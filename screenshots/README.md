@@ -11,6 +11,8 @@ the actual code change.
 | `mappings-mx4-labels.png` | #173 (`feat/per-device-button-labels`) |
 | `mappings-mx3s-fallback.png` | #173 (`feat/per-device-button-labels`) |
 | `about-panel.png` | #168 (`feat/macos-app-shell`) |
+| `app-icon-refresh-sidebar.png` | #177 (`feat/app-icon-refresh`) -- sidebar mark in app |
+| `app-icon-1024.png` | #177 (`feat/app-icon-refresh`) -- the canonical 1024 master |
 
 All shots were captured by running the actual Mouser QML window
 through `QQuickWindow.grabWindow()` against a connected MX Master 3S
