@@ -124,7 +124,7 @@ class LogitechScrollMonitor:
                     None, b"PrimaryUsage", _K_CF_STRING_ENCODING_UTF8
                 ),
             ]
-            for number in (_LOGI_VENDOR_ID, _HID_PAGE_GENERIC_DESKTOP, _HID_USAGE_MOUSE):
+            for number in (LOGI_VENDOR_ID, _HID_PAGE_GENERIC_DESKTOP, _HID_USAGE_MOUSE):
                 slot = c_int(number)
                 values.append(
                     _cf.CFNumberCreate(None, _K_CF_NUMBER_SINT32, byref(slot))

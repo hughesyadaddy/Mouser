@@ -170,7 +170,9 @@ Scroll inversion must flip **only** wheel events from a **physically attached** 
 | **Windows** | `GetRawInputBuffer` peek in the LL hook plus a backup mark from the `WM_INPUT` raw-input window when the buffer is empty; device path must match `VID_046D` | same |
 | **Linux** | evdev grab is Logitech-only; `_handle_rel` passes `linux_evdev=True` into the fallback gate | `VIRTUAL_DEVICE_SOURCES` in `mouse_hook_types` |
 
-**Host vs client policy:** On the USB host, scroll invert stays active even while KVM focus is remote (`_should_intercept_events` stands down, but `_apply_*scroll_invert_fallback` does not). On a client with only a virtual remote device, both firmware and OS-layer invert are skipped (`_physical_logitech_bound()` is false). If the macOS IOHID monitor is unavailable, OS-layer invert fails closed; HID++ firmware invert still works on capable hardware.
+**Host vs client policy:** On the USB host, scroll invert stays active even while KVM focus is remote (`_should_intercept_events` stands down, but `_apply_*scroll_invert_fallback` does not). On a client with only a virtual remote device, both firmware and OS-layer invert are skipped (`_physical_logitech_bound()` is false). Tier 1.5 Deskflow ingress uses `deskflow-shim` as the device source for the same reason. If the macOS IOHID monitor is unavailable, OS-layer invert fails closed; HID++ firmware invert still works on capable hardware.
+
+**Deskflow auto-integration:** When a Deskflow client sink manifest is detected, the engine may auto-start the loopback remote-device server and emit `"Deskflow HID sink auto-enabled"` even if `settings.remote_device.enabled` is false. Disable via the UI integration toggle or remove the manifest; `reload_kvm_integration()` stops both server and forwarder.
 
 ### App detector
 

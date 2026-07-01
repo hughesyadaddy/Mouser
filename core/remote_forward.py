@@ -34,9 +34,9 @@ import json
 import socket
 import threading
 
-PROTOCOL_VERSION = 1
+from core.remote_protocol import MAX_LINE_BYTES, PROTOCOL_VERSION
+
 DEFAULT_BRIDGE_PORT = 19796
-_MAX_LINE_BYTES = 64 * 1024
 _RECONNECT_DELAYS_S = (1.0, 2.0, 5.0)
 
 
@@ -220,7 +220,7 @@ class RemoteForwarder:
             }).encode("utf-8") + b"\n")
             sock.settimeout(5)
             reader = sock.makefile("rb")
-            reply_line = reader.readline(_MAX_LINE_BYTES)
+            reply_line = reader.readline(MAX_LINE_BYTES)
             reply = json.loads(reply_line) if reply_line else None
             if not (isinstance(reply, dict) and reply.get("ok")):
                 print(f"[RemoteForward] bridge rejected hello: {reply!r}")
@@ -253,10 +253,10 @@ class RemoteForwarder:
 
         while not self._stopped.is_set():
             try:
-                line = self._reader.readline(_MAX_LINE_BYTES + 1)
+                line = self._reader.readline(MAX_LINE_BYTES + 1)
             except OSError:
                 return
-            if not line or len(line) > _MAX_LINE_BYTES:
+            if not line or len(line) > MAX_LINE_BYTES:
                 return
             try:
                 msg = json.loads(line)

@@ -555,9 +555,9 @@ class HidBoltReceiverTests(unittest.TestCase):
         ]
 
         with patch.object(listener, "_vendor_hid_infos", return_value=infos):
-            # _try_connect sorts infos in place before iterating
             with (
                 patch.object(listener, "_find_feature", return_value=None),
+                patch.object(hid_gesture, "_load_last_device_cache", return_value=None),
                 patch("builtins.print"),
             ):
                 listener._try_connect()

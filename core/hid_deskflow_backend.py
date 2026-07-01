@@ -94,3 +94,12 @@ def flush_deskflow_sink():
     with _SINK_LOCK:
         if _GLOBAL_SINK is not None:
             _GLOBAL_SINK.flush()
+
+
+def reset_deskflow_sink_for_tests():
+    """Drop the process-global sink (tests only)."""
+    global _GLOBAL_SINK
+    with _SINK_LOCK:
+        if _GLOBAL_SINK is not None:
+            _GLOBAL_SINK.close()
+        _GLOBAL_SINK = None

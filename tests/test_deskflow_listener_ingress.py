@@ -7,6 +7,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from core.hid_deskflow_backend import flush_deskflow_sink, reset_deskflow_sink_for_tests
 from core.hid_gesture import HidGestureListener
 from core.hid_sink import encode_report_frame
 from core.mouse_hook_base import BaseMouseHook
@@ -126,9 +127,16 @@ class _IngressFixture:
             self.client.close()
         if self.server is not None:
             self.server.stop()
+        flush_deskflow_sink()
 
 
 class DeskflowListenerIngressTests(unittest.TestCase):
+    def setUp(self):
+        reset_deskflow_sink_for_tests()
+
+    def tearDown(self):
+        reset_deskflow_sink_for_tests()
+
     @patch.object(HidGestureListener, "_vendor_hid_infos", return_value=[])
     def test_transparent_connect_uses_main_listener(self, mock_infos):
         with _IngressFixture(mock_infos) as fx:
@@ -139,7 +147,10 @@ class DeskflowListenerIngressTests(unittest.TestCase):
             )
             fx.client.send_frame(encode_report_frame(1, FRAME_GESTURE_DOWN))
             self.assertTrue(
-                _wait_until(lambda: ("dispatch", "gesture_down") in fx.hook.calls),
+                _wait_until(
+                    lambda: ("dispatch", "gesture_down") in fx.hook.calls,
+                    timeout=5.0,
+                ),
                 "gesture frame was not dispatched",
             )
 

@@ -244,33 +244,8 @@ class SmartShiftPendingRequestAbortTests(unittest.TestCase):
 # Engine -- SmartShift config persistence and startup
 # ──────────────────────────────────────────────────────────────────────────────
 
-class _FakeMouseHook:
-    def __init__(self):
-        self.invert_vscroll = False
-        self.invert_hscroll = False
-        self.debug_mode = False
-        self.connected_device = None
-        self.device_connected = False
-        self._hid_gesture = None
-        self.divert_mode_shift = False
-        self.start_called = False
-        self.wheel_native_invert_vertical = False
-        self.wheel_native_invert_horizontal = False
-        self.wheel_divert_active = False
-
-    def set_debug_callback(self, cb): pass
-    def set_gesture_callback(self, cb): pass
-    def set_status_callback(self, cb): pass
-    def set_connection_change_callback(self, cb): pass
-    def configure_gestures(self, **kwargs): pass
-    def configure_wheel_multipliers(self, vertical, horizontal):
-        return None
-    def block(self, event_type): pass
-    def register(self, event_type, callback): pass
-    def reset_bindings(self): pass
-    def sync_hid_extra_diverts(self): pass
-    def start(self): self.start_called = True
-    def stop(self): pass
+from tests.support.engine_test_helpers import engine_start_without_kvm
+from tests.support.fake_mouse_hook import FakeMouseHook as _FakeMouseHook
 
 
 class _FakeAppDetector:
@@ -300,6 +275,7 @@ class EngineSmartShiftTests(unittest.TestCase):
             patch("core.engine.MouseHook", _FakeMouseHook),
             patch("core.engine.AppDetector", _FakeAppDetector),
             patch("core.engine.load_config", return_value=cfg),
+            patch("core.deskflow_integration.resolve_integration", return_value=None),
         ):
             return Engine()
 
@@ -338,8 +314,9 @@ class EngineSmartShiftTests(unittest.TestCase):
         with (
             patch("core.engine.threading.Thread", _ImmediateThread),
             patch("time.sleep"),
+            engine_start_without_kvm(engine),
         ):
-            engine.start()
+            pass
         # Called twice: once immediately, once after the settled 3 s delay.
         hg.set_smart_shift.assert_called_with("freespin", True, 40)
         self.assertGreaterEqual(hg.set_smart_shift.call_count, 1)
@@ -351,8 +328,9 @@ class EngineSmartShiftTests(unittest.TestCase):
         with (
             patch("core.engine.threading.Thread", _ImmediateThread),
             patch("time.sleep"),
+            engine_start_without_kvm(engine),
         ):
-            engine.start()
+            pass
         hg.set_smart_shift.assert_not_called()
 
     def test_run_saved_settings_replay_reapplies_saved_smart_shift(self):
@@ -553,6 +531,7 @@ class EngineToggleSmartShiftTests(unittest.TestCase):
             patch("core.engine.MouseHook", _FakeMouseHook),
             patch("core.engine.AppDetector", _FakeAppDetector),
             patch("core.engine.load_config", return_value=cfg),
+            patch("core.deskflow_integration.resolve_integration", return_value=None),
         ):
             return Engine()
 
@@ -640,6 +619,7 @@ class EngineSwitchScrollModeTests(unittest.TestCase):
             patch("core.engine.MouseHook", _FakeMouseHook),
             patch("core.engine.AppDetector", _FakeAppDetector),
             patch("core.engine.load_config", return_value=cfg),
+            patch("core.deskflow_integration.resolve_integration", return_value=None),
         ):
             return Engine()
 

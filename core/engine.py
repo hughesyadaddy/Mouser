@@ -981,6 +981,11 @@ class Engine:
         if status_message:
             self._emit_status(status_message)
 
+    def _resolve_deskflow_integration(self):
+        from core.deskflow_integration import resolve_integration
+
+        return resolve_integration(self.cfg) or {}
+
     def _start_remote_device_server(self):
         """Start the loopback virtual-device server when configured.
 
@@ -989,10 +994,10 @@ class Engine:
         Deskflow auto mode can supply token/port from the Deskflow manifest.
         """
         remote_cfg = self.cfg.get("settings", {}).get("remote_device", {}) or {}
-        from core.deskflow_integration import resolve_integration, use_transparent_transport
+        from core.deskflow_integration import use_transparent_transport
         from core.remote_device import DEFAULT_PORT, RemoteDeviceServer
 
-        deskflow = resolve_integration(self.cfg)
+        deskflow = self._resolve_deskflow_integration()
         enabled = bool(remote_cfg.get("enabled", False))
         token = str(remote_cfg.get("token") or "")
         port = DEFAULT_PORT
@@ -1041,10 +1046,9 @@ class Engine:
     def _start_remote_forwarder(self):
         """Start the KVM-bridge forwarder when configured (off by default)."""
         fwd_cfg = self.cfg.get("settings", {}).get("remote_forward", {}) or {}
-        from core.deskflow_integration import resolve_integration
         from core.remote_forward import DEFAULT_BRIDGE_PORT, RemoteForwarder
 
-        deskflow = resolve_integration(self.cfg)
+        deskflow = self._resolve_deskflow_integration()
         enabled = bool(fwd_cfg.get("enabled", False))
         decode_only = bool(fwd_cfg.get("passthrough_decode_only", False))
         token = str(fwd_cfg.get("token") or "")

@@ -54,15 +54,10 @@ from core.mouse_hook_types import (
     DEVICE_SOURCE_REMOTE_VIRTUAL,
 )
 
-PROTOCOL_VERSION = 1
-DEFAULT_PORT = 19795  # 0x4D53 "MS"
-_MAX_LINE_BYTES = 64 * 1024
+from core.remote_decode import parse_feat_idx, parse_gesture_cid
+from core.remote_protocol import MAX_LINE_BYTES, PROTOCOL_VERSION, SENSE_PANEL_CID
 
-# MX Master 4's Sense Panel CID. The sender resolves gesture/thumb roles on
-# its side before forwarding, so the receiving hook's OS-level fallback
-# rerouting (``_gesture_via_sense_panel``) must stay off; claiming the panel
-# divert is active does exactly that and is harmless for other devices.
-_SENSE_PANEL_CID = 0x01A0
+DEFAULT_PORT = 19795  # 0x4D53 "MS"
 
 # Allowlisted event name -> BaseMouseHook entry point. ``gesture_move`` is
 # handled separately because it carries deltas.
@@ -215,7 +210,7 @@ class RemoteDeviceServer:
             if is_json_line_start(buffer[0]):
                 newline = buffer.find(b"\n")
                 if newline < 0:
-                    if len(buffer) > _MAX_LINE_BYTES:
+                    if len(buffer) > MAX_LINE_BYTES:
                         return
                     chunk = conn.recv(8192)
                     if not chunk:
@@ -224,7 +219,7 @@ class RemoteDeviceServer:
                     continue
                 line = buffer[:newline]
                 buffer = buffer[newline + 1:]
-                if len(line) > _MAX_LINE_BYTES:
+                if len(line) > MAX_LINE_BYTES:
                     return
                 try:
                     msg = json.loads(line)
@@ -258,7 +253,7 @@ class RemoteDeviceServer:
             if not chunk:
                 return buffer, False
             buffer += chunk
-            if len(buffer) > _MAX_LINE_BYTES:
+            if len(buffer) > MAX_LINE_BYTES:
                 return buffer, False
         newline = buffer.find(b"\n")
         line = buffer[:newline]
@@ -372,7 +367,7 @@ class RemoteDeviceServer:
                 product_name=product_name or "Logitech Mouse",
                 transport="USB Receiver",
                 source=DEVICE_SOURCE_DESKFLOW_SHIM,
-                active_gesture_cid=_SENSE_PANEL_CID,
+                active_gesture_cid=SENSE_PANEL_CID,
             )
             self._emit_status(f"Deskflow ingress: {preview.display_name}")
             print(
@@ -398,7 +393,7 @@ class RemoteDeviceServer:
                 product_name=product_name,
                 transport=transport,
                 source=source,
-                active_gesture_cid=_SENSE_PANEL_CID,
+                active_gesture_cid=SENSE_PANEL_CID,
             )
         except Exception as exc:  # noqa: BLE001 - input boundary
             print(f"[RemoteDevice] connect failed to build device info: {exc!r}")
@@ -482,10 +477,8 @@ class RemoteDeviceServer:
         """
         if not isinstance(decode, dict):
             return None
-        feat_idx = decode.get("feat_idx")
-        # HID++ feature indexes are a single report byte; anything else is
-        # config garbage that would silently match nothing.
-        if not isinstance(feat_idx, int) or not 0 < feat_idx <= 0xFF:
+        feat_idx = parse_feat_idx(decode)
+        if feat_idx is None:
             return None
 
         from core.hid_gesture import HidGestureListener
@@ -514,7 +507,7 @@ class RemoteDeviceServer:
             extra_diverts=extra,
         )
         listener._feat_idx = feat_idx
-        gesture_cid = _coerce_product_id(decode.get("gesture_cid"))
+        gesture_cid = parse_gesture_cid(decode)
         if gesture_cid is not None:
             listener._gesture_cid = gesture_cid
         listener._rawxy_enabled = bool(decode.get("rawxy", True))

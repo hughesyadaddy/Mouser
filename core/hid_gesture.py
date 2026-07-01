@@ -28,6 +28,7 @@ from core.logi_devices import (
     resolve_device,
 )
 from core.mouse_hook_types import DEVICE_SOURCE_DESKFLOW_SHIM
+from core.remote_decode import parse_feat_idx, parse_gesture_cid
 
 _HID_MODULE_NAME = None
 try:
@@ -1072,20 +1073,13 @@ class HidGestureListener:
 
     def _seed_from_decode(self, decode):
         """Apply host-published decode context without arming local diverts."""
-        feat_idx = decode.get("feat_idx")
-        if not isinstance(feat_idx, int) or not 0 < feat_idx <= 0xFF:
+        feat_idx = parse_feat_idx(decode)
+        if feat_idx is None:
             return False
-        self._feat_idx = int(feat_idx)
-        gesture_cid = decode.get("gesture_cid")
+        self._feat_idx = feat_idx
+        gesture_cid = parse_gesture_cid(decode)
         if gesture_cid is not None:
-            try:
-                self._gesture_cid = (
-                    int(gesture_cid, 0)
-                    if isinstance(gesture_cid, str)
-                    else int(gesture_cid)
-                )
-            except (TypeError, ValueError):
-                pass
+            self._gesture_cid = gesture_cid
         self._rawxy_enabled = bool(decode.get("rawxy", True))
         self._extra_diverts = {
             cid: {**info, "held": False}

@@ -6,58 +6,8 @@ from unittest.mock import Mock, patch
 from core.config import DEFAULT_CONFIG
 from core.mouse_hook import MouseEvent
 from core.mouse_hook_types import HidRuntimeState
-
-
-class _FakeMouseHook:
-    def __init__(self):
-        self.invert_vscroll = False
-        self.invert_hscroll = False
-        self.debug_mode = False
-        self.connected_device = None
-        self.device_connected = False
-        self._hid_gesture = None
-        self.start_called = False
-        self.stop_called = False
-        self.wheel_native_invert_vertical = False
-        self.wheel_native_invert_horizontal = False
-        # Back-compat alias mirrored on the real BaseMouseHook for callers
-        # from the divert+inject build of the test fixtures.
-        self.wheel_divert_active = False
-
-    def set_debug_callback(self, cb):
-        self._debug_callback = cb
-
-    def set_gesture_callback(self, cb):
-        self._gesture_callback = cb
-
-    def set_status_callback(self, cb):
-        self._status_callback = cb
-
-    def set_connection_change_callback(self, cb):
-        self._connection_change_callback = cb
-
-    def configure_gestures(self, **kwargs):
-        self._gesture_config = kwargs
-
-    def configure_wheel_multipliers(self, vertical, horizontal):
-        # Retained for shape compatibility; real BaseMouseHook accepts but
-        # no-ops the call in native-invert mode.
-        return None
-
-    def block(self, event_type):
-        pass
-
-    def register(self, event_type, callback):
-        pass
-
-    def reset_bindings(self):
-        pass
-
-    def start(self):
-        self.start_called = True
-
-    def stop(self):
-        self.stop_called = True
+from tests.support.engine_test_helpers import engine_start_without_kvm
+from tests.support.fake_mouse_hook import FakeMouseHook as _FakeMouseHook
 
 
 class _FakeAppDetector:
@@ -113,6 +63,7 @@ class EngineHorizontalScrollTests(unittest.TestCase):
             patch("core.engine.MouseHook", _FakeMouseHook),
             patch("core.engine.AppDetector", _FakeAppDetector),
             patch("core.engine.load_config", return_value=cfg),
+            patch("core.deskflow_integration.resolve_integration", return_value=None),
         ):
             return Engine()
 
@@ -261,8 +212,9 @@ class EngineHorizontalScrollTests(unittest.TestCase):
         with (
             patch("core.engine.threading.Thread", _ImmediateThread),
             patch("time.sleep", return_value=None),
+            engine_start_without_kvm(engine),
         ):
-            engine.start()
+            pass
 
         expected = engine.cfg["settings"]["dpi"]
         engine.hook._hid_gesture.set_dpi.assert_called_once_with(expected)
@@ -282,6 +234,7 @@ class EngineReplayPhaseOneTests(unittest.TestCase):
             patch("core.engine.MouseHook", _FakeMouseHook),
             patch("core.engine.AppDetector", _FakeAppDetector),
             patch("core.engine.load_config", return_value=cfg),
+            patch("core.deskflow_integration.resolve_integration", return_value=None),
         ):
             return Engine()
 
@@ -442,8 +395,8 @@ class EngineReplayPhaseOneTests(unittest.TestCase):
         with (
             patch("core.engine.threading.Thread", side_effect=self._thread_factory(threads)),
             patch("core.engine.time.sleep", return_value=None),
+            engine_start_without_kvm(engine),
         ):
-            engine.start()
             startup_threads = list(self._non_battery_threads(threads))
             self.assertEqual(len(startup_threads), 1)
 
@@ -521,6 +474,36 @@ class EngineReplayPhaseOneTests(unittest.TestCase):
 
         engine.hook._hid_gesture.read_battery.assert_called_once_with()
         engine.hook._hid_gesture.read_smart_shift.assert_not_called()
+
+
+class EngineDeskflowIntegrationTests(unittest.TestCase):
+    def test_client_sink_auto_enables_remote_device_server(self):
+        from core.engine import Engine
+
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["remote_device"]["enabled"] = False
+        status_messages = []
+        deskflow = {
+            "client_sink": True,
+            "token": "deskflow-token",
+            "port": 19795,
+        }
+        with (
+            patch("core.engine.MouseHook", _FakeMouseHook),
+            patch("core.engine.AppDetector", _FakeAppDetector),
+            patch("core.engine.load_config", return_value=cfg),
+            patch("core.deskflow_integration.resolve_integration", return_value=deskflow),
+            patch("core.remote_device.RemoteDeviceServer") as server_cls,
+        ):
+            server_cls.return_value.start.return_value = True
+            engine = Engine()
+            engine.set_status_callback(status_messages.append)
+            engine._start_remote_device_server()
+
+        server_cls.assert_called_once()
+        self.assertTrue(
+            any("Deskflow HID sink auto-enabled" in msg for msg in status_messages)
+        )
 
 
 if __name__ == "__main__":
