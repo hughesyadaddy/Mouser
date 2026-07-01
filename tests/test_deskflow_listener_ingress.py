@@ -4,11 +4,13 @@ import json
 import socket
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from core.hid_gesture import HidGestureListener
 from core.hid_sink import encode_report_frame
 from core.mouse_hook_base import BaseMouseHook
+from core.mouse_hook_types import DEVICE_SOURCE_DESKFLOW_SHIM
 from core.remote_device import PROTOCOL_VERSION, RemoteDeviceServer
 
 TOKEN = "listener-ingress-token"
@@ -18,6 +20,15 @@ DECODE = {
     "extra_diverts": {"0x00C4": "thumb_button"},
 }
 FRAME_GESTURE_DOWN = bytes.fromhex("11ff0b0001a00000")
+
+
+def _wait_until(predicate, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
 
 
 class _StubHook(BaseMouseHook):
@@ -62,21 +73,27 @@ class _Client:
         self.sock.close()
 
 
-class DeskflowListenerIngressTests(unittest.TestCase):
-    @patch.object(HidGestureListener, "_vendor_hid_infos", return_value=[])
-    def test_transparent_connect_uses_main_listener(self, _mock_infos):
-        hook = _StubHook()
-        hook.start()
-        server = RemoteDeviceServer(
-            hook,
+class _IngressFixture:
+    def __init__(self, mock_infos):
+        self.mock_infos = mock_infos
+        self.hook = _StubHook()
+        self.server = None
+        self.client = None
+
+    def __enter__(self):
+        self.hook.start()
+        self.server = RemoteDeviceServer(
+            self.hook,
             token=TOKEN,
             port=0,
             transparent_transport=True,
         )
-        self.assertTrue(server.start())
-        client = _Client(server.port)
-        self.assertTrue(client.hello().get("ok"))
-        reply = client.send_json(
+        if not self.server.start():
+            raise AssertionError("RemoteDeviceServer failed to start")
+        self.client = _Client(self.server.port)
+        if not self.client.hello().get("ok"):
+            raise AssertionError("hello handshake failed")
+        reply = self.client.send_json(
             {
                 "type": "connect",
                 "device": {
@@ -86,22 +103,64 @@ class DeskflowListenerIngressTests(unittest.TestCase):
                 },
             }
         )
-        self.assertTrue(reply.get("ok"))
-        for _ in range(40):
-            hg = hook._hid_gesture
-            if hg is not None and hg.connected_device is not None:
-                break
-            time.sleep(0.05)
-        hg = hook._hid_gesture
-        self.assertIsNotNone(hg)
-        self.assertTrue(getattr(hg, "_deskflow_readonly", False))
-        self.assertEqual(hg.connected_device.source, "hidapi")
-        client.send_frame(encode_report_frame(1, FRAME_GESTURE_DOWN))
-        time.sleep(0.15)
-        self.assertIn(("dispatch", "gesture_down"), hook.calls)
-        client.send_json({"type": "disconnect"})
-        client.close()
-        server.stop()
+        if not reply.get("ok"):
+            raise AssertionError(f"connect failed: {reply!r}")
+        if not _wait_until(
+            lambda: (
+                self.hook._hid_gesture is not None
+                and self.hook._hid_gesture.connected_device is not None
+                and self.hook._connected_device is not None
+            )
+        ):
+            raise AssertionError(
+                "Deskflow ingress did not propagate connected device to hook"
+            )
+        return self
+
+    def __exit__(self, *_exc):
+        if self.client is not None:
+            try:
+                self.client.send_json({"type": "disconnect"})
+            except OSError:
+                pass
+            self.client.close()
+        if self.server is not None:
+            self.server.stop()
+
+
+class DeskflowListenerIngressTests(unittest.TestCase):
+    @patch.object(HidGestureListener, "_vendor_hid_infos", return_value=[])
+    def test_transparent_connect_uses_main_listener(self, mock_infos):
+        with _IngressFixture(mock_infos) as fx:
+            hg = fx.hook._hid_gesture
+            self.assertTrue(getattr(hg, "_deskflow_readonly", False))
+            self.assertEqual(
+                fx.hook._connected_device.source, DEVICE_SOURCE_DESKFLOW_SHIM
+            )
+            fx.client.send_frame(encode_report_frame(1, FRAME_GESTURE_DOWN))
+            self.assertTrue(
+                _wait_until(lambda: ("dispatch", "gesture_down") in fx.hook.calls),
+                "gesture frame was not dispatched",
+            )
+
+    @patch.object(HidGestureListener, "_vendor_hid_infos", return_value=[])
+    def test_deskflow_ingress_skips_kvm_scroll_invert(self, mock_infos):
+        """KVM-forwarded scroll on the client must not be OS-inverted again."""
+        with _IngressFixture(mock_infos) as fx:
+            hook = fx.hook
+            hook.invert_vscroll = True
+            self.assertEqual(
+                hook._connected_device.source, DEVICE_SOURCE_DESKFLOW_SHIM
+            )
+            self.assertFalse(hook._physical_logitech_bound())
+            self.assertFalse(hook._apply_vscroll_invert_fallback(linux_evdev=True))
+
+    def test_hidapi_source_would_invert_kvm_scroll(self):
+        hook = _StubHook()
+        hook.invert_vscroll = True
+        hook._connected_device = SimpleNamespace(source="hidapi")
+        self.assertTrue(hook._physical_logitech_bound())
+        self.assertTrue(hook._apply_vscroll_invert_fallback(linux_evdev=True))
 
 
 if __name__ == "__main__":

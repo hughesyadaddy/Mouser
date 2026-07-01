@@ -27,6 +27,7 @@ from core.logi_devices import (
     clamp_dpi,
     resolve_device,
 )
+from core.mouse_hook_types import DEVICE_SOURCE_DESKFLOW_SHIM
 
 _HID_MODULE_NAME = None
 try:
@@ -1149,7 +1150,7 @@ class HidGestureListener:
                 product_id=product_id,
                 product_name=product_name,
                 transport="USB Receiver",
-                source="hidapi",
+                source=DEVICE_SOURCE_DESKFLOW_SHIM,
                 gesture_cids=self._gesture_candidates,
                 reprog_controls=(),
                 active_gesture_cid=self._gesture_cid,

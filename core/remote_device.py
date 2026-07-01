@@ -371,7 +371,7 @@ class RemoteDeviceServer:
                 product_id=product_id,
                 product_name=product_name or "Logitech Mouse",
                 transport="USB Receiver",
-                source="hidapi",
+                source=DEVICE_SOURCE_DESKFLOW_SHIM,
                 active_gesture_cid=_SENSE_PANEL_CID,
             )
             self._emit_status(f"Deskflow ingress: {preview.display_name}")
