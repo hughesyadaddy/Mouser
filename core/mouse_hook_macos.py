@@ -184,6 +184,11 @@ class MouseHook(BaseMouseHook):
             # Logitech to another machine while Mouser keeps running on
             # this one.
             if not self._should_intercept_events():
+                if event_type == Quartz.kCGEventScrollWheel:
+                    if self._apply_vscroll_invert_fallback():
+                        self._negate_scroll_axis(cg_event, 1)
+                    if self._apply_hscroll_invert_fallback():
+                        self._negate_scroll_axis(cg_event, 2)
                 return cg_event
 
             mouse_event = None

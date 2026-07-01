@@ -139,6 +139,10 @@ class BaseMouseHook:
     # (raw-XY divertable) AND as OS btn=6 / BTN_TASK.
     SENSE_PANEL_CID = 0x01A0
 
+    def _logitech_device_bound(self) -> bool:
+        """True while a Logitech device is bound to this host's pipeline."""
+        return self._connected_device is not None
+
     def _should_intercept_events(self) -> bool:
         """True only when the platform hook should block, remap, or dispatch
         OS-level mouse events to the engine.
@@ -159,11 +163,13 @@ class BaseMouseHook:
         contract stays platform-uniform.
 
         When a remote forwarder reports active (KVM focus is on another
-        machine), the hook also stands down: OS-level events must pass
-        through untouched so the KVM software can forward them raw, and
-        the remote machine's Mouser remaps them there.
+        machine), the hook also stands down for button/gesture remaps:
+        Deskflow forwards pointer and scroll through untouched while the
+        DMSR bridge relays only decoded HID++ gesture/button events to
+        the focused client's Mouser. Scroll inversion is host-local and
+        is gated separately via :meth:`_apply_vscroll_invert_fallback`.
         """
-        if self._connected_device is None:
+        if not self._logitech_device_bound():
             return False
         fwd = self._remote_forwarder
         if fwd is not None and fwd.should_forward():
@@ -175,20 +181,13 @@ class BaseMouseHook:
         self._remote_forwarder = forwarder
 
     def _maybe_forward_raw_report(self, raw) -> bool:
-        """Listener raw-report tap: while KVM focus is remote, relay the raw
-        HID++ frame to that machine and tell the listener to skip local
-        decode. Returns False when not forwarding so local handling runs."""
-        fwd = self._remote_forwarder
-        if fwd is None or not fwd.should_forward():
-            return False
-        try:
-            # hidapi yields a report as list[int] on macOS/Linux and bytes on
-            # some backends; normalise before hex-encoding for the wire.
-            data = raw if isinstance(raw, (bytes, bytearray)) else bytes(raw)
-            return bool(fwd.send_report(data.hex()))
-        except Exception as exc:  # noqa: BLE001 - relay boundary
-            print(f"[MouseHook] remote forward of raw report raised: {exc!r}")
-            return False
+        """Listener raw-report tap.
+
+        Legacy DMSR relay ships decoded gesture/button events only
+        (``_hid_event_entry``); raw HID++ frames are always decoded on
+        the host. Returns False so local handling always runs.
+        """
+        return False
 
     def gesture_decode_context(self):
         """The live gesture decode map, for a host to advertise to slaves."""
@@ -209,17 +208,18 @@ class BaseMouseHook:
         rest. When no Logitech is currently connected we have no source-of-
         truth that the event came from a device the toggle applies to, so the
         fallback must stand down rather than invert every trackpad / generic
-        USB mouse scroll the OS forwards through us. The "no Logitech bound"
-        gate is delegated to :meth:`_should_intercept_events` so this fallback
-        and the platform hooks' top-level early-return share one source of
-        truth.
+        USB mouse scroll the OS forwards through us.
+
+        Unlike button/gesture remaps, scroll inversion stays active on the
+        host even while KVM focus is remote: Deskflow forwards scroll through
+        untouched and must not need to know about this setting.
         """
         if not self.invert_vscroll:
             return False
         # Per-axis: only stand down when the VERTICAL axis is firmware-inverted.
         if self.wheel_native_invert_vertical:
             return False
-        return self._should_intercept_events()
+        return self._logitech_device_bound()
 
     def _apply_hscroll_invert_fallback(self) -> bool:
         """Horizontal twin of :meth:`_apply_vscroll_invert_fallback`.
@@ -233,7 +233,7 @@ class BaseMouseHook:
             return False
         if self.wheel_native_invert_horizontal:
             return False
-        return self._should_intercept_events()
+        return self._logitech_device_bound()
 
     @property
     def _thumb_button_via_hid(self) -> bool:

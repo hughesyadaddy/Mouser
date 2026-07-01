@@ -8,8 +8,10 @@ listener (e.g. a Deskflow-fork server) over loopback TCP and:
     currently on this machine or a remote one;
   - announces the connected Logitech device's identity (so the bridge can
     virtually connect it on whichever machine has focus);
-  - forwards HID++-only events (gesture button, rawXY, thumb button, ...)
-    while focus is remote, during which local handling is suppressed.
+  - forwards HID++-only *decoded* events (gesture button, rawXY, thumb button,
+    mode shift, DPI, ...) while focus is remote, during which local handling
+    of those events is suppressed. Scroll wheel inversion stays on the host
+    and is not part of this relay; Deskflow forwards pointer/scroll agnostically.
 
 Wire protocol (line-delimited JSON, mirrors core/remote_device.py):
 

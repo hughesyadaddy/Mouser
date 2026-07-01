@@ -350,6 +350,31 @@ class HookForwardingGateTests(unittest.TestCase):
         hook, _ = self._make_hook_with_forwarder(forwarding=False)
         self.assertFalse(hook._should_intercept_events())
 
+    def test_scroll_invert_fallback_active_while_forwarding(self):
+        hook, _ = self._make_hook_with_forwarder(forwarding=True)
+        hook._connected_device = object()
+        hook.invert_vscroll = True
+        hook.invert_hscroll = True
+        self.assertFalse(hook._should_intercept_events())
+        self.assertTrue(hook._apply_vscroll_invert_fallback())
+        self.assertTrue(hook._apply_hscroll_invert_fallback())
+
+    def test_scroll_invert_fallback_off_without_logitech(self):
+        hook, _ = self._make_hook_with_forwarder(forwarding=True)
+        hook.invert_vscroll = True
+        self.assertFalse(hook._apply_vscroll_invert_fallback())
+
+    def test_raw_report_never_forwarded(self):
+        hook = _StubHook()
+        sent = []
+        forwarder = SimpleNamespace(
+            should_forward=lambda: True,
+            send_report=lambda data: sent.append(data) or True,
+        )
+        hook.set_remote_forwarder(forwarder)
+        self.assertFalse(hook._maybe_forward_raw_report(b"\x11\xff"))
+        self.assertEqual(sent, [])
+
 
 if __name__ == "__main__":
     unittest.main()

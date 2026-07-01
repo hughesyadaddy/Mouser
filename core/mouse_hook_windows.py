@@ -304,6 +304,25 @@ class MouseHook(BaseMouseHook):
             # failure mode users hit when their KVM switches the Logitech
             # to another machine while Mouser keeps running here.
             if not self._should_intercept_events():
+                # Host-local scroll invert still runs while KVM focus is remote.
+                if wParam == WM_MOUSEWHEEL and self._apply_vscroll_invert_fallback():
+                    delta = hiword(mouse_data)
+                    if delta != 0 and self._ri_hwnd:
+                        self._pending_vscroll += -delta
+                        if not self._vscroll_posted:
+                            if PostMessageW(self._ri_hwnd, WM_APP_INJECT_VSCROLL, 0, 0):
+                                self._vscroll_posted = True
+                                return 1
+                            self._pending_vscroll -= -delta
+                elif wParam == WM_MOUSEHWHEEL and self._apply_hscroll_invert_fallback():
+                    delta = hiword(mouse_data)
+                    if delta != 0 and self._ri_hwnd:
+                        self._pending_hscroll += -delta
+                        if not self._hscroll_posted:
+                            if PostMessageW(self._ri_hwnd, WM_APP_INJECT_HSCROLL, 0, 0):
+                                self._hscroll_posted = True
+                                return 1
+                            self._pending_hscroll -= -delta
                 return CallNextHookEx(self._hook, nCode, wParam, lParam)
 
             if wParam == WM_XBUTTONDOWN:
