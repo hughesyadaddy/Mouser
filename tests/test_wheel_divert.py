@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import sys
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
@@ -25,6 +26,12 @@ from core.hid_gesture import (
 from core.logi_devices import resolve_device
 from core.mouse_hook_base import BaseMouseHook
 from core.mouse_hook_contract import MouseHookLike
+from core.mouse_hook_types import (
+    DEVICE_SOURCE_DESKFLOW_SHIM,
+    DEVICE_SOURCE_REMOTE_VIRTUAL,
+    is_physical_device_source,
+)
+from core.macos_iokit_scroll import LogitechScrollMonitor
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -429,6 +436,29 @@ class MacOSSuppressionTests(unittest.TestCase):
     _kCGScrollWheelEventIsContinuous = 88
     _kCGEventScrollWheel = 22
 
+    def _mark_recent_logitech_scroll(self, hook):
+        hook._logitech_scroll_monitor.mark_wheel()
+
+    def _mock_get_field(
+        self,
+        *,
+        is_continuous=0,
+        source_user_data=0,
+        momentum_phase=0,
+        scroll_phase=0,
+    ):
+        def _get(_event, field):
+            if field == self._kCGScrollWheelEventIsContinuous:
+                return is_continuous
+            if field == self._mouse_hook_macos._CG_SCROLL_FIELD_MOMENTUM_PHASE:
+                return momentum_phase
+            if field == self._mouse_hook_macos._CG_SCROLL_FIELD_SCROLL_PHASE:
+                return scroll_phase
+            if field == self.mock_quartz.kCGEventSourceUserData:
+                return source_user_data
+            return 0
+        return _get
+
     def setUp(self):
         try:
             from core import mouse_hook_macos
@@ -439,22 +469,57 @@ class MacOSSuppressionTests(unittest.TestCase):
         self.mock_quartz = MagicMock(name="Quartz")
         self.mock_quartz.kCGEventScrollWheel = self._kCGEventScrollWheel
         mouse_hook_macos.Quartz = self.mock_quartz
+        self._sync_patch = patch.object(
+            mouse_hook_macos.MouseHook,
+            "_sync_logitech_scroll_monitor",
+            lambda self: None,
+        )
+        self._sync_patch.start()
 
     def tearDown(self):
+        self._sync_patch.stop()
         if self._prev_quartz is None:
             if hasattr(self._mouse_hook_macos, "Quartz"):
                 delattr(self._mouse_hook_macos, "Quartz")
         else:
             self._mouse_hook_macos.Quartz = self._prev_quartz
 
-    def _mock_get_field(self, *, is_continuous=0, source_user_data=0):
-        def _get(_event, field):
-            if field == self._kCGScrollWheelEventIsContinuous:
-                return is_continuous
-            if field == self.mock_quartz.kCGEventSourceUserData:
-                return source_user_data
-            return 0
-        return _get
+    def test_scroll_attribution_rejects_continuous_trackpad(self):
+        hook = self._mouse_hook_macos.MouseHook()
+        hook.ignore_trackpad = True
+        hook._connected_device = self._logitech_stub()
+        self._mark_recent_logitech_scroll(hook)
+        cg_event = MagicMock(name="cg_event")
+        self.mock_quartz.CGEventGetIntegerValueField.side_effect = (
+            self._mock_get_field(is_continuous=1)
+        )
+        self.assertFalse(
+            hook._scroll_event_targets_logitech(cg_event=cg_event)
+        )
+
+    def test_scroll_attribution_rejects_momentum_phase(self):
+        hook = self._mouse_hook_macos.MouseHook()
+        hook._connected_device = self._logitech_stub()
+        self._mark_recent_logitech_scroll(hook)
+        cg_event = MagicMock(name="cg_event")
+        self.mock_quartz.CGEventGetIntegerValueField.side_effect = (
+            self._mock_get_field(momentum_phase=1)
+        )
+        self.assertFalse(
+            hook._scroll_event_targets_logitech(cg_event=cg_event)
+        )
+
+    def test_scroll_attribution_rejects_in_progress_scroll_phase(self):
+        hook = self._mouse_hook_macos.MouseHook()
+        hook._connected_device = self._logitech_stub()
+        self._mark_recent_logitech_scroll(hook)
+        cg_event = MagicMock(name="cg_event")
+        self.mock_quartz.CGEventGetIntegerValueField.side_effect = (
+            self._mock_get_field(scroll_phase=1)
+        )
+        self.assertFalse(
+            hook._scroll_event_targets_logitech(cg_event=cg_event)
+        )
 
     def test_os_inversion_skipped_when_native_active(self):
         hook = self._mouse_hook_macos.MouseHook()
@@ -486,6 +551,7 @@ class MacOSSuppressionTests(unittest.TestCase):
         return SimpleNamespace(
             key="mx_master_3s",
             display_name="MX Master 3S",
+            source="hidapi",
             thumb_button_via_hid=False,
             gesture_via_sense_panel=False,
         )
@@ -498,6 +564,7 @@ class MacOSSuppressionTests(unittest.TestCase):
         hook.wheel_native_invert_vertical = False
         hook.wheel_native_invert_horizontal = False
         hook._connected_device = self._logitech_stub()
+        self._mark_recent_logitech_scroll(hook)
         cg_event = MagicMock(name="cg_event")
         self.mock_quartz.CGEventGetIntegerValueField.side_effect = (
             self._mock_get_field(is_continuous=0)
@@ -520,6 +587,7 @@ class MacOSSuppressionTests(unittest.TestCase):
         hook.wheel_native_invert_vertical = False
         hook.wheel_native_invert_horizontal = False
         hook._connected_device = self._logitech_stub()
+        self._mark_recent_logitech_scroll(hook)
         cg_event = MagicMock(name="cg_event")
         self.mock_quartz.CGEventGetIntegerValueField.side_effect = (
             self._mock_get_field(is_continuous=0)
@@ -545,6 +613,7 @@ class MacOSSuppressionTests(unittest.TestCase):
         hook.wheel_native_invert_vertical = True    # firmware holds vertical
         hook.wheel_native_invert_horizontal = False  # OS owns horizontal
         hook._connected_device = self._logitech_stub()
+        self._mark_recent_logitech_scroll(hook)
         cg_event = MagicMock(name="cg_event")
         self.mock_quartz.CGEventGetIntegerValueField.side_effect = (
             self._mock_get_field(is_continuous=0)
@@ -566,6 +635,7 @@ class MacOSSuppressionTests(unittest.TestCase):
         hook.wheel_native_invert_vertical = False
         hook.wheel_native_invert_horizontal = False
         hook._connected_device = self._logitech_stub()
+        self._mark_recent_logitech_scroll(hook)
         cg_event = MagicMock(name="cg_event")
         self.mock_quartz.CGEventGetIntegerValueField.side_effect = (
             self._mock_get_field(is_continuous=0)
@@ -605,6 +675,26 @@ class MacOSSuppressionTests(unittest.TestCase):
         negate.assert_not_called()
         self.assertIs(result, cg_event)
 
+    def test_os_inversion_skipped_for_unattributed_scroll(self):
+        """A connected Logitech is not enough: only wheel events the IOHID
+        monitor actually saw from a Logitech mouse may be inverted."""
+        hook = self._mouse_hook_macos.MouseHook()
+        hook._running = True
+        hook._tap = MagicMock(name="tap")
+        hook.invert_vscroll = True
+        hook.wheel_native_invert_vertical = False
+        hook._connected_device = self._logitech_stub()
+        cg_event = MagicMock(name="cg_event")
+        self.mock_quartz.CGEventGetIntegerValueField.side_effect = (
+            self._mock_get_field(is_continuous=0)
+        )
+        with patch.object(hook, "_negate_scroll_axis") as negate:
+            result = hook._event_tap_callback(
+                None, self._kCGEventScrollWheel, cg_event, None
+            )
+        negate.assert_not_called()
+        self.assertIs(result, cg_event)
+
     def test_os_inversion_resumes_when_logitech_reconnects(self):
         """Disconnect/reconnect transitions must not require Mouser restart:
         the very next event after ``_connected_device`` flips back to a
@@ -628,6 +718,7 @@ class MacOSSuppressionTests(unittest.TestCase):
         negate_off.assert_not_called()
 
         hook._connected_device = self._logitech_stub()
+        self._mark_recent_logitech_scroll(hook)
         with patch.object(hook, "_negate_scroll_axis") as negate_on:
             hook._event_tap_callback(
                 None, self._kCGEventScrollWheel, MagicMock(name="evt-on"), None
@@ -692,6 +783,8 @@ class ProtocolConformanceTests(unittest.TestCase):
                 "wheel_native_invert_horizontal",
                 "invert_vscroll",
                 "invert_hscroll",
+                "_physical_logitech_bound",
+                "_scroll_event_targets_logitech",
             ):
                 self.assertTrue(
                     hasattr(inst, attr),
@@ -730,6 +823,12 @@ class _FakeHook:
     def reset_bindings(self): pass
     def start(self): pass
     def stop(self): pass
+
+    def _physical_logitech_bound(self):
+        device = self.connected_device
+        if device is None:
+            return False
+        return is_physical_device_source(getattr(device, "source", None))
 
 
 class _FakeAppDetector:
@@ -784,6 +883,7 @@ class EngineNativeInvertTests(unittest.TestCase):
                 ack=ack, has_wheel=has_wheel, has_thumb=has_thumb,
             )
             engine.hook.connected_device = SimpleNamespace(
+                source="hidapi",
                 has_hires_wheel=has_wheel,
                 has_thumbwheel=has_thumb,
             )
@@ -822,12 +922,40 @@ class EngineNativeInvertTests(unittest.TestCase):
     def test_incapable_device_skips_firmware_invert(self):
         engine = self._make_engine(invert_v=True, has_wheel=False, has_thumb=False)
         engine.hook.connected_device = SimpleNamespace(
+            source="hidapi",
             has_hires_wheel=False, has_thumbwheel=False,
         )
         engine._apply_wheel_invert_setting()
         hg = engine.hook._hid_gesture
         self.assertEqual(hg.requests, [])
         self.assertFalse(engine.wheel_native_invert_active)
+
+    def test_virtual_remote_device_skips_firmware_invert(self):
+        engine = self._make_engine(invert_v=True, invert_h=True)
+        engine.hook.connected_device = SimpleNamespace(
+            source=DEVICE_SOURCE_REMOTE_VIRTUAL,
+            has_hires_wheel=True,
+            has_thumbwheel=True,
+        )
+        engine._apply_wheel_invert_setting()
+        self.assertEqual(engine.hook._hid_gesture.requests, [])
+        self.assertFalse(engine.wheel_native_invert_active)
+
+    def test_virtual_deskflow_shim_skips_firmware_invert(self):
+        engine = self._make_engine(invert_v=True)
+        engine.hook.connected_device = SimpleNamespace(
+            source=DEVICE_SOURCE_DESKFLOW_SHIM,
+            has_hires_wheel=True,
+            has_thumbwheel=True,
+        )
+        engine._apply_wheel_invert_setting()
+        self.assertEqual(engine.hook._hid_gesture.requests, [])
+
+    def test_virtual_remote_skips_horizontal_os_fallback(self):
+        hook = BaseMouseHook()
+        hook._connected_device = SimpleNamespace(source=DEVICE_SOURCE_REMOTE_VIRTUAL)
+        hook.invert_hscroll = True
+        self.assertFalse(hook._apply_hscroll_invert_fallback(linux_evdev=True))
 
     def test_failed_ack_falls_back_to_os_layer(self):
         engine = self._make_engine(invert_v=True, ack=False)
@@ -887,6 +1015,88 @@ class EngineNativeInvertTests(unittest.TestCase):
         engine.cfg["settings"]["wheel_divert"] = "off"
         engine._apply_wheel_invert_setting()
         self.assertEqual(seen, [False, True, False])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Scroll monitor + Linux attribution
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class LogitechScrollMonitorTests(unittest.TestCase):
+    def test_recent_wheel_expires(self):
+        monitor = LogitechScrollMonitor()
+        monitor.mark_wheel()
+        self.assertTrue(monitor.recent_wheel())
+        monitor._last_wheel_monotonic -= 1.0
+        self.assertFalse(monitor.recent_wheel())
+
+    def test_stop_clears_recent_mark(self):
+        monitor = LogitechScrollMonitor()
+        monitor.mark_wheel()
+        monitor.stop()
+        self.assertFalse(monitor.recent_wheel())
+
+
+class MacOSScrollMonitorLifecycleTests(unittest.TestCase):
+    def test_sync_starts_only_when_physical_logitech_bound(self):
+        try:
+            from core import mouse_hook_macos as mhm
+        except Exception:
+            self.skipTest("macOS hook unavailable")
+        hook = mhm.MouseHook()
+        monitor = hook._logitech_scroll_monitor
+        with (
+            patch.object(mhm, "SCROLL_MONITOR_AVAILABLE", True),
+            patch.object(monitor, "start") as start,
+            patch.object(monitor, "stop") as stop,
+        ):
+            hook._connected_device = SimpleNamespace(source="hidapi")
+            hook._sync_logitech_scroll_monitor()
+            start.assert_called_once()
+            stop.assert_not_called()
+
+            start.reset_mock()
+            hook._connected_device = SimpleNamespace(
+                source=DEVICE_SOURCE_REMOTE_VIRTUAL
+            )
+            hook._sync_logitech_scroll_monitor()
+            stop.assert_called_once()
+            start.assert_not_called()
+
+    def test_scroll_attribution_fail_closed_without_monitor(self):
+        try:
+            from core import mouse_hook_macos as mhm
+        except Exception:
+            self.skipTest("macOS hook unavailable")
+        hook = mhm.MouseHook()
+        with patch.object(mhm, "SCROLL_MONITOR_AVAILABLE", False):
+            self.assertFalse(
+                hook._scroll_event_targets_logitech(cg_event=MagicMock())
+            )
+
+
+class LinuxScrollAttributionTests(unittest.TestCase):
+    def test_handle_rel_passes_linux_evdev_to_vertical_fallback(self):
+        try:
+            from core import mouse_hook_linux as mhl
+        except Exception:
+            self.skipTest("Linux hook unavailable")
+        if not mhl._EVDEV_OK:
+            self.skipTest("evdev not installed")
+        hook = mhl.MouseHook()
+        hook._ui_passthrough = False
+        hook._evdev_remap_ready = True
+        hook._uinput = SimpleNamespace(write_event=Mock(), write=Mock())
+        event = SimpleNamespace(
+            type=mhl._ecodes.EV_REL,
+            code=mhl._ecodes.REL_WHEEL,
+            value=1,
+        )
+        with patch.object(
+            hook, "_apply_vscroll_invert_fallback", return_value=True
+        ) as gate:
+            hook._handle_rel(event)
+        gate.assert_called_once_with(linux_evdev=True)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

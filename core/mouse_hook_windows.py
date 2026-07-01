@@ -5,6 +5,7 @@ Windows mouse hook implementation.
 import ctypes
 import ctypes.wintypes as wintypes
 import queue
+import re
 import sys
 import threading
 import time
@@ -26,7 +27,9 @@ from ctypes import (
 from core.key_simulator import MOUSEEVENTF_HWHEEL, MOUSEEVENTF_WHEEL
 from core.key_simulator import inject_scroll as _inject_scroll_impl
 from core.mouse_hook_base import BaseMouseHook, HidGestureListener
-from core.mouse_hook_types import MouseEvent
+from core.mouse_hook_types import LOGITECH_SCROLL_RECENT_S, MouseEvent
+
+_LOGITECH_VID_RE = re.compile(r"vid_046d\b", re.IGNORECASE)
 
 WH_MOUSE_LL = 14
 WM_XBUTTONDOWN = 0x020B
@@ -35,6 +38,8 @@ WM_MBUTTONDOWN = 0x0207
 WM_MBUTTONUP = 0x0208
 WM_MOUSEHWHEEL = 0x020E
 WM_MOUSEWHEEL = 0x020A
+RI_MOUSE_WHEEL = 0x0400
+RI_MOUSE_HWHEEL = 0x0800
 
 HC_ACTION = 0
 XBUTTON1 = 0x0001
@@ -163,6 +168,9 @@ RegisterRawInputDevices = windll.user32.RegisterRawInputDevices
 GetRawInputData = windll.user32.GetRawInputData
 GetRawInputData.argtypes = [c_void_p, c_uint, c_void_p, POINTER(c_uint), c_uint]
 GetRawInputData.restype = c_uint
+GetRawInputBuffer = windll.user32.GetRawInputBuffer
+GetRawInputBuffer.argtypes = [c_void_p, POINTER(c_uint), c_uint]
+GetRawInputBuffer.restype = c_uint
 GetRawInputDeviceInfoW = windll.user32.GetRawInputDeviceInfoW
 RegisterClassExW = windll.user32.RegisterClassExW
 
@@ -241,6 +249,9 @@ class MouseHook(BaseMouseHook):
         self._startup_ok = False
         self._prev_raw_buttons = {}
         self._last_rehook_time = 0
+        # WM_INPUT wheel marks from ``_process_raw_input``; used when the LL
+        # hook's ``GetRawInputBuffer`` peek returns empty for the same stroke.
+        self._last_logitech_wheel_monotonic = 0.0
         self._init_dispatch_queue(maxsize=512)
         self._dispatch_worker_thread = None
 
@@ -305,7 +316,9 @@ class MouseHook(BaseMouseHook):
             # to another machine while Mouser keeps running here.
             if not self._should_intercept_events():
                 # Host-local scroll invert still runs while KVM focus is remote.
-                if wParam == WM_MOUSEWHEEL and self._apply_vscroll_invert_fallback():
+                if wParam == WM_MOUSEWHEEL and self._apply_vscroll_invert_fallback(
+                    wParam=wParam, lParam=lParam
+                ):
                     delta = hiword(mouse_data)
                     if delta != 0 and self._ri_hwnd:
                         self._pending_vscroll += -delta
@@ -314,7 +327,9 @@ class MouseHook(BaseMouseHook):
                                 self._vscroll_posted = True
                                 return 1
                             self._pending_vscroll -= -delta
-                elif wParam == WM_MOUSEHWHEEL and self._apply_hscroll_invert_fallback():
+                elif wParam == WM_MOUSEHWHEEL and self._apply_hscroll_invert_fallback(
+                    wParam=wParam, lParam=lParam
+                ):
                     delta = hiword(mouse_data)
                     if delta != 0 and self._ri_hwnd:
                         self._pending_hscroll += -delta
@@ -356,7 +371,7 @@ class MouseHook(BaseMouseHook):
                 # currently connected (the toggle is meant for Logitech
                 # scroll, not generic / trackball / virtual mouse events) and
                 # the firmware is not already inverting at the source.
-                if self._apply_vscroll_invert_fallback():
+                if self._apply_vscroll_invert_fallback(wParam=wParam, lParam=lParam):
                     delta = hiword(mouse_data)
                     if delta != 0 and self._ri_hwnd:
                         self._pending_vscroll += -delta
@@ -380,7 +395,7 @@ class MouseHook(BaseMouseHook):
                     event = MouseEvent(MouseEvent.HSCROLL_RIGHT, abs(delta))
                     should_block = MouseEvent.HSCROLL_RIGHT in self._blocked_events
 
-                if self._apply_hscroll_invert_fallback():
+                if self._apply_hscroll_invert_fallback(wParam=wParam, lParam=lParam):
                     if delta != 0 and self._ri_hwnd and not should_block:
                         self._pending_hscroll += -delta
                         if self._hscroll_posted:
@@ -419,7 +434,51 @@ class MouseHook(BaseMouseHook):
         return name
 
     def _is_logitech(self, hDevice):
-        return "046d" in self._get_device_name(hDevice).lower()
+        return bool(_LOGITECH_VID_RE.search(self._get_device_name(hDevice)))
+
+    def _recent_logitech_wheel_from_wm_input(self) -> bool:
+        return (
+            time.monotonic() - self._last_logitech_wheel_monotonic
+        ) < LOGITECH_SCROLL_RECENT_S
+
+    def _scroll_event_targets_logitech(
+        self,
+        *,
+        cg_event=None,
+        wParam=None,
+        lParam=None,
+        linux_evdev=False,
+    ) -> bool:
+        if linux_evdev:
+            return True
+        if wParam not in (WM_MOUSEWHEEL, WM_MOUSEHWHEEL):
+            return False
+        wheel_flag = RI_MOUSE_WHEEL if wParam == WM_MOUSEWHEEL else RI_MOUSE_HWHEEL
+        header_size = sizeof(RAWINPUTHEADER)
+        size = c_uint(0)
+        # ``GetRawInputBuffer`` drains the per-thread raw-input queue (unlike
+        # ``GetRawInputData`` on a single ``WM_INPUT`` lParam). The LL hook
+        # often sees wheel messages after WM_INPUT already consumed packets, so
+        # we also correlate against a recent Logitech wheel mark from the RI
+        # window proc below.
+        GetRawInputBuffer(None, byref(size), header_size)
+        if size.value == 0:
+            return self._recent_logitech_wheel_from_wm_input()
+        buffer = create_string_buffer(size.value)
+        if GetRawInputBuffer(buffer, byref(size), header_size) == 0xFFFFFFFF:
+            return self._recent_logitech_wheel_from_wm_input()
+        offset = 0
+        while offset + header_size <= size.value:
+            header = RAWINPUTHEADER.from_buffer_copy(buffer, offset)
+            if (
+                header.dwType == RIM_TYPEMOUSE
+                and self._is_logitech(header.hDevice)
+            ):
+                mouse = RAWMOUSE.from_buffer_copy(buffer, offset + header_size)
+                if mouse.usButtonFlags & wheel_flag:
+                    return True
+            offset += int(header.dwSize)
+        return self._recent_logitech_wheel_from_wm_input()
 
     def _ri_wndproc(self, hwnd, msg, wParam, lParam):
         if msg == WM_INPUT:
@@ -471,6 +530,9 @@ class MouseHook(BaseMouseHook):
         if not self._is_logitech(header.hDevice):
             return
         if header.dwType == RIM_TYPEMOUSE:
+            mouse = RAWMOUSE.from_buffer_copy(buffer, sizeof(RAWINPUTHEADER))
+            if mouse.usButtonFlags & (RI_MOUSE_WHEEL | RI_MOUSE_HWHEEL):
+                self._last_logitech_wheel_monotonic = time.monotonic()
             self._check_raw_mouse_gesture(header.hDevice, buffer)
 
     def _check_raw_mouse_gesture(self, hDevice, buffer):

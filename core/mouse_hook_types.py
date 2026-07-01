@@ -6,6 +6,25 @@ from dataclasses import dataclass
 import time
 from typing import Any
 
+# Logitech USB vendor id (lowercase hex without prefix for string matching).
+LOGI_VENDOR_ID = 0x046D
+
+# ``ConnectedDeviceInfo.source`` values for KVM / Deskflow virtual devices.
+DEVICE_SOURCE_REMOTE_VIRTUAL = "remote-virtual"
+DEVICE_SOURCE_DESKFLOW_SHIM = "deskflow-shim"
+VIRTUAL_DEVICE_SOURCES = frozenset({
+    DEVICE_SOURCE_REMOTE_VIRTUAL,
+    DEVICE_SOURCE_DESKFLOW_SHIM,
+})
+
+# Correlate IOHID wheel callbacks with CGEvent scroll (macOS) / WM_INPUT (Windows).
+LOGITECH_SCROLL_RECENT_S = 0.080
+
+
+def is_physical_device_source(source: object) -> bool:
+    """True when ``source`` is not a KVM virtual device descriptor."""
+    return source not in VIRTUAL_DEVICE_SOURCES
+
 
 @dataclass(frozen=True)
 class HidRuntimeState:

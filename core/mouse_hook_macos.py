@@ -58,8 +58,30 @@ _CG_SCROLL_FIELD_IS_CONTINUOUS = getattr(
     "kCGScrollWheelEventIsContinuous",
     88,
 )
+_CG_SCROLL_FIELD_MOMENTUM_PHASE = getattr(
+    Quartz if _QUARTZ_OK else object(),
+    "kCGScrollWheelEventMomentumPhase",
+    123,
+)
+_CG_SCROLL_FIELD_SCROLL_PHASE = getattr(
+    Quartz if _QUARTZ_OK else object(),
+    "kCGScrollWheelEventScrollPhase",
+    99,
+)
+_CG_SCROLL_PHASE_NONE = getattr(
+    Quartz if _QUARTZ_OK else object(),
+    "kCGScrollPhaseNone",
+    0,
+)
+_CG_SCROLL_PHASE_ENDED = getattr(
+    Quartz if _QUARTZ_OK else object(),
+    "kCGScrollPhaseEnded",
+    4,
+)
 _kCGEventTapDisabledByTimeout = 0xFFFFFFFE
 _kCGEventTapDisabledByUserInput = 0xFFFFFFFF
+
+from core.macos_iokit_scroll import LogitechScrollMonitor, SCROLL_MONITOR_AVAILABLE
 
 
 class MouseHook(BaseMouseHook):
@@ -87,6 +109,16 @@ class MouseHook(BaseMouseHook):
         # the BLE-notification latency can't leak a visible drift.
         self._last_cursor_pos = None
         self._gesture_anchor = None
+        self._logitech_scroll_monitor = LogitechScrollMonitor()
+
+    def _on_hid_connect(self):
+        super()._on_hid_connect()
+        # IOHID monitor start/stop runs on the event-tap run loop; the next
+        # ScrollWheel event calls ``_sync_logitech_scroll_monitor``.
+
+    def _on_hid_disconnect(self):
+        super()._on_hid_disconnect()
+        # Same run-loop constraint as connect: sync on the next scroll event.
 
     def _warp_cursor(self, pos) -> None:
         """Pin the hardware cursor to ``pos`` without synthesizing an event.
@@ -123,6 +155,50 @@ class MouseHook(BaseMouseHook):
             value = Quartz.CGEventGetIntegerValueField(cg_event, field)
             if value:
                 Quartz.CGEventSetIntegerValueField(cg_event, field, -value)
+
+    def _scroll_event_targets_logitech(
+        self,
+        *,
+        cg_event=None,
+        wParam=None,
+        lParam=None,
+        linux_evdev=False,
+    ) -> bool:
+        if linux_evdev:
+            return True
+        if cg_event is None:
+            return False
+        if not SCROLL_MONITOR_AVAILABLE:
+            # Fail closed: without IOHID wheel attribution we cannot prove the
+            # scroll came from a physical Logitech (firmware invert still works).
+            return False
+        try:
+            if self.ignore_trackpad and Quartz.CGEventGetIntegerValueField(
+                cg_event, _CG_SCROLL_FIELD_IS_CONTINUOUS
+            ):
+                return False
+            if Quartz.CGEventGetIntegerValueField(
+                cg_event, _CG_SCROLL_FIELD_MOMENTUM_PHASE
+            ):
+                return False
+            phase = Quartz.CGEventGetIntegerValueField(
+                cg_event, _CG_SCROLL_FIELD_SCROLL_PHASE
+            )
+            if phase not in (_CG_SCROLL_PHASE_NONE, _CG_SCROLL_PHASE_ENDED):
+                return False
+        except Exception as exc:  # noqa: BLE001 - Quartz boundary
+            self._emit_debug(f"scroll attribution check failed: {exc!r}")
+            return False
+        return self._logitech_scroll_monitor.recent_wheel()
+
+    def _sync_logitech_scroll_monitor(self) -> None:
+        """Start/stop the IOHID wheel tap on the event-tap run loop."""
+        if not SCROLL_MONITOR_AVAILABLE:
+            return
+        if self._physical_logitech_bound():
+            self._logitech_scroll_monitor.start()
+        else:
+            self._logitech_scroll_monitor.stop()
 
     def _dispatch_worker(self):
         while self._running:
@@ -185,9 +261,10 @@ class MouseHook(BaseMouseHook):
             # this one.
             if not self._should_intercept_events():
                 if event_type == Quartz.kCGEventScrollWheel:
-                    if self._apply_vscroll_invert_fallback():
+                    self._sync_logitech_scroll_monitor()
+                    if self._apply_vscroll_invert_fallback(cg_event=cg_event):
                         self._negate_scroll_axis(cg_event, 1)
-                    if self._apply_hscroll_invert_fallback():
+                    if self._apply_hscroll_invert_fallback(cg_event=cg_event):
                         self._negate_scroll_axis(cg_event, 2)
                 return cg_event
 
@@ -314,6 +391,7 @@ class MouseHook(BaseMouseHook):
                     should_block = MouseEvent.THUMB_BUTTON_UP in self._blocked_events
 
             elif event_type == Quartz.kCGEventScrollWheel:
+                self._sync_logitech_scroll_monitor()
                 # Allow Mouser's own injected scroll events through untouched.
                 if (
                     Quartz.CGEventGetIntegerValueField(
@@ -363,9 +441,9 @@ class MouseHook(BaseMouseHook):
                 # Logitech scroll, not for inverting every trackpad and
                 # generic USB mouse the OS hands us. Also skipped when the
                 # firmware already inverted at the source.
-                if self._apply_vscroll_invert_fallback():
+                if self._apply_vscroll_invert_fallback(cg_event=cg_event):
                     self._negate_scroll_axis(cg_event, 1)
-                if self._apply_hscroll_invert_fallback():
+                if self._apply_hscroll_invert_fallback(cg_event=cg_event):
                     self._negate_scroll_axis(cg_event, 2)
 
             if mouse_event:
@@ -578,6 +656,7 @@ class MouseHook(BaseMouseHook):
         self._running = False
         self._stop_hid_listener()
         self._connected_device = None
+        self._logitech_scroll_monitor.stop()
 
         if self._tap:
             Quartz.CGEventTapEnable(self._tap, False)

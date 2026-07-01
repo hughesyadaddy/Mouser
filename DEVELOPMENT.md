@@ -160,6 +160,18 @@ The engine drives this via `_apply_wheel_invert_setting` on every profile / devi
 
 The kill-switch is `settings.wheel_divert` in `config.json`: `"auto"` (default) enables divert on capable devices; `"off"` forces the OS-layer fallback even on MX Master.
 
+#### Per-event scroll attribution (KVM / physical-only invert)
+
+Scroll inversion must flip **only** wheel events from a **physically attached** Logitech on the machine running Mouser. KVM virtual devices (`remote-virtual`, `deskflow-shim` from [`core/remote_device.py`](core/remote_device.py)) must not trigger invert — otherwise Deskflow-forwarded scroll from the host would be flipped again on the client.
+
+| Platform | Attribution mechanism | Shared constants |
+|---|---|---|
+| **macOS** | IOHID wheel monitor ([`core/macos_iokit_scroll.py`](core/macos_iokit_scroll.py)) correlates CGEvent scroll with recent Logitech wheel HID values; trackpad continuous / momentum / in-progress phases are filtered | `LOGITECH_SCROLL_RECENT_S` (80 ms) in [`core/mouse_hook_types.py`](core/mouse_hook_types.py) |
+| **Windows** | `GetRawInputBuffer` peek in the LL hook plus a backup mark from the `WM_INPUT` raw-input window when the buffer is empty; device path must match `VID_046D` | same |
+| **Linux** | evdev grab is Logitech-only; `_handle_rel` passes `linux_evdev=True` into the fallback gate | `VIRTUAL_DEVICE_SOURCES` in `mouse_hook_types` |
+
+**Host vs client policy:** On the USB host, scroll invert stays active even while KVM focus is remote (`_should_intercept_events` stands down, but `_apply_*scroll_invert_fallback` does not). On a client with only a virtual remote device, both firmware and OS-layer invert are skipped (`_physical_logitech_bound()` is false). If the macOS IOHID monitor is unavailable, OS-layer invert fails closed; HID++ firmware invert still works on capable hardware.
+
 ### App detector
 
 [`core/app_detector.py`](core/app_detector.py) polls the foreground window every 300ms.

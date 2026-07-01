@@ -49,6 +49,10 @@ import time
 from core.hid_deskflow_backend import get_deskflow_sink
 from core.hid_sink import SINK_MAGIC, is_json_line_start, try_decode_report_frame
 from core.logi_devices import build_connected_device_info
+from core.mouse_hook_types import (
+    DEVICE_SOURCE_DESKFLOW_SHIM,
+    DEVICE_SOURCE_REMOTE_VIRTUAL,
+)
 
 PROTOCOL_VERSION = 1
 DEFAULT_PORT = 19795  # 0x4D53 "MS"
@@ -383,10 +387,10 @@ class RemoteDeviceServer:
 
         if self._transparent_transport:
             transport = "USB Receiver"
-            source = "deskflow-shim"
+            source = DEVICE_SOURCE_DESKFLOW_SHIM
         else:
             transport = "remote"
-            source = "remote-virtual"
+            source = DEVICE_SOURCE_REMOTE_VIRTUAL
 
         try:
             info = build_connected_device_info(

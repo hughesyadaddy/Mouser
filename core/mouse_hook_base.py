@@ -10,7 +10,12 @@ try:
 except Exception:
     HidGestureListener = None
 
-from core.mouse_hook_types import HidRuntimeState, MouseEvent, format_debug_details
+from core.mouse_hook_types import (
+    HidRuntimeState,
+    MouseEvent,
+    format_debug_details,
+    is_physical_device_source,
+)
 
 
 
@@ -143,6 +148,18 @@ class BaseMouseHook:
         """True while a Logitech device is bound to this host's pipeline."""
         return self._connected_device is not None
 
+    def _physical_logitech_bound(self) -> bool:
+        """True when a Logitech is physically attached on this machine.
+
+        KVM virtual devices (``remote-virtual``, ``deskflow-shim``) do not
+        count — scroll invert must not touch Deskflow-forwarded wheel events
+        on a client that only has a remote-described device connected.
+        """
+        device = self._connected_device
+        if device is None:
+            return False
+        return is_physical_device_source(getattr(device, "source", None))
+
     def _should_intercept_events(self) -> bool:
         """True only when the platform hook should block, remap, or dispatch
         OS-level mouse events to the engine.
@@ -199,7 +216,30 @@ class BaseMouseHook:
         except Exception:  # noqa: BLE001 - boundary
             return None
 
-    def _apply_vscroll_invert_fallback(self) -> bool:
+    def _scroll_event_targets_logitech(
+        self,
+        *,
+        cg_event=None,
+        wParam=None,
+        lParam=None,
+        linux_evdev=False,
+    ) -> bool:
+        """True when the scroll event originated from a Logitech mouse.
+
+        Linux evdev only forwards the grabbed Logitech source, so callers
+        there pass ``linux_evdev=True``. macOS and Windows override this to
+        attribute individual CGEvent / WH_MOUSE_* wheel messages.
+        """
+        return bool(linux_evdev)
+
+    def _apply_vscroll_invert_fallback(
+        self,
+        *,
+        cg_event=None,
+        wParam=None,
+        lParam=None,
+        linux_evdev=False,
+    ) -> bool:
         """True only when the OS-layer vertical-scroll inversion fallback
         should fire on the current event.
 
@@ -219,9 +259,23 @@ class BaseMouseHook:
         # Per-axis: only stand down when the VERTICAL axis is firmware-inverted.
         if self.wheel_native_invert_vertical:
             return False
-        return self._logitech_device_bound()
+        if not self._physical_logitech_bound():
+            return False
+        return self._scroll_event_targets_logitech(
+            cg_event=cg_event,
+            wParam=wParam,
+            lParam=lParam,
+            linux_evdev=linux_evdev,
+        )
 
-    def _apply_hscroll_invert_fallback(self) -> bool:
+    def _apply_hscroll_invert_fallback(
+        self,
+        *,
+        cg_event=None,
+        wParam=None,
+        lParam=None,
+        linux_evdev=False,
+    ) -> bool:
         """Horizontal twin of :meth:`_apply_vscroll_invert_fallback`.
 
         Gated on the HORIZONTAL firmware flag only -- this is the line that
@@ -233,7 +287,14 @@ class BaseMouseHook:
             return False
         if self.wheel_native_invert_horizontal:
             return False
-        return self._logitech_device_bound()
+        if not self._physical_logitech_bound():
+            return False
+        return self._scroll_event_targets_logitech(
+            cg_event=cg_event,
+            wParam=wParam,
+            lParam=lParam,
+            linux_evdev=linux_evdev,
+        )
 
     @property
     def _thumb_button_via_hid(self) -> bool:

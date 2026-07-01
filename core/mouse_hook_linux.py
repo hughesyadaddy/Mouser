@@ -752,7 +752,7 @@ class MouseHook(BaseMouseHook):
             # currently connected (otherwise we would invert every uinput
             # scroll from a generic mouse or trackball routed through us)
             # and the firmware is not already inverting at the source.
-            if self._apply_vscroll_invert_fallback():
+            if self._apply_vscroll_invert_fallback(linux_evdev=True):
                 self._uinput.write(_ecodes.EV_REL, code, -value)
             else:
                 self._uinput.write_event(event)
@@ -774,7 +774,7 @@ class MouseHook(BaseMouseHook):
 
             if should_block:
                 return
-            if self._apply_hscroll_invert_fallback():
+            if self._apply_hscroll_invert_fallback(linux_evdev=True):
                 self._uinput.write(_ecodes.EV_REL, code, -value)
             else:
                 self._uinput.write_event(event)

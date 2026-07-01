@@ -6,8 +6,13 @@ import threading
 import time
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from core.mouse_hook_base import BaseMouseHook
+from core.mouse_hook_types import (
+    DEVICE_SOURCE_DESKFLOW_SHIM,
+    DEVICE_SOURCE_REMOTE_VIRTUAL,
+)
 from core.remote_forward import RemoteForwarder
 
 TOKEN = "bridge-token"
@@ -352,17 +357,37 @@ class HookForwardingGateTests(unittest.TestCase):
 
     def test_scroll_invert_fallback_active_while_forwarding(self):
         hook, _ = self._make_hook_with_forwarder(forwarding=True)
-        hook._connected_device = object()
+        hook._connected_device = SimpleNamespace(source="hidapi")
         hook.invert_vscroll = True
         hook.invert_hscroll = True
         self.assertFalse(hook._should_intercept_events())
-        self.assertTrue(hook._apply_vscroll_invert_fallback())
-        self.assertTrue(hook._apply_hscroll_invert_fallback())
+        self.assertTrue(hook._apply_vscroll_invert_fallback(linux_evdev=True))
+        self.assertTrue(hook._apply_hscroll_invert_fallback(linux_evdev=True))
 
-    def test_scroll_invert_fallback_off_without_logitech(self):
+    def test_scroll_invert_fallback_requires_logitech_event(self):
         hook, _ = self._make_hook_with_forwarder(forwarding=True)
+        hook._connected_device = object()
         hook.invert_vscroll = True
         self.assertFalse(hook._apply_vscroll_invert_fallback())
+
+    def test_scroll_invert_skipped_for_virtual_devices(self):
+        hook = _StubHook()
+        hook.invert_vscroll = True
+        for source in (DEVICE_SOURCE_REMOTE_VIRTUAL, DEVICE_SOURCE_DESKFLOW_SHIM):
+            with self.subTest(source=source):
+                hook._connected_device = SimpleNamespace(source=source)
+                self.assertFalse(
+                    hook._apply_vscroll_invert_fallback(linux_evdev=True)
+                )
+                self.assertFalse(
+                    hook._apply_hscroll_invert_fallback(linux_evdev=True)
+                )
+
+    def test_scroll_invert_allowed_for_physical_device(self):
+        hook = _StubHook()
+        hook._connected_device = SimpleNamespace(source="hidapi")
+        hook.invert_vscroll = True
+        self.assertTrue(hook._apply_vscroll_invert_fallback(linux_evdev=True))
 
     def test_raw_report_never_forwarded(self):
         hook = _StubHook()
@@ -374,6 +399,110 @@ class HookForwardingGateTests(unittest.TestCase):
         hook.set_remote_forwarder(forwarder)
         self.assertFalse(hook._maybe_forward_raw_report(b"\x11\xff"))
         self.assertEqual(sent, [])
+
+
+class WindowsScrollAttributionTests(unittest.TestCase):
+    """Windows per-event scroll attribution via GetRawInputBuffer."""
+
+    def test_returns_false_when_raw_buffer_empty(self):
+        try:
+            from core import mouse_hook_windows as mhw
+        except ImportError:
+            self.skipTest("Windows hook unavailable")
+        hook = mhw.MouseHook()
+        with patch.object(mhw, "GetRawInputBuffer", return_value=0):
+            self.assertFalse(
+                hook._scroll_event_targets_logitech(
+                    wParam=mhw.WM_MOUSEWHEEL, lParam=0
+                )
+            )
+
+    def test_returns_true_for_logitech_wheel_packet(self):
+        try:
+            from core import mouse_hook_windows as mhw
+            import ctypes
+            from ctypes import c_uint
+        except ImportError:
+            self.skipTest("Windows hook unavailable")
+        header_size = ctypes.sizeof(mhw.RAWINPUTHEADER)
+        mouse_size = ctypes.sizeof(mhw.RAWMOUSE)
+        total = header_size + mouse_size
+        buf = ctypes.create_string_buffer(total)
+        mhw.RAWINPUTHEADER(
+            dwType=mhw.RIM_TYPEMOUSE,
+            dwSize=total,
+            hDevice=0x1234,
+            wParam=None,
+        )
+        # Pack header + mouse into buffer manually
+        ctypes.memmove(
+            buf,
+            bytes(mhw.RAWINPUTHEADER(
+                dwType=mhw.RIM_TYPEMOUSE,
+                dwSize=total,
+                hDevice=0x1234,
+                wParam=None,
+            )),
+            header_size,
+        )
+        mouse = mhw.RAWMOUSE(
+            usFlags=0,
+            usButtonFlags=mhw.RI_MOUSE_WHEEL,
+            usButtonData=120,
+            ulRawButtons=0,
+            lLastX=0,
+            lLastY=0,
+            ulExtraInformation=0,
+        )
+        ctypes.memmove(
+            ctypes.addressof(buf) + header_size,
+            ctypes.byref(mouse),
+            mouse_size,
+        )
+
+        def _fill_buffer(out, size_ref, hdr_size):
+            if out is None:
+                size_ref.contents = c_uint(total)
+                return 0
+            ctypes.memmove(out, buf, total)
+            size_ref.contents = c_uint(total)
+            return 1
+
+        hook = mhw.MouseHook()
+        with (
+            patch.object(hook, "_is_logitech", return_value=True),
+            patch.object(mhw, "GetRawInputBuffer", side_effect=_fill_buffer),
+        ):
+            self.assertTrue(
+                hook._scroll_event_targets_logitech(
+                    wParam=mhw.WM_MOUSEWHEEL, lParam=0
+                )
+            )
+
+    def test_falls_back_to_recent_wm_input_wheel_mark(self):
+        try:
+            from core import mouse_hook_windows as mhw
+        except ImportError:
+            self.skipTest("Windows hook unavailable")
+        hook = mhw.MouseHook()
+        hook._last_logitech_wheel_monotonic = time.monotonic()
+        with patch.object(mhw, "GetRawInputBuffer", return_value=0):
+            self.assertTrue(
+                hook._scroll_event_targets_logitech(
+                    wParam=mhw.WM_MOUSEWHEEL, lParam=0
+                )
+            )
+
+    def test_vid_match_requires_vid_token_not_bare_substring(self):
+        try:
+            from core import mouse_hook_windows as mhw
+        except ImportError:
+            self.skipTest("Windows hook unavailable")
+        hook = mhw.MouseHook()
+        hook._device_name_cache[1] = r"\\?\HID#VID_DEAD&PID_BEEF"
+        hook._device_name_cache[2] = r"\\?\HID#VID_046D&PID_C52B"
+        self.assertFalse(hook._is_logitech(1))
+        self.assertTrue(hook._is_logitech(2))
 
 
 if __name__ == "__main__":

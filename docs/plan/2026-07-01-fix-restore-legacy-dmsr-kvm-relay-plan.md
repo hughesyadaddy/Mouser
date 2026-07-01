@@ -46,6 +46,8 @@ sequenceDiagram
     ClientM->>ClientM: decode + fire action
 ```
 
+
+
 **Passthrough path is OFF.** Host keeps exclusive USB; suppression is via `RemoteForwarder.should_forward()`, not IOHID seize.
 
 ## Phase 1 — Config rollback (all machines, ~15 min)
@@ -134,12 +136,14 @@ tail -f ~/Library/Logs/Mouser/mouser.log | rg 'RemoteForward|Gesture|Focus'
 tail -f ~/deskflow.log | rg 'switch|DMSR|mouser|bridge'
 ```
 
-| Step | Action | Pass criteria |
-|------|--------|---------------|
-| H1 | Mouser starts | `[RemoteForward] Connected to bridge 127.0.0.1:19796` |
-| H2 | Move cursor to tiny11 or macbookpro | `[RemoteForward] Focus -> remote (screen=...)` |
-| H3 | Perform swipe gesture (hold gesture button) | **No** `[Gesture] … [fired]` on host while focus remote |
-| H4 | Return cursor to hackintosh | `[RemoteForward] Focus -> local`; gestures fire on host again |
+
+| Step | Action                                      | Pass criteria                                                 |
+| ---- | ------------------------------------------- | ------------------------------------------------------------- |
+| H1   | Mouser starts                               | `[RemoteForward] Connected to bridge 127.0.0.1:19796`         |
+| H2   | Move cursor to tiny11 or macbookpro         | `[RemoteForward] Focus -> remote (screen=...)`                |
+| H3   | Perform swipe gesture (hold gesture button) | **No** `[Gesture] … [fired]` on host while focus remote       |
+| H4   | Return cursor to hackintosh                 | `[RemoteForward] Focus -> local`; gestures fire on host again |
+
 
 ### Client (macbookpro)
 
@@ -147,11 +151,13 @@ tail -f ~/deskflow.log | rg 'switch|DMSR|mouser|bridge'
 tail -f ~/Library/Logs/Mouser/mouser.log | rg 'RemoteDevice|Gesture|Focus|connect'
 ```
 
-| Step | Pass criteria |
-|------|---------------|
-| C1 | `[RemoteDevice] Listening on :19795` (or connect on focus) |
-| C2 | While host focus remote to this screen: `[Gesture] … [fired]` with expected action (e.g. Mission Control) |
-| C3 | No duplicate fires on host for same gesture |
+
+| Step | Pass criteria                                                                                             |
+| ---- | --------------------------------------------------------------------------------------------------------- |
+| C1   | `[RemoteDevice] Listening on :19795` (or connect on focus)                                                |
+| C2   | While host focus remote to this screen: `[Gesture] … [fired]` with expected action (e.g. Mission Control) |
+| C3   | No duplicate fires on host for same gesture                                                               |
+
 
 ### Client (tiny11)
 
@@ -219,24 +225,28 @@ If legacy path fails:
 
 ## Risk notes
 
-| Risk | Mitigation |
-|------|------------|
-| Token mismatch between machines | Single source of truth in `Deskflow.conf`; re-sync all `config.json` |
-| KVM toggle OFF clears forwarder | Keep toggle ON; only disable passthrough in Deskflow |
-| tiny11 stuck on local USB probe | May need client-side "skip local probe when no device" — separate fix |
+
+| Risk                                      | Mitigation                                                                          |
+| ----------------------------------------- | ----------------------------------------------------------------------------------- |
+| Token mismatch between machines           | Single source of truth in `Deskflow.conf`; re-sync all `config.json`                |
+| KVM toggle OFF clears forwarder           | Keep toggle ON; only disable passthrough in Deskflow                                |
+| tiny11 stuck on local USB probe           | May need client-side "skip local probe when no device" — separate fix               |
 | Installed Mouser.app older than `working` | Rebuild/install from `working` if `reload_kvm_integration` or deskflow auto missing |
+
 
 ## Files reference
 
-| Area | Path |
-|------|------|
-| Forwarder logic | `core/remote_forward.py` |
-| Engine startup | `core/engine.py` (`_start_remote_forwarder`) |
-| Deskflow auto-detect | `core/deskflow_integration.py` |
-| Hook suppression | `core/mouse_hook_base.py` (`_should_intercept_events`, `_maybe_forward_raw_report`) |
-| KVM UI toggle | `ui/backend.py` (`setDeskflowIntegrationEnabled`) |
-| Deskflow bridge docs | `deskflow/docs/mouser-bridge.md` |
-| Passthrough docs (deferred) | `deskflow/docs/hid-passthrough.md` |
+
+| Area                        | Path                                                                                |
+| --------------------------- | ----------------------------------------------------------------------------------- |
+| Forwarder logic             | `core/remote_forward.py`                                                            |
+| Engine startup              | `core/engine.py` (`_start_remote_forwarder`)                                        |
+| Deskflow auto-detect        | `core/deskflow_integration.py`                                                      |
+| Hook suppression            | `core/mouse_hook_base.py` (`_should_intercept_events`, `_maybe_forward_raw_report`) |
+| KVM UI toggle               | `ui/backend.py` (`setDeskflowIntegrationEnabled`)                                   |
+| Deskflow bridge docs        | `deskflow/docs/mouser-bridge.md`                                                    |
+| Passthrough docs (deferred) | `deskflow/docs/hid-passthrough.md`                                                  |
+
 
 ## Technical review (2026-07-01)
 
@@ -257,12 +267,14 @@ If legacy path fails:
 
 ### Gaps addressed
 
-| Gap | Resolution |
-|-----|------------|
-| Both bridge + passthrough ON | Deskflow logs `prefer HID passthrough only` (`Server.cpp:534`) — plan disables passthrough explicitly |
-| `resolve_integration()` returns None on host when passthrough off | Harmless for host; explicit `remote_forward.enabled=true` is sufficient |
-| macOS overrides `_on_hid_gesture_move` without extra wrap | Base class `_start_hid_listener` wraps with `_hid_event_entry` — forwarding works on macOS |
-| Client auto-start | `client_sink` from Deskflow client config still auto-enables `:19795` listener via `engine._start_remote_device_server` |
+
+| Gap                                                               | Resolution                                                                                                              |
+| ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| Both bridge + passthrough ON                                      | Deskflow logs `prefer HID passthrough only` (`Server.cpp:534`) — plan disables passthrough explicitly                   |
+| `resolve_integration()` returns None on host when passthrough off | Harmless for host; explicit `remote_forward.enabled=true` is sufficient                                                 |
+| macOS overrides `_on_hid_gesture_move` without extra wrap         | Base class `_start_hid_listener` wraps with `_hid_event_entry` — forwarding works on macOS                              |
+| Client auto-start                                                 | `client_sink` from Deskflow client config still auto-enables `:19795` listener via `engine._start_remote_device_server` |
+
 
 ### Review verdict
 

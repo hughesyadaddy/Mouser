@@ -187,7 +187,7 @@ _TRANSLATIONS = {
         "scroll.wheel_invert_inactive": "Inactive \u2014 connect a Logitech mouse",
         "scroll.wheel_invert_native_tooltip": "Inversion is flipped at the device firmware (HID++ 0x2121 / 0x2150). The scroll wheel reports the inverted direction natively, so any remote machine receiving these events over Synergy / DeskFlow / KVM / Barrier sees them already inverted.",
         "scroll.wheel_invert_os_tooltip": "Inversion is applied locally by Mouser before the OS dispatches the event. A remote machine receiving these scroll events over Synergy / DeskFlow / KVM / Barrier will see the original (un-inverted) direction.",
-        "scroll.wheel_invert_inactive_tooltip": "The wheel-invert toggle is on but no Logitech mouse is currently connected. Mouser only inverts scroll events from Logitech devices, so this toggle has no effect right now -- connect a supported Logitech mouse and the badge will update.",
+        "scroll.wheel_invert_inactive_tooltip": "The wheel-invert toggle is on but no Logitech mouse is physically connected to this machine. Mouser only inverts scroll from a local Logitech — not trackpads, generic mice, or KVM-forwarded scroll from another host.",
         "scroll.ignore_trackpad": "Ignore trackpad",
         "scroll.ignore_trackpad_desc": "Only respond to mouse events, not trackpad or Magic Mouse",
         "scroll.dpi_note": "DPI changes require HID++ communication with the device and will take effect after a short delay.",

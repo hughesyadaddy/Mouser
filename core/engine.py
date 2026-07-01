@@ -368,7 +368,8 @@ class Engine:
         invert_v = bool(settings.get("invert_vscroll", False))
         invert_h = bool(settings.get("invert_hscroll", False))
         device = self.connected_device
-        capable = bool(device and (
+        physical = self.hook._physical_logitech_bound()
+        capable = bool(physical and device and (
             getattr(device, "has_hires_wheel", False)
             or getattr(device, "has_thumbwheel", False)
         ))
