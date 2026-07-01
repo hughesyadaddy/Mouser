@@ -1052,7 +1052,6 @@ class Engine:
 
         if deskflow and deskflow.get("host_bridge"):
             enabled = True
-            decode_only = True
             if not token:
                 token = str(deskflow.get("bridge_token") or "")
             try:
@@ -1084,8 +1083,8 @@ class Engine:
             self.hook.set_remote_forwarder(forwarder)
             if decode_only:
                 self._schedule_decode_publish()
-            if deskflow and deskflow.get("host_bridge") and not fwd_cfg.get("enabled", False):
-                self._emit_status("Deskflow decode bridge auto-enabled")
+            elif deskflow and deskflow.get("host_bridge"):
+                self._emit_status("Deskflow device sharing auto-enabled")
 
     def _schedule_decode_publish(self):
         """Poll until feat_idx is ready and published to the bridge."""

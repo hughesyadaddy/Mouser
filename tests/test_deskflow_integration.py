@@ -45,7 +45,6 @@ class DeskflowIntegrationTests(unittest.TestCase):
                 handle.write(
                     "[server]\n"
                     "mouserBridgeEnabled=true\n"
-                    "hidPassthroughEnabled=true\n"
                     "mouserBridgePort=19800\n"
                     "mouserBridgeToken=bridge-token\n"
                 )

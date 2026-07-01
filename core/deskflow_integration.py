@@ -112,7 +112,7 @@ def resolve_integration(user_cfg: dict | None = None) -> dict[str, Any] | None:
         except (TypeError, ValueError):
             port = DEFAULT_CLIENT_PORT
         out["source"] = "manifest"
-        out["client_sink"] = bool(manifest.get("hid_passthrough", True))
+        out["client_sink"] = True
     else:
         for section in ("client", "General"):
             if _conf_bool(conf, section, "mouserEnabled"):
@@ -133,9 +133,7 @@ def resolve_integration(user_cfg: dict | None = None) -> dict[str, Any] | None:
     bridge_token = ""
     bridge_port = DEFAULT_BRIDGE_PORT
     for section in ("server", "General"):
-        if _conf_bool(conf, section, "mouserBridgeEnabled") and _conf_bool(
-            conf, section, "hidPassthroughEnabled"
-        ):
+        if _conf_bool(conf, section, "mouserBridgeEnabled"):
             bridge_token = _conf_str(conf, section, "mouserBridgeToken")
             bridge_port = _conf_int(conf, section, "mouserBridgePort", DEFAULT_BRIDGE_PORT)
             if bridge_token:
