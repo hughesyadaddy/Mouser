@@ -244,110 +244,6 @@ class MouseHook(BaseMouseHook):
         self._init_dispatch_queue(maxsize=512)
         self._dispatch_worker_thread = None
 
-    def _accumulate_gesture_delta(self, delta_x, delta_y, source):
-        if not (self._gesture_direction_enabled and self._gesture_active):
-            return
-        if self._gesture_cooldown_active():
-            self._emit_debug(
-                f"Gesture cooldown active source={source} dx={delta_x} dy={delta_y}"
-            )
-            self._emit_gesture_event(
-                {
-                    "type": "cooldown_active",
-                    "source": source,
-                    "dx": delta_x,
-                    "dy": delta_y,
-                }
-            )
-            return
-        if not self._gesture_tracking:
-            self._emit_debug(f"Gesture tracking started source={source}")
-            self._emit_gesture_event(
-                {
-                    "type": "tracking_started",
-                    "source": source,
-                }
-            )
-            self._start_gesture_tracking()
-
-        now = time.monotonic()
-        idle_ms = (now - self._gesture_last_move_at) * 1000.0
-        if idle_ms > self._gesture_timeout_ms:
-            self._emit_debug(
-                f"Gesture segment reset timeout source={source} "
-                f"accum_x={self._gesture_delta_x} accum_y={self._gesture_delta_y}"
-            )
-            self._start_gesture_tracking()
-
-        if self._gesture_input_source not in (None, source):
-            self._emit_debug(
-                f"Gesture source locked to {self._gesture_input_source}; "
-                f"ignoring {source} dx={delta_x} dy={delta_y}"
-            )
-            return
-        self._gesture_input_source = source
-
-        self._gesture_delta_x += delta_x
-        self._gesture_delta_y += delta_y
-        self._gesture_last_move_at = now
-        self._emit_debug(
-            f"Gesture segment source={source} "
-            f"accum_x={self._gesture_delta_x} accum_y={self._gesture_delta_y}"
-        )
-        self._emit_gesture_event(
-            {
-                "type": "segment",
-                "source": source,
-                "dx": self._gesture_delta_x,
-                "dy": self._gesture_delta_y,
-            }
-        )
-
-        gesture_event = self._detect_gesture_event()
-        if not gesture_event:
-            return
-
-        self._gesture_triggered = True
-        self._emit_debug(
-            "Gesture detected "
-            f"{gesture_event} source={source} "
-            f"delta_x={self._gesture_delta_x} delta_y={self._gesture_delta_y}"
-        )
-        self._emit_gesture_event(
-            {
-                "type": "detected",
-                "event_name": gesture_event,
-                "source": source,
-                "dx": self._gesture_delta_x,
-                "dy": self._gesture_delta_y,
-            }
-        )
-        self._dispatch(
-            MouseEvent(
-                gesture_event,
-                {
-                    "delta_x": self._gesture_delta_x,
-                    "delta_y": self._gesture_delta_y,
-                    "source": source,
-                },
-            )
-        )
-        self._gesture_cooldown_until = (
-            time.monotonic() + self._gesture_cooldown_ms / 1000.0
-        )
-        self._emit_debug(
-            f"Gesture cooldown started source={source} "
-            f"for_ms={self._gesture_cooldown_ms}"
-        )
-        self._emit_gesture_event(
-            {
-                "type": "cooldown_started",
-                "source": source,
-                "for_ms": self._gesture_cooldown_ms,
-            }
-        )
-        self._finish_gesture_tracking()
-
     _WM_NAMES = {
         0x0200: "WM_MOUSEMOVE",
         0x0201: "WM_LBUTTONDOWN",
@@ -400,6 +296,16 @@ class MouseHook(BaseMouseHook):
             if flags & INJECTED_FLAG:
                 return CallNextHookEx(self._hook, nCode, wParam, lParam)
 
+            # KVM / cold-start guard: when no Logitech is currently bound to
+            # this host, the WH_MOUSE_LL hook must be a complete pass-through.
+            # The hook sees events from every input device, so without this
+            # guard a trackpad scroll or generic USB mouse's xbutton click
+            # would still run through Mouser's remap pipeline -- the exact
+            # failure mode users hit when their KVM switches the Logitech
+            # to another machine while Mouser keeps running here.
+            if not self._should_intercept_events():
+                return CallNextHookEx(self._hook, nCode, wParam, lParam)
+
             if wParam == WM_XBUTTONDOWN:
                 xbutton = hiword(mouse_data)
                 if xbutton == XBUTTON1:
@@ -427,7 +333,11 @@ class MouseHook(BaseMouseHook):
                 should_block = MouseEvent.MIDDLE_UP in self._blocked_events
 
             elif wParam == WM_MOUSEWHEEL:
-                if self.invert_vscroll:
+                # The OS-layer inversion path only runs when a Logitech is
+                # currently connected (the toggle is meant for Logitech
+                # scroll, not generic / trackball / virtual mouse events) and
+                # the firmware is not already inverting at the source.
+                if self._apply_vscroll_invert_fallback():
                     delta = hiword(mouse_data)
                     if delta != 0 and self._ri_hwnd:
                         self._pending_vscroll += -delta
@@ -451,7 +361,7 @@ class MouseHook(BaseMouseHook):
                     event = MouseEvent(MouseEvent.HSCROLL_RIGHT, abs(delta))
                     should_block = MouseEvent.HSCROLL_RIGHT in self._blocked_events
 
-                if self.invert_hscroll:
+                if self._apply_hscroll_invert_fallback():
                     if delta != 0 and self._ri_hwnd and not should_block:
                         self._pending_hscroll += -delta
                         if self._hscroll_posted:
@@ -545,7 +455,14 @@ class MouseHook(BaseMouseHook):
             self._check_raw_mouse_gesture(header.hDevice, buffer)
 
     def _check_raw_mouse_gesture(self, hDevice, buffer):
-        if self._hid_gesture_available():
+        # MX Master 4 fallback: when the Sense Panel's HID++ divert was
+        # rejected, the panel surfaces as an OS-level button beyond
+        # XBUTTON2 (button 6). WH_MOUSE_LL cannot see buttons > 5, but the
+        # Raw Input extra-button mask below can -- the same mechanism the
+        # legacy no-HID++ path already relies on. In fallback mode this
+        # path drives gesture capture even though HID++ is available.
+        sense_panel_fallback = self._gesture_via_sense_panel
+        if self._hid_gesture_available() and not sense_panel_fallback:
             return
         mouse = RAWMOUSE.from_buffer_copy(buffer, sizeof(RAWINPUTHEADER))
         raw_buttons = mouse.ulRawButtons
@@ -555,18 +472,38 @@ class MouseHook(BaseMouseHook):
         extra_now = raw_buttons & ~STANDARD_BUTTON_MASK
         extra_prev = prev_buttons & ~STANDARD_BUTTON_MASK
 
-        if extra_now == extra_prev:
-            return
         if extra_now and not extra_prev:
-            if not self._gesture_active:
-                self._gesture_active = True
-                self._gesture_triggered = False
+            if sense_panel_fallback:
+                self._begin_gesture_capture("Sense panel gesture")
+            else:
+                with self._gesture_lock:
+                    if self._gesture_active:
+                        return
+                    self._gesture_active = True
                 print(f"[MouseHook] Gesture DOWN (rawBtns extra: 0x{extra_now:X})")
         elif not extra_now and extra_prev:
-            if self._gesture_active:
+            if sense_panel_fallback:
+                self._end_gesture_capture("Sense panel gesture")
+                return
+            with self._gesture_lock:
+                if not self._gesture_active:
+                    return
                 self._gesture_active = False
-                print("[MouseHook] Gesture UP")
-                self._dispatch(MouseEvent(MouseEvent.GESTURE_CLICK))
+            print("[MouseHook] Gesture UP")
+            self._dispatch(MouseEvent(MouseEvent.GESTURE_CLICK))
+            return
+
+        # While a Sense Panel gesture is held, raw mouse motion feeds the
+        # swipe detector (the macOS event tap and Linux REL events fill
+        # this role on the other platforms; HID++ rawXY is suppressed in
+        # fallback mode so it cannot pollute the capture).
+        if sense_panel_fallback and (mouse.lLastX or mouse.lLastY):
+            with self._gesture_lock:
+                gesture_active = self._gesture_active
+            if gesture_active:
+                self._accumulate_gesture_delta(
+                    mouse.lLastX, mouse.lLastY, "raw_mouse"
+                )
 
     def _setup_raw_input(self):
         instance = GetModuleHandleW(None)
@@ -595,7 +532,7 @@ class MouseHook(BaseMouseHook):
             None,
         )
         if not self._ri_hwnd:
-            print("[MouseHook] CreateWindowExW failed — gesture detection unavailable")
+            print("[MouseHook] CreateWindowExW failed -- gesture detection unavailable")
             return False
 
         ShowWindow(self._ri_hwnd, SW_HIDE)
@@ -683,7 +620,7 @@ class MouseHook(BaseMouseHook):
         if now - self._last_rehook_time < 2.0:
             return
         self._last_rehook_time = now
-        print("[MouseHook] Device change detected — refreshing hook")
+        print("[MouseHook] Device change detected -- refreshing hook")
         self._device_name_cache.clear()
         self._prev_raw_buttons.clear()
         self._reinstall_hook()
@@ -705,34 +642,21 @@ class MouseHook(BaseMouseHook):
             print("[MouseHook] Failed to reinstall hook!")
 
     def _on_hid_gesture_down(self):
-        if not self._gesture_active:
-            self._gesture_active = True
-            self._gesture_triggered = False
-            self._emit_debug("HID gesture button down")
-            self._emit_gesture_event({"type": "button_down"})
-            if self._gesture_direction_enabled and not self._gesture_cooldown_active():
-                self._start_gesture_tracking()
-            else:
-                self._gesture_tracking = False
-                self._gesture_triggered = False
+        # MX4 routing: when the Sense Panel is the gesture source for this
+        # device, the small HID++ "gesture" button (CID 0x00c3) is the
+        # Thumb button, not the gesture trigger.
+        if self._gesture_via_sense_panel:
+            self._emit_debug("HID thumb button down")
+            self._dispatch(MouseEvent(MouseEvent.THUMB_BUTTON_DOWN))
+            return
+        self._begin_gesture_capture("HID gesture")
 
     def _on_hid_gesture_up(self):
-        if self._gesture_active:
-            should_click = not self._gesture_triggered
-            self._gesture_active = False
-            self._finish_gesture_tracking()
-            self._gesture_triggered = False
-            self._emit_debug(
-                f"HID gesture button up click_candidate={str(should_click).lower()}"
-            )
-            self._emit_gesture_event(
-                {
-                    "type": "button_up",
-                    "click_candidate": should_click,
-                }
-            )
-            if should_click:
-                self._dispatch(MouseEvent(MouseEvent.GESTURE_CLICK))
+        if self._gesture_via_sense_panel:
+            self._emit_debug("HID thumb button up")
+            self._dispatch(MouseEvent(MouseEvent.THUMB_BUTTON_UP))
+            return
+        self._end_gesture_capture("HID gesture")
 
     def _on_hid_mode_shift_down(self):
         self._emit_debug("HID mode shift button down")
@@ -751,6 +675,10 @@ class MouseHook(BaseMouseHook):
         self._dispatch(MouseEvent(MouseEvent.DPI_SWITCH_UP))
 
     def _on_hid_gesture_move(self, delta_x, delta_y):
+        # MX4 fallback: drop rawXY from the small HID++ button so it
+        # cannot pollute an in-flight Sense Panel gesture.
+        if self._gesture_via_sense_panel:
+            return
         self._emit_debug(f"HID rawxy move dx={delta_x} dy={delta_y}")
         self._emit_gesture_event(
             {

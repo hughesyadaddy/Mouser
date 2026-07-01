@@ -221,11 +221,15 @@ class Backend(QObject):
     debugEventsEnabledChanged = Signal()
     gestureStateChanged = Signal()
     gestureRecordsChanged = Signal()
+    # Always-on gesture feedback for the on-screen HUD: (text, status).
+    # status is "fired" | "failed" | "unmapped".
+    gestureFeedback = Signal(str, str)
     deviceInfoChanged = Signal()
     deviceLayoutChanged = Signal()
     knownAppsChanged = Signal()
     updateAvailable = Signal(str, str)
     updateInstallChanged = Signal()
+    wheelDivertActiveChanged = Signal(bool)
 
     # Internal cross-thread signals
     _profileSwitchRequest = Signal(str)
@@ -234,12 +238,14 @@ class Backend(QObject):
     _batteryChangeRequest = Signal(int)
     _debugMessageRequest = Signal(str)
     _gestureEventRequest = Signal(object)
+    _gestureFeedbackRequest = Signal(str, str, str)  # arrow, label, status
     _smartShiftReadRequest = Signal()
     _statusMessageRequest = Signal(str)
     _updateAvailableRequest = Signal(str, str, bool, object)
     _updateCheckFinishedRequest = Signal(bool, bool, object)
     _updateInstallStateRequest = Signal(str, str, bool)
     _updateInstallProgressRequest = Signal(int)
+    _wheelDivertChangeRequest = Signal(bool)
 
     def __init__(self, engine=None, parent=None, root_dir=None):
         super().__init__(parent)
@@ -291,6 +297,19 @@ class Backend(QObject):
         self._update_timer = QTimer(self)
         self._update_timer.setInterval(DEFAULT_AUTO_CHECK_INTERVAL_SECONDS * 1000)
         self._update_timer.timeout.connect(lambda: self._startUpdateCheck(manual=False))
+        self._wheel_divert_active = False
+
+        # Lazily-computed list snapshots for QML bindings. Every read of a
+        # ``@Property(list, ...)`` returns the cached value until the
+        # property's notify signal (or a structurally-dependent signal)
+        # fires and clears it. Without these caches QML repaints rebuild
+        # the lists on every binding evaluation -- profiles re-runs
+        # ``app_catalog`` lookups, knownApps walks the catalog, etc.
+        self._buttons_cache: list | None = None
+        self._profiles_cache: list | None = None
+        self._known_apps_cache: list | None = None
+        self._action_categories_cache: list | None = None
+        self._all_actions_cache: list | None = None
 
         # Cross-thread signal connections
         self._profileSwitchRequest.connect(
@@ -305,6 +324,8 @@ class Backend(QObject):
             self._handleDebugMessage, Qt.QueuedConnection)
         self._gestureEventRequest.connect(
             self._handleGestureEvent, Qt.QueuedConnection)
+        self._gestureFeedbackRequest.connect(
+            self._handleGestureFeedback, Qt.QueuedConnection)
         self._smartShiftReadRequest.connect(
             self._handleSmartShiftRead, Qt.QueuedConnection)
         self._statusMessageRequest.connect(
@@ -317,6 +338,17 @@ class Backend(QObject):
             self._handleUpdateInstallState, Qt.QueuedConnection)
         self._updateInstallProgressRequest.connect(
             self._handleUpdateInstallProgress, Qt.QueuedConnection)
+        self._wheelDivertChangeRequest.connect(
+            self._handleWheelDivertChange, Qt.QueuedConnection)
+
+        # List-property cache invalidation. Each notify signal maps to the
+        # subset of caches that depends on it; reads after the next emit
+        # rebuild lazily.
+        self.mappingsChanged.connect(self._invalidate_buttons_cache)
+        self.profilesChanged.connect(self._invalidate_profiles_cache)
+        self.activeProfileChanged.connect(self._invalidate_profiles_cache)
+        self.knownAppsChanged.connect(self._invalidate_known_apps_cache)
+        self.deviceLayoutChanged.connect(self._invalidate_device_dependent_caches)
 
         # Wire engine callbacks
         if engine:
@@ -329,10 +361,16 @@ class Backend(QObject):
                 engine.set_debug_callback(self._onEngineDebugMessage)
             if hasattr(engine, "set_gesture_event_callback"):
                 engine.set_gesture_event_callback(self._onEngineGestureEvent)
+            if hasattr(engine, "set_gesture_outcome_callback"):
+                engine.set_gesture_outcome_callback(self._onEngineGestureOutcome)
             if hasattr(engine, "set_smart_shift_read_callback"):
                 engine.set_smart_shift_read_callback(self._onEngineSmartShiftRead)
             if hasattr(engine, "set_status_callback"):
                 engine.set_status_callback(self._onEngineStatusMessage)
+            if hasattr(engine, "set_wheel_divert_change_callback"):
+                engine.set_wheel_divert_change_callback(
+                    self._onEngineWheelDivertChange
+                )
             if hasattr(engine, "set_debug_enabled"):
                 engine.set_debug_enabled(self.debugMode)
             self._mouse_connected = bool(getattr(engine, "device_connected", False))
@@ -367,9 +405,44 @@ class Backend(QObject):
 
     # ── Properties ─────────────────────────────────────────────
 
+    def _button_label(self, key: str, fallback_name: str) -> str:
+        """Return the connected layout's hotspot label for ``key`` so the
+        mappings list matches the diagram, or ``fallback_name`` if the
+        device has no hotspot for that key.
+
+        Defensive against malformed catalog data: non-dict hotspots,
+        missing ``buttonKey``, empty-string labels, and missing
+        ``hotspots`` arrays all degrade cleanly to the fallback name
+        rather than blowing up the mappings list rebuild.
+        """
+        layout = self._device_layout or {}
+        hotspots = layout.get("hotspots") or ()
+        for hotspot in hotspots:
+            if not isinstance(hotspot, dict):
+                continue
+            if hotspot.get("buttonKey") != key:
+                continue
+            label = hotspot.get("label")
+            if isinstance(label, str) and label:
+                return label
+        return fallback_name
+
     @Property(list, notify=mappingsChanged)
     def buttons(self):
-        """List of button dicts for the active profile, filtered by device."""
+        """List of button dicts for the active profile, filtered by device.
+
+        Cached -- invalidated by ``mappingsChanged`` (active-profile
+        mappings) and ``deviceLayoutChanged`` (effective supported-button
+        set). The QML mappings list binds to ``backend.buttons`` and
+        re-evaluates on every paint of the row delegate, so without the
+        cache this rebuilt a list of ~10 dicts and a per-button
+        ``_action_label`` lookup on every frame the user scrolled.
+        """
+        if self._buttons_cache is None:
+            self._buttons_cache = self._compute_buttons()
+        return self._buttons_cache
+
+    def _compute_buttons(self):
         mappings = get_active_mappings(self._cfg)
         device_buttons = set(
             self._effective_supported_buttons or BUTTON_NAMES.keys()
@@ -383,12 +456,30 @@ class Backend(QObject):
             idx += 1
             result.append({
                 "key": key,
-                "name": name,
+                "name": self._button_label(key, name),
                 "actionId": aid,
                 "actionLabel": _action_label(aid),
                 "index": idx,
             })
         return result
+
+    def _invalidate_buttons_cache(self) -> None:
+        self._buttons_cache = None
+
+    def _invalidate_profiles_cache(self) -> None:
+        self._profiles_cache = None
+
+    def _invalidate_known_apps_cache(self) -> None:
+        self._known_apps_cache = None
+
+    def _invalidate_device_dependent_caches(self) -> None:
+        # ``buttons`` depends on ``_effective_supported_buttons`` and
+        # ``actionCategories`` / ``allActions`` depend on the hidden-action
+        # filter that is itself derived from the layout. A device swap
+        # invalidates all three at once.
+        self._buttons_cache = None
+        self._action_categories_cache = None
+        self._all_actions_cache = None
 
     def _hidden_actions(self):
         """Return set of action IDs to hide based on effective device buttons."""
@@ -401,7 +492,18 @@ class Backend(QObject):
 
     @Property(list, notify=deviceLayoutChanged)
     def actionCategories(self):
-        """Actions grouped by category, filtered by device capabilities."""
+        """Actions grouped by category, filtered by device capabilities.
+
+        Cached -- invalidated by ``deviceLayoutChanged``. The grouped
+        structure is rebuilt across the whole ``ACTIONS`` registry on
+        every read; the QML action picker binds to this property and
+        rebuilt it on every focus/visibility change before the cache.
+        """
+        if self._action_categories_cache is None:
+            self._action_categories_cache = self._compute_action_categories()
+        return self._action_categories_cache
+
+    def _compute_action_categories(self):
         from collections import OrderedDict
         hidden = self._hidden_actions()
         cats = OrderedDict()
@@ -425,7 +527,15 @@ class Backend(QObject):
 
     @Property(list, notify=deviceLayoutChanged)
     def allActions(self):
-        """Flat sorted action list (Do Nothing first), filtered by device."""
+        """Flat sorted action list (Do Nothing first), filtered by device.
+
+        Cached -- invalidated by ``deviceLayoutChanged``.
+        """
+        if self._all_actions_cache is None:
+            self._all_actions_cache = self._compute_all_actions()
+        return self._all_actions_cache
+
+    def _compute_all_actions(self):
         hidden = self._hidden_actions()
         result = []
         none_data = ACTIONS.get("none")
@@ -510,6 +620,16 @@ class Backend(QObject):
     def startAtLogin(self):
         return bool(self._cfg.get("settings", {}).get("start_at_login", False))
 
+    @Property(bool, notify=settingsChanged)
+    def deskflowIntegrationEnabled(self):
+        settings = self._cfg.get("settings", {}) or {}
+        deskflow = settings.get("deskflow", {}) or {}
+        if deskflow.get("auto") is False:
+            remote_fwd = settings.get("remote_forward", {}) or {}
+            remote_dev = settings.get("remote_device", {}) or {}
+            return bool(remote_fwd.get("enabled") or remote_dev.get("enabled"))
+        return True
+
     @Property(bool, constant=True)
     def supportsStartAtLogin(self):
         return supports_login_startup()
@@ -521,6 +641,12 @@ class Backend(QObject):
     @Property(bool, notify=settingsChanged)
     def invertHScroll(self):
         return self._cfg.get("settings", {}).get("invert_hscroll", False)
+
+    @Property(bool, notify=wheelDivertActiveChanged)
+    def wheelDivertActive(self):
+        """True when scroll inversion is being applied by the device firmware
+        via HID++ (0x2121 / 0x2150) rather than by Mouser at the OS layer."""
+        return bool(self._wheel_divert_active)
 
     @Property(bool, notify=settingsChanged)
     def ignoreTrackpad(self):
@@ -734,6 +860,20 @@ class Backend(QObject):
 
     @Property(list, notify=profilesChanged)
     def profiles(self):
+        """Profile snapshots for the QML profile selector.
+
+        Cached -- invalidated by ``profilesChanged`` (catalog churn) and
+        ``activeProfileChanged`` (the ``isActive`` flag per row). The
+        compute path walks every profile's apps and resolves each through
+        ``get_icon_for_exe`` and ``app_catalog.get_app_label`` -- both
+        non-trivial in a profile with several apps, so rebuilding on
+        every QML read was the worst per-paint allocator in this file.
+        """
+        if self._profiles_cache is None:
+            self._profiles_cache = self._compute_profiles()
+        return self._profiles_cache
+
+    def _compute_profiles(self):
         result = []
         active = self._cfg.get("active_profile", "default")
         for pname, pdata in self._cfg.get("profiles", {}).items():
@@ -750,6 +890,17 @@ class Backend(QObject):
 
     @Property(list, notify=knownAppsChanged)
     def knownApps(self):
+        """Catalog snapshot for the QML known-apps picker.
+
+        Cached -- invalidated by ``knownAppsChanged``. The catalog itself
+        is essentially static for a session, so this is the highest-hit
+        memoization target of the five.
+        """
+        if self._known_apps_cache is None:
+            self._known_apps_cache = self._compute_known_apps()
+        return self._known_apps_cache
+
+    def _compute_known_apps(self):
         result = []
         for entry in app_catalog.get_app_catalog():
             icon = get_icon_for_exe(entry.get("path", ""))
@@ -1145,6 +1296,25 @@ class Backend(QObject):
         self.statusMessage.emit("Saved")
 
     @Slot(bool)
+    def setDeskflowIntegrationEnabled(self, value):
+        enabled = bool(value)
+        if self.deskflowIntegrationEnabled == enabled:
+            return
+        settings = self._cfg.setdefault("settings", {})
+        deskflow = settings.setdefault("deskflow", {})
+        deskflow["auto"] = enabled
+        if not enabled:
+            settings.setdefault("remote_forward", {})["enabled"] = False
+            settings.setdefault("remote_device", {})["enabled"] = False
+        save_config(self._cfg)
+        if self._engine:
+            self._engine.reload_kvm_integration()
+        self.settingsChanged.emit()
+        self.statusMessage.emit(
+            "Deskflow integration enabled" if enabled else "Deskflow integration disabled"
+        )
+
+    @Slot(bool)
     def setCheckForUpdates(self, value):
         enabled = bool(value)
         if self.checkForUpdates == enabled:
@@ -1531,7 +1701,7 @@ class Backend(QObject):
             aid = mappings.get(key, "none")
             result.append({
                 "key": key,
-                "name": name,
+                "name": self._button_label(key, name),
                 "actionId": aid,
                 "actionLabel": _action_label(aid),
             })
@@ -1659,6 +1829,22 @@ class Backend(QObject):
         """Called from engine/hook thread — posts to Qt main thread."""
         self._gestureEventRequest.emit(event)
 
+    def _onEngineGestureOutcome(self, arrow, label, status, detail):
+        """Always-on gesture outcome from the engine thread — posts to the
+        Qt main thread, where it becomes the on-screen HUD signal."""
+        self._gestureFeedbackRequest.emit(arrow or "", label or "", status or "")
+
+    @Slot(str, str, str)
+    def _handleGestureFeedback(self, arrow, label, status):
+        """Runs on the Qt main thread; emits the public HUD signal."""
+        if status == "failed":
+            text = f"{arrow} {label} failed".strip()
+        elif status == "unmapped":
+            text = f"{arrow} not mapped".strip()
+        else:
+            text = f"{arrow} {label}".strip()
+        self.gestureFeedback.emit(text, status)
+
     def _onEngineSmartShiftRead(self, state):
         """Called from engine/hook thread — posts to Qt main thread.
 
@@ -1699,11 +1885,17 @@ class Backend(QObject):
         """Called from engine thread — posts to Qt main thread."""
         self._statusMessageRequest.emit(str(message or ""))
 
-    @Slot(str)
-    def _handleStatusMessage(self, message):
+    def _onEngineWheelDivertChange(self, active):
+        """Called from the engine thread; hops to the Qt main thread."""
+        self._wheelDivertChangeRequest.emit(bool(active))
+
+    @Slot(bool)
+    def _handleWheelDivertChange(self, active):
         """Runs on Qt main thread."""
-        if message:
-            self.statusMessage.emit(message)
+        active = bool(active)
+        if active != self._wheel_divert_active:
+            self._wheel_divert_active = active
+            self.wheelDivertActiveChanged.emit(active)
 
     @Slot(str)
     def _handleProfileSwitch(self, profile_name):
@@ -1716,10 +1908,31 @@ class Backend(QObject):
 
     @Slot(int)
     def _handleDpiRead(self, dpi):
-        """Runs on Qt main thread."""
-        self._cfg.setdefault("settings", {})["dpi"] = dpi
+        """Runs on Qt main thread.
+
+        A device-reported DPI is authoritative for "what the hardware is
+        currently set to" -- the user expects Mouser to keep showing the
+        same value across restarts rather than reverting to a stale
+        preference whenever the engine reads the device. Clamp the
+        incoming value, persist it, and keep the engine's cached config
+        in sync so subsequent reads do not loop through a stale picture.
+
+        Skip the engine push (``set_dpi``) here: this handler is reacting
+        to a value the device already reports, so echoing it back would
+        be a redundant HID round-trip.
+        """
+        device = self._resolved_connected_device()
+        clamped = clamp_dpi(dpi, device)
+        settings = self._cfg.setdefault("settings", {})
+        if settings.get("dpi") == clamped:
+            self.dpiFromDevice.emit(clamped)
+            return
+        settings["dpi"] = clamped
+        save_config(self._cfg)
+        if self._engine:
+            self._engine.cfg = self._cfg
         self.settingsChanged.emit()
-        self.dpiFromDevice.emit(dpi)
+        self.dpiFromDevice.emit(clamped)
 
     @Slot(bool)
     def _handleConnectionChange(self, connected):
@@ -2026,31 +2239,6 @@ class Backend(QObject):
             self.gestureStateChanged.emit()
             return
 
-        if event_type == "cooldown_started":
-            source = event.get("source", "")
-            for_ms = str(event.get("for_ms", "0"))
-            attempt = self._ensure_record_attempt()
-            self._gesture_move_source = source
-            self._gesture_status = f"Cooldown {for_ms} ms"
-            if attempt is not None:
-                attempt["notes"].append(f"cooldown {source} {for_ms}ms")
-            self.gestureStateChanged.emit()
-            return
-
-        if event_type == "cooldown_active":
-            source = event.get("source", "")
-            dx = int(event.get("dx", 0))
-            dy = int(event.get("dy", 0))
-            attempt = self._ensure_record_attempt()
-            self._gesture_move_source = source
-            self._gesture_move_dx = dx
-            self._gesture_move_dy = dy
-            self._gesture_status = f"Cooldown ignore {source} ({dx},{dy})"
-            if attempt is not None:
-                attempt["notes"].append(f"cooldown-ignore {source} ({dx},{dy})")
-            self.gestureStateChanged.emit()
-            return
-
         if event_type == "detected":
             detected = event.get("event_name", "")
             source = event.get("source", "")
@@ -2069,8 +2257,9 @@ class Backend(QObject):
 
         if event_type == "button_up":
             click_candidate = str(event.get("click_candidate", False)).lower()
+            resolved = event.get("resolved", "")
             self._gesture_active = False
-            self._gesture_status = f"Released click_candidate={click_candidate}"
+            self._gesture_status = f"Released resolved={resolved}"
             if self._current_attempt is not None:
                 self._current_attempt["click_candidate"] = click_candidate
             self.gestureStateChanged.emit()

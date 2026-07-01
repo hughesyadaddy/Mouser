@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -46,6 +47,7 @@ class _FakeEngine:
         self.debug_callback = None
         self.gesture_callback = None
         self.status_callback = None
+        self.wheel_divert_callback = None
         self.debug_enabled = None
         self.start_count = 0
         self.stop_count = 0
@@ -71,6 +73,9 @@ class _FakeEngine:
 
     def set_status_callback(self, cb):
         self.status_callback = cb
+
+    def set_wheel_divert_change_callback(self, cb):
+        self.wheel_divert_callback = cb
 
     def set_debug_enabled(self, enabled):
         self.debug_enabled = enabled
@@ -729,6 +734,111 @@ class BackendDeviceLayoutTests(unittest.TestCase):
         self.assertNotIn("gesture", button_keys)
         self.assertNotIn("mode_shift", button_keys)
 
+    def test_mx_master_4_mappings_use_per_device_hotspot_labels(self):
+        device = SimpleNamespace(
+            key="mx_master_4",
+            display_name="MX Master 4",
+            dpi_min=200,
+            dpi_max=8000,
+            ui_layout="mx_master_4",
+            supported_buttons=(
+                "middle", "gesture", "xbutton1", "xbutton2", "thumb_button",
+                "hscroll_left", "hscroll_right", "mode_shift",
+            ),
+        )
+
+        with (
+            patch("ui.backend.load_config", return_value=copy.deepcopy(DEFAULT_CONFIG)),
+            patch("ui.backend.save_config"),
+            patch("ui.backend.supports_login_startup", return_value=False),
+        ):
+            backend = Backend(engine=_FakeEngine(device_connected=True, connected_device=device))
+
+        names_by_key = {button["key"]: button["name"] for button in backend.buttons}
+        self.assertEqual(names_by_key.get("gesture"), "Sense Panel")
+        self.assertEqual(names_by_key.get("thumb_button"), "Top thumb button")
+
+    def test_mappings_fall_back_to_button_names_when_layout_has_no_hotspot(self):
+        # mx_master_3s defines a hotspot for hscroll_left (the wheel marker)
+        # but none for hscroll_right, so the right-direction binding must
+        # surface the global BUTTON_NAMES entry instead of an empty label.
+        device = SimpleNamespace(
+            key="mx_master_3s",
+            display_name="MX Master 3S",
+            dpi_min=200,
+            dpi_max=8000,
+            ui_layout="mx_master_3s",
+            supported_buttons=(
+                "middle", "gesture", "xbutton1", "xbutton2",
+                "hscroll_left", "hscroll_right",
+            ),
+        )
+
+        with (
+            patch("ui.backend.load_config", return_value=copy.deepcopy(DEFAULT_CONFIG)),
+            patch("ui.backend.save_config"),
+            patch("ui.backend.supports_login_startup", return_value=False),
+        ):
+            backend = Backend(engine=_FakeEngine(device_connected=True, connected_device=device))
+
+        names_by_key = {button["key"]: button["name"] for button in backend.buttons}
+        self.assertEqual(names_by_key.get("hscroll_right"), "Horizontal scroll right")
+        self.assertEqual(names_by_key.get("hscroll_left"), "Horizontal scroll left")
+
+    def test_button_label_falls_back_when_layout_has_no_hotspots_array(self):
+        """A layout without a ``hotspots`` array (e.g. generic mouse) must
+        still produce the global BUTTON_NAMES fallback for every key.
+        """
+        backend = self._make_backend()
+        backend._device_layout = {"key": "generic_mouse"}
+        self.assertEqual(backend._button_label("middle", "Middle"), "Middle")
+
+    def test_button_label_falls_back_when_layout_is_none(self):
+        """Defensive: a transient None layout (race with disconnect cleanup)
+        must not raise -- the mappings list rebuild has to survive the case.
+        """
+        backend = self._make_backend()
+        backend._device_layout = None
+        self.assertEqual(backend._button_label("middle", "Middle"), "Middle")
+
+    def test_button_label_ignores_empty_string_label(self):
+        """A hotspot whose label is the empty string is data corruption, not
+        a deliberate "label is empty" signal. Fall back so the user always
+        sees a non-empty name in the mappings list.
+        """
+        backend = self._make_backend()
+        backend._device_layout = {
+            "hotspots": [{"buttonKey": "middle", "label": ""}],
+        }
+        self.assertEqual(backend._button_label("middle", "Middle"), "Middle")
+
+    def test_button_label_ignores_non_dict_hotspots(self):
+        """Malformed catalog entries (a list slipping in instead of a dict)
+        must not raise AttributeError mid-rebuild.
+        """
+        backend = self._make_backend()
+        backend._device_layout = {
+            "hotspots": [
+                None,
+                ["not", "a", "dict"],
+                {"buttonKey": "middle", "label": "Wheel click"},
+            ],
+        }
+        self.assertEqual(backend._button_label("middle", "Middle"), "Wheel click")
+
+    def test_button_label_returns_first_match_on_duplicates(self):
+        """If duplicate hotspots claim the same buttonKey (catalog bug), the
+        return value must be deterministic -- first wins.
+        """
+        backend = self._make_backend()
+        backend._device_layout = {
+            "hotspots": [
+                {"buttonKey": "middle", "label": "First"},
+                {"buttonKey": "middle", "label": "Second"},
+            ],
+        }
+        self.assertEqual(backend._button_label("middle", "Fallback"), "First")
+
     def test_disconnect_clears_stale_linux_device_identity_and_layout(self):
         device = SimpleNamespace(
             key="mx_master_3",
@@ -1374,6 +1484,255 @@ class BackendLoginStartupTests(unittest.TestCase):
 
         apply_mock.assert_not_called()
         self.assertFalse(backend.startMinimized)
+
+    def test_set_deskflow_integration_disabled_clears_legacy_remote_flags(self):
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["remote_forward"]["enabled"] = True
+        cfg["settings"]["remote_device"]["enabled"] = True
+        engine = unittest.mock.MagicMock()
+        with (
+            patch("ui.backend.load_config", return_value=cfg),
+            patch("ui.backend.save_config") as save_mock,
+        ):
+            backend = Backend(engine=None)
+            backend._engine = engine
+            backend.setDeskflowIntegrationEnabled(False)
+
+        self.assertFalse(backend.deskflowIntegrationEnabled)
+        self.assertFalse(cfg["settings"]["deskflow"]["auto"])
+        self.assertFalse(cfg["settings"]["remote_forward"]["enabled"])
+        self.assertFalse(cfg["settings"]["remote_device"]["enabled"])
+        save_mock.assert_called()
+        engine.reload_kvm_integration.assert_called_once()
+
+
+@unittest.skipIf(Backend is None, "PySide6 not installed in test environment")
+class BackendWheelDivertSignalTests(unittest.TestCase):
+    """Pin the contract that exposes HID++ wheel-divert state to QML.
+
+    The Scroll page's invert-scope badge derives its tristate ("device",
+    "mouser", "inactive") from ``backend.wheelDivertActive`` and
+    ``backend.mouseConnected``. If either side of that contract slips, the
+    badge silently misrepresents which inversion path the device is on --
+    which is the precise UX failure mode that the new platform-hook gate is
+    supposed to eliminate.
+    """
+
+    def _make_backend(self, engine=None):
+        loaded_config = copy.deepcopy(DEFAULT_CONFIG)
+        with (
+            patch("ui.backend.load_config", return_value=loaded_config),
+            patch("ui.backend.save_config"),
+            patch("ui.backend.supports_login_startup", return_value=False),
+        ):
+            return Backend(engine=engine)
+
+    def test_engine_callback_is_registered_when_available(self):
+        engine = _FakeEngine()
+        backend = self._make_backend(engine=engine)
+        self.addCleanup(backend.deleteLater)
+        self.assertIsNotNone(engine.wheel_divert_callback)
+
+    def test_default_state_is_inactive(self):
+        backend = self._make_backend(engine=_FakeEngine())
+        self.addCleanup(backend.deleteLater)
+        self.assertFalse(backend.wheelDivertActive)
+
+    def test_callback_flips_property_and_emits_signal(self):
+        _ensure_qapp()
+        engine = _FakeEngine()
+        backend = self._make_backend(engine=engine)
+        self.addCleanup(backend.deleteLater)
+
+        events: list[bool] = []
+        backend.wheelDivertActiveChanged.connect(events.append)
+
+        engine.wheel_divert_callback(True)
+        QCoreApplication.processEvents()
+        self.assertTrue(backend.wheelDivertActive)
+        self.assertEqual(events, [True])
+
+        engine.wheel_divert_callback(False)
+        QCoreApplication.processEvents()
+        self.assertFalse(backend.wheelDivertActive)
+        self.assertEqual(events, [True, False])
+
+    def test_redundant_callback_does_not_emit_signal(self):
+        """No-op transitions must not churn the QML binding -- otherwise the
+        badge animation would re-trigger on every reconnect even when the
+        scope stayed the same.
+        """
+        _ensure_qapp()
+        engine = _FakeEngine()
+        backend = self._make_backend(engine=engine)
+        self.addCleanup(backend.deleteLater)
+
+        events: list[bool] = []
+        backend.wheelDivertActiveChanged.connect(events.append)
+
+        engine.wheel_divert_callback(False)
+        engine.wheel_divert_callback(False)
+        QCoreApplication.processEvents()
+        self.assertEqual(events, [])
+
+    def test_truthy_non_bool_value_is_coerced(self):
+        """Engines that pass ``1`` / ``0`` instead of strict booleans must not
+        leak the raw int into the property. QML bindings type-narrow against
+        the ``Property(bool, ...)`` declaration, so the property accessor has
+        to coerce defensively.
+        """
+        _ensure_qapp()
+        engine = _FakeEngine()
+        backend = self._make_backend(engine=engine)
+        self.addCleanup(backend.deleteLater)
+
+        engine.wheel_divert_callback(1)
+        QCoreApplication.processEvents()
+        self.assertIs(backend.wheelDivertActive, True)
+
+
+@unittest.skipIf(Backend is None, "PySide6 not installed in test environment")
+class BackendHandleDpiReadTests(unittest.TestCase):
+    """Device-reported DPI must persist to ``config.json`` so a hardware
+    DPI change taken on the mouse survives the next Mouser restart, and
+    must clamp into the connected device's range to defend against
+    bogus reports."""
+
+    def setUp(self) -> None:
+        self._save_mock = unittest.mock.MagicMock()
+        self._patches = (
+            patch("ui.backend.save_config", self._save_mock),
+            patch("ui.backend.supports_login_startup", return_value=False),
+        )
+        for p in self._patches:
+            p.start()
+        self.addCleanup(self._stop_patches)
+
+    def _stop_patches(self) -> None:
+        for p in self._patches:
+            p.stop()
+
+    def _build(self, *, cfg=None, engine=None):
+        loaded = copy.deepcopy(cfg or DEFAULT_CONFIG)
+        with patch("ui.backend.load_config", return_value=loaded):
+            backend = Backend(engine=engine)
+        self._save_mock.reset_mock()
+        return backend
+
+    def test_persists_new_device_dpi_to_disk(self):
+        backend = self._build()
+        backend._handleDpiRead(2400)
+        self.assertEqual(backend._cfg["settings"]["dpi"], 2400)
+        self._save_mock.assert_called_once_with(backend._cfg)
+
+    def test_clamps_overrange_dpi_to_device_max(self):
+        device = SimpleNamespace(dpi_min=200, dpi_max=4000)
+        engine = _FakeEngine(device_connected=True, connected_device=device)
+        backend = self._build(engine=engine)
+        backend._handleDpiRead(99999)
+        self.assertEqual(backend._cfg["settings"]["dpi"], 4000)
+        self._save_mock.assert_called_once_with(backend._cfg)
+
+    def test_clamps_underrange_dpi_to_device_min(self):
+        device = SimpleNamespace(dpi_min=400, dpi_max=8000)
+        engine = _FakeEngine(device_connected=True, connected_device=device)
+        backend = self._build(engine=engine)
+        backend._handleDpiRead(50)
+        self.assertEqual(backend._cfg["settings"]["dpi"], 400)
+        self._save_mock.assert_called_once_with(backend._cfg)
+
+    def test_no_change_skips_save(self):
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["dpi"] = 1500
+        backend = self._build(cfg=cfg)
+        backend._handleDpiRead(1500)
+        self._save_mock.assert_not_called()
+
+    def test_syncs_engine_cached_config(self):
+        engine = _FakeEngine(device_connected=True)
+        backend = self._build(engine=engine)
+        backend._handleDpiRead(1800)
+        self.assertEqual(engine.cfg["settings"]["dpi"], 1800)
+
+    def test_emits_dpi_from_device_with_clamped_value(self):
+        _ensure_qapp()
+        device = SimpleNamespace(dpi_min=200, dpi_max=4000)
+        engine = _FakeEngine(device_connected=True, connected_device=device)
+        backend = self._build(engine=engine)
+        seen = []
+        backend.dpiFromDevice.connect(seen.append)
+        backend._handleDpiRead(9999)
+        QCoreApplication.processEvents()
+        self.assertEqual(seen, [4000])
+
+
+@unittest.skipIf(Backend is None, "PySide6 not installed in test environment")
+class BackendListPropertyMemoizationTests(unittest.TestCase):
+    """The five ``@Property(list, ...)`` getters on ``Backend`` (``buttons``,
+    ``profiles``, ``knownApps``, ``actionCategories``, ``allActions``) are
+    read by every QML binding that depends on them, including those evaluated
+    inside delegate rebuilds. Without memoization the lists -- and their
+    per-entry catalog / icon lookups -- were rebuilt on every paint."""
+
+    def _build(self, cfg=None):
+        loaded = copy.deepcopy(cfg or DEFAULT_CONFIG)
+        with (
+            patch("ui.backend.load_config", return_value=loaded),
+            patch("ui.backend.save_config"),
+            patch("ui.backend.supports_login_startup", return_value=False),
+        ):
+            return Backend(engine=None)
+
+    def test_buttons_returns_same_object_across_reads(self):
+        backend = self._build()
+        first = backend.buttons
+        second = backend.buttons
+        self.assertIs(first, second)
+
+    def test_mappings_changed_invalidates_buttons_cache(self):
+        backend = self._build()
+        before = backend.buttons
+        backend.mappingsChanged.emit()
+        after = backend.buttons
+        self.assertIsNot(before, after)
+        self.assertEqual(before, after)
+
+    def test_device_layout_changed_invalidates_buttons_and_actions(self):
+        backend = self._build()
+        buttons_before = backend.buttons
+        cats_before = backend.actionCategories
+        actions_before = backend.allActions
+        backend.deviceLayoutChanged.emit()
+        self.assertIsNot(backend.buttons, buttons_before)
+        self.assertIsNot(backend.actionCategories, cats_before)
+        self.assertIsNot(backend.allActions, actions_before)
+
+    def test_active_profile_changed_invalidates_profiles_cache(self):
+        backend = self._build()
+        before = backend.profiles
+        backend.activeProfileChanged.emit()
+        self.assertIsNot(backend.profiles, before)
+
+    def test_known_apps_changed_invalidates_known_apps_cache(self):
+        backend = self._build()
+        before = backend.knownApps
+        backend.knownAppsChanged.emit()
+        self.assertIsNot(backend.knownApps, before)
+
+    def test_profiles_cache_not_invalidated_by_unrelated_signals(self):
+        backend = self._build()
+        first = backend.profiles
+        backend.knownAppsChanged.emit()
+        backend.mappingsChanged.emit()
+        self.assertIs(backend.profiles, first)
+
+    def test_known_apps_cache_not_invalidated_by_unrelated_signals(self):
+        backend = self._build()
+        first = backend.knownApps
+        backend.profilesChanged.emit()
+        backend.mappingsChanged.emit()
+        backend.deviceLayoutChanged.emit()
+        self.assertIs(backend.knownApps, first)
 
 
 if __name__ == "__main__":

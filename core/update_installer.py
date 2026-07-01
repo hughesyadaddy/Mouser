@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 import zipfile
@@ -541,7 +542,32 @@ def same_volume_windows_stage_dir(
     return root.with_name(f".{root.name}.update-{safe_tag}-{pid or os.getpid()}")
 
 
-def _probe_directory_writable(directory: Path) -> bool:
+def _probe_directory_writable(directory: Path, timeout: float = 2.0) -> bool:
+    """Writability probe with a hard timeout.
+
+    Runs on the startup path (Backend init -> locate_runtime). On some Windows
+    setups, creating a file under a protected directory such as
+    C:\\Program Files (Controlled Folder Access or a filesystem minifilter)
+    blocks indefinitely instead of failing fast, which would hang the whole
+    app before the window appears. Run the probe on a daemon thread and treat
+    a directory that does not answer within `timeout` as not writable -- you
+    would not want to stage a self-update into a filesystem that stalls on a
+    single create anyway.
+    """
+    result: dict[str, bool] = {"ok": False}
+
+    def _worker() -> None:
+        result["ok"] = _probe_directory_writable_impl(directory)
+
+    worker = threading.Thread(target=_worker, name="mouser-write-probe", daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        return False
+    return result["ok"]
+
+
+def _probe_directory_writable_impl(directory: Path) -> bool:
     try:
         handle, marker = tempfile.mkstemp(
             prefix=".mouser-update-write-test-",

@@ -27,6 +27,25 @@ MX_ANYWHERE_SMARTSHIFT_BUTTONS = (
     "mode_shift",
 )
 
+# MX Master 4 layout: the standard MX Master set plus a third thumb-area
+# button. The MX Master 4 relocates the legacy gesture button (CID 0x00C3)
+# next to back/forward and adds a haptic Sense Panel (CID 0x01A0); the
+# "thumb_button" key gives the relocated button its own UI mapping target.
+MX_MASTER_4_BUTTONS = (
+    "middle",
+    "gesture",
+    "gesture_left",
+    "gesture_right",
+    "gesture_up",
+    "gesture_down",
+    "xbutton1",
+    "xbutton2",
+    "thumb_button",
+    "hscroll_left",
+    "hscroll_right",
+    "mode_shift",
+)
+
 # G502 family (G-series gaming mice). These run onboard profiles and do not
 # expose REPROG_CONTROLS_V4 (0x1B04), so HID++ button diversion -- gesture,
 # mode_shift, dpi_switch -- is unavailable. The buttons below are the ones the
@@ -40,6 +59,20 @@ G502_BUTTONS = (
     "xbutton2",
     "hscroll_left",
     "hscroll_right",
+)
+
+# G602: HID++ 2.0 over its dedicated wireless receiver (USB 0xC537), but no
+# REPROG_CONTROLS feature in any version, so buttons cannot be diverted via
+# HID++. No tilt wheel either. Default onboard mappings (per the official
+# quick-start guide): G4=Forward, G5=Back (standard OS mouse buttons --
+# covered by xbutton2/xbutton1 below); G7/G8/G9 type keyboard keys 1/2/3
+# (keyboard events, outside the mouse hooks' reach); G6 = battery-check
+# (internal, no OS event); G10/G11 = DPI +/- (onboard). Battery (0x1000)
+# and ADJUSTABLE_DPI (0x2201) are exposed.
+G602_BUTTONS = (
+    "middle",
+    "xbutton1",
+    "xbutton2",
 )
 
 # M650 Signature family: no horizontal scroll, no mode-shift, no dedicated gesture button.
@@ -112,6 +145,22 @@ LOGI_DEVICE_SPECS = (
         ),
         "ui_layout": "mx_master_4",
         "image_asset": "logitech-mice/mx_master_4/mouse.png",
+        "supported_buttons": MX_MASTER_4_BUTTONS,
+        "has_hires_wheel": True,
+        "has_thumbwheel": True,
+        # The Sense Panel (CID 0x01A0) and the relocated Mouse Gesture
+        # Button (0x00C3) are both divertable + rawXY-capable on the
+        # MX Master 4 firmware. List 0x01A0 first so the listener prefers
+        # the larger Sense Panel as the swipe surface; fall back to
+        # 0x00C3 then the virtual gesture control 0x00D7.
+        "gesture_cids": (0x01A0, 0x00C3, 0x00D7),
+        # Divert the relocated Mouse Gesture Button as a button-only extra
+        # alongside the active gesture CID. Skipped when the listener has
+        # to fall back to 0x00C3 as the gesture CID.
+        "thumb_button_cid": 0x00C3,
+        # Enables the OS-level btn=6 / BTN_TASK gesture swap as a fallback
+        # for clients that cannot divert the Sense Panel via HID++.
+        "gesture_via_sense_panel": True,
     },
     {
         "key": "mx_master_3s",
@@ -124,6 +173,8 @@ LOGI_DEVICE_SPECS = (
         ),
         "ui_layout": "mx_master_3s",
         "image_asset": "logitech-mice/mx_master_3s/mouse.png",
+        "has_hires_wheel": True,
+        "has_thumbwheel": True,
     },
     {
         "key": "mx_master_3",
@@ -137,6 +188,8 @@ LOGI_DEVICE_SPECS = (
         ),
         "ui_layout": "mx_master_3",
         "image_asset": "logitech-mice/mx_master_3/mouse.png",
+        "has_hires_wheel": True,
+        "has_thumbwheel": True,
     },
     {
         "key": "mx_master_2s",
@@ -149,6 +202,8 @@ LOGI_DEVICE_SPECS = (
         "ui_layout": "mx_master_2s",
         "image_asset": "logitech-mice/mx_master_2s/mouse.png",
         "dpi_max": 4000,
+        "has_hires_wheel": True,
+        "has_thumbwheel": True,
     },
     {
         "key": "mx_master",
@@ -161,6 +216,8 @@ LOGI_DEVICE_SPECS = (
         "ui_layout": "mx_master_classic",
         "image_asset": "logitech-mice/mx_master/mouse.png",
         "dpi_max": 4000,
+        "has_hires_wheel": True,
+        "has_thumbwheel": True,
     },
     {
         "key": "mx_anywhere_3s",
@@ -294,6 +351,23 @@ LOGI_DEVICE_SPECS = (
         "dpi_min": 200,
         "dpi_max": 12000,
     },
+    {
+        # Pairs only through its dedicated receiver (USB PID 0xC537); the
+        # receiver PID itself is intentionally not listed -- Mouser probes
+        # receiver slots and resolves the device by WPID / HID++ name.
+        "key": "g602",
+        "display_name": "G602",
+        "product_ids": (0x402C,),
+        "aliases": (
+            "G602 Gaming Wireless Mouse",
+            "Wireless Gaming Mouse G602",
+        ),
+        "ui_layout": "g602",
+        "image_asset": "icons/mouse-simple.svg",
+        "supported_buttons": G602_BUTTONS,
+        "dpi_min": 250,
+        "dpi_max": 2500,
+    },
 )
 
 
@@ -336,6 +410,23 @@ LOGI_DEVICE_LAYOUTS = {
         ),
         "hotspots": [],
     },
+    "g602": {
+        "key": "g602",
+        "label": "G602",
+        "image_asset": "icons/mouse-simple.svg",
+        "image_width": 220,
+        "image_height": 220,
+        "interactive": False,
+        # Manual-selectable for the same reason as the g502 layout above.
+        "manual_selectable": True,
+        "note": (
+            "G602 buttons are remapped at the OS level. Side buttons G4/G5 "
+            "act as Forward/Back and are mappable; G7-G9 type keyboard keys "
+            "1/2/3 and G10/G11 adjust DPI onboard, so they cannot be "
+            "remapped here yet."
+        ),
+        "hotspots": [],
+    },
     "mx_master_4": _layout(
         "mx_master_4",
         "MX Master 4",
@@ -374,14 +465,29 @@ LOGI_DEVICE_LAYOUTS = {
                 label_off_y=-90,
             ),
             _hotspot(
+                # Sense Panel (CID 0x01A0) drives directional gestures via
+                # rawXY divert. Labeled by physical identity so remapping
+                # in the UI does not lie about where the press lands.
                 "gesture",
-                "Gesture button",
+                "Sense Panel",
                 "gesture",
-                0.386,
-                0.361,
+                0.18,
+                0.69,
+                label_side="left",
+                label_off_x=-240,
+                label_off_y=40,
+            ),
+            _hotspot(
+                # Relocated Mouse Gesture Button (CID 0x00C3) at the top of
+                # the side row, exposed as a single-press mapping target.
+                "thumb_button",
+                "Top thumb button",
+                "mapping",
+                0.392,
+                0.405,
                 label_side="left",
                 label_off_x=-260,
-                label_off_y=20,
+                label_off_y=-60,
             ),
             _hotspot(
                 "hscroll_left",

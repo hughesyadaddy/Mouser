@@ -325,7 +325,7 @@ def _get_winreg():
     return winreg
 
 
-def _apply_windows(enabled: bool) -> None:
+def _apply_windows(enabled: bool, *, run_command: str | None = None) -> None:
     if sys.platform != "win32":
         return
     winreg = _get_winreg()
@@ -338,7 +338,11 @@ def _apply_windows(enabled: bool) -> None:
     try:
         if enabled:
             winreg.SetValueEx(
-                key, RUN_VALUE_NAME, 0, winreg.REG_SZ, build_run_command()
+                key,
+                RUN_VALUE_NAME,
+                0,
+                winreg.REG_SZ,
+                run_command if run_command is not None else build_run_command(),
             )
         else:
             try:
@@ -427,7 +431,7 @@ def _restore_macos_plist_then_raise(
     raise RuntimeError(f"failed to update launch agent: {exc}") from exc
 
 
-def _apply_macos(enabled: bool) -> None:
+def _apply_macos(enabled: bool, *, program_arguments: list[str] | None = None) -> None:
     if sys.platform != "darwin":
         return
     plist_path = _macos_plist_path()
@@ -450,7 +454,7 @@ def _apply_macos(enabled: bool) -> None:
             _launchctl_run(["launchctl", "bootout", domain, plist_path])
         payload = {
             "Label": MACOS_LAUNCH_AGENT_LABEL,
-            "ProgramArguments": _program_arguments(),
+            "ProgramArguments": program_arguments or _program_arguments(),
             "RunAtLoad": True,
         }
         new_plist = plistlib.dumps(payload, fmt=plistlib.FMT_XML)
@@ -494,13 +498,20 @@ def _apply_linux(enabled: bool) -> None:
         print(f"[startup] failed to refresh Linux launcher on disable: {exc}", file=sys.stderr)
 
 
-def apply_login_startup(enabled: bool) -> None:
+def apply_login_startup(
+    enabled: bool,
+    *,
+    program_arguments: list[str] | None = None,
+) -> None:
     if not supports_login_startup():
         return
     if sys.platform == "win32":
-        _apply_windows(enabled)
+        run_command = None
+        if program_arguments:
+            run_command = _quote_arg(program_arguments[0])
+        _apply_windows(enabled, run_command=run_command)
     elif sys.platform == "darwin":
-        _apply_macos(enabled)
+        _apply_macos(enabled, program_arguments=program_arguments)
     elif sys.platform == "linux":
         _apply_linux(enabled)
 

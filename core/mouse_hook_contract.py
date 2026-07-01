@@ -14,6 +14,14 @@ class MouseHookLike(Protocol):
     invert_hscroll: bool
     divert_mode_shift: bool
     divert_dpi_switch: bool
+    # Per-axis: True when the connected Logitech device is performing scroll
+    # inversion at the firmware level (vertical = HID++ 0x2121, horizontal =
+    # 0x2150). The matching OS-layer inversion path must be skipped to avoid
+    # double flipping. The axes are independent -- a device may firmware-invert
+    # one axis while the OS handles the other (original MX Master: vertical
+    # firmware, horizontal OS fallback).
+    wheel_native_invert_vertical: bool
+    wheel_native_invert_horizontal: bool
     _hid_gesture: Any
 
     def register(self, event_type: str, callback: Callable[[Any], None]) -> None: ...
@@ -24,9 +32,6 @@ class MouseHookLike(Protocol):
         self,
         enabled: bool = False,
         threshold: int = 50,
-        deadzone: int = 40,
-        timeout_ms: int = 3000,
-        cooldown_ms: int = 500,
     ) -> None: ...
     def set_connection_change_callback(self, cb: Callable[[bool], None]) -> None: ...
     def set_debug_callback(self, callback: Callable[[str], None]) -> None: ...

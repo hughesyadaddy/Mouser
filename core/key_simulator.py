@@ -386,6 +386,101 @@ if sys.platform == "win32":
     def send_key_press(vk):
         send_key_combo([vk])
 
+    def _open_task_view():
+        """Open Windows Task View via the shell COM API instead of a Win+Tab
+        keystroke.
+
+        Win+Tab is the *only* keyboard trigger for Task View, so when the user
+        remaps Win+Tab to something else (e.g. PowerToys Keyboard Manager →
+        Alt+Tab) there is no key combo left that reaches it. Shell.Application's
+        ``WindowSwitcher`` method (shell32, in System32) invokes Task View
+        directly -- no keystroke is synthesised, so no remap or low-level hook
+        can intercept or rewrite it. Returns True on success.
+
+        Implemented with raw ctypes COM so it needs no win32com/comtypes (the
+        frozen build bundles neither).
+        """
+        import ctypes
+        from ctypes import (
+            POINTER, Structure, byref, c_void_p, c_long, c_ulong, c_uint,
+            c_ushort, c_ubyte, c_wchar_p, HRESULT, WINFUNCTYPE,
+        )
+
+        class GUID(Structure):
+            _fields_ = [
+                ("Data1", c_ulong), ("Data2", c_ushort),
+                ("Data3", c_ushort), ("Data4", c_ubyte * 8),
+            ]
+
+        class DISPPARAMS(Structure):
+            _fields_ = [
+                ("rgvarg", c_void_p), ("rgdispidNamedArgs", c_void_p),
+                ("cArgs", c_ulong), ("cNamedArgs", c_ulong),
+            ]
+
+        S_OK = 0
+        S_FALSE = 1
+        COINIT_APARTMENTTHREADED = 0x2
+        CLSCTX_INPROC_SERVER = 0x1
+        CLSCTX_LOCAL_SERVER = 0x4
+        DISPATCH_METHOD = 0x1
+        LOCALE_USER_DEFAULT = 0x0400
+        # IDispatch vtable slots and IID {00020400-0000-0000-C000-000000000046}
+        _VT_RELEASE, _VT_GETIDS, _VT_INVOKE = 2, 5, 6
+
+        try:
+            ole32 = ctypes.windll.ole32
+            hr_init = ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+            # S_OK/S_FALSE: we initialised COM and must balance it. Any other
+            # value (e.g. RPC_E_CHANGED_MODE) means the thread already had COM
+            # up in another mode -- reuse it and do NOT uninitialise.
+            did_init = hr_init in (S_OK, S_FALSE)
+            try:
+                clsid = GUID()
+                if ole32.CLSIDFromProgID(c_wchar_p("Shell.Application"), byref(clsid)) != S_OK:
+                    return False
+                iid_dispatch = GUID(
+                    0x00020400, 0x0000, 0x0000,
+                    (c_ubyte * 8)(0xC0, 0, 0, 0, 0, 0, 0, 0x46),
+                )
+                iid_null = GUID()
+                pdisp = c_void_p()
+                if ole32.CoCreateInstance(
+                    byref(clsid), None,
+                    CLSCTX_INPROC_SERVER | CLSCTX_LOCAL_SERVER,
+                    byref(iid_dispatch), byref(pdisp),
+                ) != S_OK or not pdisp:
+                    return False
+
+                vtbl = ctypes.cast(pdisp, POINTER(POINTER(c_void_p))).contents
+                get_ids = WINFUNCTYPE(
+                    HRESULT, c_void_p, POINTER(GUID), POINTER(c_wchar_p),
+                    c_uint, c_ulong, POINTER(c_long),
+                )(vtbl[_VT_GETIDS])
+                invoke = WINFUNCTYPE(
+                    HRESULT, c_void_p, c_long, POINTER(GUID), c_ulong,
+                    c_ushort, POINTER(DISPPARAMS), c_void_p, c_void_p, c_void_p,
+                )(vtbl[_VT_INVOKE])
+                release = WINFUNCTYPE(c_ulong, c_void_p)(vtbl[_VT_RELEASE])
+                try:
+                    name = c_wchar_p("WindowSwitcher")
+                    dispid = c_long(0)
+                    if get_ids(pdisp, byref(iid_null), byref(name), 1,
+                               LOCALE_USER_DEFAULT, byref(dispid)) != S_OK:
+                        return False
+                    params = DISPPARAMS(None, None, 0, 0)
+                    hr = invoke(pdisp, dispid, byref(iid_null), LOCALE_USER_DEFAULT,
+                                DISPATCH_METHOD, byref(params), None, None, None)
+                    return hr == S_OK
+                finally:
+                    release(pdisp)
+            finally:
+                if did_init:
+                    ole32.CoUninitialize()
+        except Exception as exc:
+            print(f"[KeySimulator] _open_task_view COM failed: {exc}")
+            return False
+
     def _send_phased_alt_arrow(arrow_vk, hold_ms=50):
         # Some Chromium-based browsers silently drop batched VK-only SendInput chords;
         # phased modifier-down → key-tap → modifier-up with pauses is accepted reliably.
@@ -493,7 +588,9 @@ if sys.platform == "win32":
             "category": "Navigation",
         },
         "task_view": {
-            "label": "Task View (Win+Tab)",
+            # Invoked via the shell COM API (see _open_task_view), so it works
+            # even when Win+Tab is remapped. keys[] is only a fallback.
+            "label": "Task View (all windows)",
             "keys": [VK_LWIN, VK_TAB],
             "category": "Navigation",
         },
@@ -660,6 +757,14 @@ if sys.platform == "win32":
                 return
             if request_screenshot_action(action_id):
                 return
+            if action_id == "task_view":
+                # Open Task View through the shell COM API rather than a Win+Tab
+                # keystroke, so it still works when Win+Tab is remapped (PowerToys
+                # Keyboard Manager etc.). Only fall back to the keystroke (below)
+                # if the COM call fails.
+                if _open_task_view():
+                    return
+                print("[KeySimulator] task_view: COM call failed, falling back to Win+Tab keystroke")
             action = ACTIONS.get(action_id)
             if not action or not action["keys"]:
                 print(f"[KeySimulator] execute_action: no keys for '{action_id}'")

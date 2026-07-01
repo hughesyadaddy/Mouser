@@ -935,6 +935,85 @@ Item {
                 height: backend.supportsStartAtLogin ? 16 : 0
             }
 
+            // ── KVM / Deskflow ────────────────────────────────────
+            Rectangle {
+                width: parent.width - 72
+                anchors.horizontalCenter: parent.horizontalCenter
+                height: kvmContent.implicitHeight + 40
+                radius: Theme.radius
+                color: scrollPage.theme.bgCard
+                border.width: 1
+                border.color: scrollPage.theme.border
+
+                Column {
+                    id: kvmContent
+                    anchors {
+                        left: parent.left
+                        right: parent.right
+                        top: parent.top
+                        margins: 20
+                    }
+                    spacing: 12
+
+                    Text {
+                        text: s["scroll.kvm_integration"]
+                        font {
+                            family: uiState.fontFamily
+                            pixelSize: 16
+                            bold: true
+                        }
+                        color: scrollPage.theme.textPrimary
+                    }
+
+                    Text {
+                        text: s["scroll.kvm_integration_desc"]
+                        font {
+                            family: uiState.fontFamily
+                            pixelSize: 12
+                        }
+                        color: scrollPage.theme.textSecondary
+                        wrapMode: Text.WordWrap
+                        width: parent.width
+                    }
+
+                    Rectangle {
+                        width: parent.width
+                        height: 52
+                        radius: 10
+                        color: scrollPage.theme.bgSubtle
+
+                        RowLayout {
+                            anchors {
+                                fill: parent
+                                leftMargin: 16
+                                rightMargin: 16
+                            }
+
+                            Text {
+                                text: s["scroll.kvm_integration_enable"]
+                                font {
+                                    family: uiState.fontFamily
+                                    pixelSize: 13
+                                }
+                                color: scrollPage.theme.textPrimary
+                                Layout.fillWidth: true
+                            }
+
+                            Switch {
+                                id: kvmIntegrationSwitch
+                                checked: backend.deskflowIntegrationEnabled
+                                focusPolicy: Qt.StrongFocus
+                                Material.accent: scrollPage.theme.accent
+                                Accessible.name: s["scroll.kvm_integration_enable"]
+                                onClicked: backend.setDeskflowIntegrationEnabled(checked)
+                            }
+                        }
+                    }
+                }
+            }
+
+            Item { width: 1; height: 16 }
+
             // ── Screenshots ───────────────────────────────────────
             Rectangle {
                 width: parent.width - 72
@@ -1127,6 +1206,86 @@ Item {
                         color: scrollPage.theme.textSecondary
                     }
 
+                    component InvertScopeBadge: Rectangle {
+                        // Inline indicator placed inside an invert toggle row.
+                        // Tristate so the user always sees the truth about
+                        // whether their toggle is doing anything:
+                        //   * "device"   -- inverted at device firmware (HID++).
+                        //                   Survives Synergy / DeskFlow / KVM /
+                        //                   Barrier forwarding because the
+                        //                   wheel reports the inverted sign
+                        //                   natively.
+                        //   * "mouser"   -- inverted locally by Mouser before
+                        //                   the OS dispatches the event. Does
+                        //                   NOT survive KVM forwarding (the
+                        //                   remote sees the original sign).
+                        //   * "inactive" -- the toggle is on but no Logitech
+                        //                   is currently connected, so the
+                        //                   platform hook gate suppresses
+                        //                   inversion entirely.
+                        property bool active: backend.wheelDivertActive
+                        property bool mouseConnected: backend.mouseConnected
+                        property bool toggleOn: false
+                        readonly property string scope:
+                            !mouseConnected
+                                ? "inactive"
+                                : active
+                                    ? "device"
+                                    : "mouser"
+                        visible: toggleOn
+                        width: labelText.implicitWidth + 16
+                        height: 22
+                        radius: 11
+                        color: scope === "device"
+                               ? scrollPage.theme.accent
+                               : scope === "inactive"
+                                   ? "transparent"
+                                   : scrollPage.theme.bgSubtle
+                        border.width: scope === "device" ? 0 : 1
+                        border.color: scope === "inactive"
+                                      ? scrollPage.theme.warning
+                                      : scrollPage.theme.textSecondary
+
+                        ToolTip.text: scope === "device"
+                                      ? s["scroll.wheel_invert_native_tooltip"]
+                                      : scope === "inactive"
+                                          ? s["scroll.wheel_invert_inactive_tooltip"]
+                                          : s["scroll.wheel_invert_os_tooltip"]
+                        ToolTip.delay: 400
+                        ToolTip.visible: hoverArea.containsMouse
+
+                        Accessible.role: Accessible.StaticText
+                        Accessible.name: labelText.text
+                        Accessible.description: ToolTip.text
+
+                        Text {
+                            id: labelText
+                            anchors.centerIn: parent
+                            text: parent.scope === "device"
+                                  ? s["scroll.wheel_invert_native"]
+                                  : parent.scope === "inactive"
+                                      ? s["scroll.wheel_invert_inactive"]
+                                      : s["scroll.wheel_invert_os"]
+                            font {
+                                family: uiState.fontFamily
+                                pixelSize: 11
+                                bold: parent.scope === "device"
+                            }
+                            color: parent.scope === "device"
+                                   ? scrollPage.theme.bgSidebar
+                                   : parent.scope === "inactive"
+                                       ? scrollPage.theme.warning
+                                       : scrollPage.theme.textSecondary
+                        }
+
+                        MouseArea {
+                            id: hoverArea
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            acceptedButtons: Qt.NoButton
+                        }
+                    }
+
                     Rectangle {
                         width: parent.width
                         height: 52
@@ -1139,6 +1298,7 @@ Item {
                                 leftMargin: 16
                                 rightMargin: 16
                             }
+                            spacing: 10
 
                             Text {
                                 text: s["scroll.invert_vertical"]
@@ -1148,6 +1308,10 @@ Item {
                                 }
                                 color: scrollPage.theme.textPrimary
                                 Layout.fillWidth: true
+                            }
+
+                            InvertScopeBadge {
+                                toggleOn: vscrollSwitch.checked
                             }
 
                             Switch {
@@ -1173,6 +1337,7 @@ Item {
                                 leftMargin: 16
                                 rightMargin: 16
                             }
+                            spacing: 10
 
                             Text {
                                 text: s["scroll.invert_horizontal"]
@@ -1182,6 +1347,10 @@ Item {
                                 }
                                 color: scrollPage.theme.textPrimary
                                 Layout.fillWidth: true
+                            }
+
+                            InvertScopeBadge {
+                                toggleOn: hscrollSwitch.checked
                             }
 
                             Switch {
@@ -1309,6 +1478,7 @@ Item {
                 startAtLoginSwitch.checked = backend.startAtLogin
                 startMinimizedSwitch.checked = backend.startMinimized
             }
+            kvmIntegrationSwitch.checked = backend.deskflowIntegrationEnabled
             checkUpdatesSwitch.checked = backend.checkForUpdates
             vscrollSwitch.checked = backend.invertVScroll
             hscrollSwitch.checked = backend.invertHScroll

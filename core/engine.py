@@ -1,5 +1,5 @@
 """
-Engine — wires the mouse hook to the key simulator using the
+Engine -- wires the mouse hook to the key simulator using the
 current configuration.  Sits between the hook layer and the UI.
 Supports per-application auto-switching of profiles.
 """
@@ -14,6 +14,7 @@ from core.key_simulator import (
 from core.config import (
     load_config, get_active_mappings, get_profile_for_app,
     BUTTON_TO_EVENTS, GESTURE_DIRECTION_BUTTONS, save_config,
+    WHEEL_DIVERT_OFF, coerce_wheel_divert_setting,
 )
 from core.app_detector import AppDetector
 from core.mouse_hook_types import HidRuntimeState
@@ -54,6 +55,7 @@ class Engine:
         self._smart_shift_read_cb = None   # UI callback for Smart Shift mode
         self._debug_cb = None               # UI callback for debug messages
         self._gesture_event_cb = None       # UI callback for structured gesture events
+        self._gesture_outcome_cb = None     # always-on cb(arrow, label, status, detail)
         self._debug_events_enabled = bool(
             self.cfg.get("settings", {}).get("debug_mode", False)
         )
@@ -66,7 +68,17 @@ class Engine:
         self._replay_pending_rerun = False
         self._replay_lock = threading.Lock()
         self._mouse_release_timers = {}   # action_id → Timer for safety auto-release
+        self._remote_device_server = None  # core/remote_device.py listener
+        self._remote_forwarder = None      # core/remote_forward.py bridge client
         self._lock = threading.Lock()
+        # HID++ native-invert tracking. `_last_native_invert_target` caches the
+        # most recently applied intent (target_active, invert_v, invert_h) so
+        # the fast-path skips redundant device round-trips on profile changes;
+        # None means "never applied". `_wheel_divert_active_local` is True while
+        # firmware is inverting at least one axis.
+        self._wheel_divert_change_cb = None
+        self._wheel_divert_active_local = False
+        self._last_native_invert_target = None
         self.hook.set_debug_callback(self._emit_debug)
         self.hook.set_gesture_callback(self._emit_gesture_event)
         self.hook.set_status_callback(self._emit_status)
@@ -110,9 +122,6 @@ class Engine:
             enabled=any(mappings.get(key, "none") != "none"
                         for key in GESTURE_DIRECTION_BUTTONS),
             threshold=settings.get("gesture_threshold", 50),
-            deadzone=settings.get("gesture_deadzone", 40),
-            timeout_ms=settings.get("gesture_timeout_ms", 3000),
-            cooldown_ms=settings.get("gesture_cooldown_ms", 500),
         )
         # Divert mode shift CID only when the device has the button and
         # at least one profile maps it to an action.  When no device is
@@ -140,6 +149,8 @@ class Engine:
         )
 
         self._emit_mapping_snapshot("Hook mappings refreshed", mappings)
+        # Drive HID++ firmware wheel-invert from settings + device capability.
+        self._apply_wheel_invert_setting()
 
         for btn_key, action_id in mappings.items():
             events = list(BUTTON_TO_EVENTS.get(btn_key, ()))
@@ -171,30 +182,39 @@ class Engine:
 
     def _make_handler(self, action_id):
         def handler(event):
+            if not self._enabled:
+                return
+            is_gesture = event.event_type.startswith("gesture_")
+            label = self._action_label(action_id)
             try:
-                if self._enabled:
-                    self._emit_debug(
-                        f"Mapped {event.event_type} -> {action_id} "
-                        f"({self._action_label(action_id)})"
-                    )
-                    if event.event_type.startswith("gesture_"):
-                        self._emit_gesture_event({
-                            "type": "mapped",
-                            "event_name": event.event_type,
-                            "action_id": action_id,
-                            "action_label": self._action_label(action_id),
-                        })
-                    if action_id == "toggle_smart_shift":
-                        self._toggle_smart_shift()
-                    elif action_id == "switch_scroll_mode":
-                        self._switch_scroll_mode()
-                    elif action_id == "cycle_dpi":
-                        self._cycle_dpi()
-                    else:
-                        execute_action(action_id)
+                self._emit_debug(
+                    f"Mapped {event.event_type} -> {action_id} ({label})"
+                )
+                if is_gesture:
+                    self._emit_gesture_event({
+                        "type": "mapped",
+                        "event_name": event.event_type,
+                        "action_id": action_id,
+                        "action_label": label,
+                    })
+                if action_id == "toggle_smart_shift":
+                    self._toggle_smart_shift()
+                elif action_id == "switch_scroll_mode":
+                    self._switch_scroll_mode()
+                elif action_id == "cycle_dpi":
+                    self._cycle_dpi()
+                else:
+                    execute_action(action_id)
+                if is_gesture:
+                    self._report_gesture_outcome(event.event_type, label, "fired")
             except Exception as exc:
-                print(f"[Engine] _make_handler EXCEPTION for {action_id}: {exc}")
-                import traceback; traceback.print_exc()
+                import traceback
+                print(f"[Engine] ACTION FAILED {event.event_type} -> {action_id}: {exc}")
+                traceback.print_exc()
+                # Surface the failure loudly so a blocked keystroke injection
+                # (e.g. missing Accessibility permission) is never silent.
+                if is_gesture:
+                    self._report_gesture_outcome(event.event_type, label, "failed", str(exc))
         return handler
 
     def _make_mouse_down_handler(self, action_id):
@@ -250,7 +270,7 @@ class Engine:
 
         IMPORTANT: this is called from a HID event callback which runs on the HID
         loop thread.  Calling hg.set_smart_shift() directly would block waiting for
-        the same loop to process the pending request — a deadlock that causes the
+        the same loop to process the pending request -- a deadlock that causes the
         3-second timeout seen in the logs.  Config and UI are updated synchronously;
         the device write is dispatched to a separate thread.
         """
@@ -277,7 +297,7 @@ class Engine:
         """Switch between ratchet and free-spin (Logi Options+ physical button behaviour).
 
         SmartShift auto-switching is disabled so the chosen fixed mode takes effect.
-        Same deadlock caveat as _toggle_smart_shift — device write runs off-thread.
+        Same deadlock caveat as _toggle_smart_shift -- device write runs off-thread.
         """
         settings = self.cfg.get("settings", {})
         current_mode = settings.get("smart_shift_mode", "ratchet")
@@ -332,6 +352,114 @@ class Engine:
             def _write():
                 hg.set_dpi(new_dpi)
             threading.Thread(target=_write, daemon=True, name="CycleDPI").start()
+
+    def _apply_wheel_invert_setting(self, *, force: bool = False) -> None:
+        """Drive HID++ firmware wheel-invert from settings + device
+        capability. ``force=True`` re-issues writes even when cached
+        state matches the target -- used by ``_run_saved_settings_replay``
+        to realign firmware that forgot state after sleep. On success the
+        engine + platform hook flip ``wheel_native_invert_active`` so the
+        OS-layer inversion path is suppressed; on failure the OS-layer
+        path handles inversion."""
+        settings = self.cfg.get("settings", {})
+        kill_switch_off = (
+            coerce_wheel_divert_setting(settings.get("wheel_divert")) == WHEEL_DIVERT_OFF
+        )
+        invert_v = bool(settings.get("invert_vscroll", False))
+        invert_h = bool(settings.get("invert_hscroll", False))
+        device = self.connected_device
+        capable = bool(device and (
+            getattr(device, "has_hires_wheel", False)
+            or getattr(device, "has_thumbwheel", False)
+        ))
+        # Stay True even when both invert flags are False so we own the
+        # wheel-mode write and a stale invert lease from a crashed Mouser
+        # session is reset to native on reconnect.
+        target_active = bool(capable and not kill_switch_off)
+        hg = self.hook._hid_gesture
+        # Early-return cache is the full intent, so a firmware axis that can't
+        # honor invert (handled by OS fallback) doesn't get retried on every
+        # apply. force=True (sleep/reconnect realignment) always re-issues.
+        desired = (target_active, invert_v, invert_h)
+        if not force and self._last_native_invert_target == desired:
+            return
+        # Per-axis firmware-invert outcome. request_wheel_native_invert returns
+        # (vertical_ok, horizontal_ok); the axes are independent so one can hold
+        # the firmware lease while the other falls back to OS-layer inversion.
+        ok_v = ok_h = False
+        if hg is not None and hasattr(hg, "request_wheel_native_invert"):
+            try:
+                if target_active:
+                    ok_v, ok_h = hg.request_wheel_native_invert(invert_v, invert_h)
+                else:
+                    hg.request_wheel_native_invert(False, False)
+            except Exception as exc:
+                print(f"[Engine] wheel native-invert request failed: {exc}")
+                ok_v = ok_h = False
+        # An axis holds the firmware lease only when the user wants it inverted
+        # AND the firmware confirmed (read-back) it. Otherwise the OS-layer
+        # fallback owns that axis.
+        active_v = bool(target_active and invert_v and ok_v)
+        active_h = bool(target_active and invert_h and ok_h)
+        prev_active = self._wheel_divert_active_local
+        new_active = bool(active_v or active_h)
+        self._wheel_divert_active_local = new_active
+        self.hook.wheel_native_invert_vertical = active_v
+        self.hook.wheel_native_invert_horizontal = active_h
+        self._last_native_invert_target = desired
+        if hg is not None and hasattr(hg, "set_wheel_divert_active_flags"):
+            try:
+                hg.set_wheel_divert_active_flags(active_v, active_h)
+            except Exception as exc:
+                print(f"[Engine] set_wheel_divert_active_flags failed: {exc}")
+        # A requested invert the capable firmware could not honor falls back to
+        # OS-layer inversion on that axis -- surfaced per-axis, not all-or-nothing.
+        fw_failed_v = bool(target_active and invert_v and not ok_v)
+        fw_failed_h = bool(target_active and invert_h and not ok_h)
+        print(
+            "[Engine] wheel native-invert "
+            f"vertical={'firmware' if active_v else 'os' if fw_failed_v else 'off'} "
+            f"horizontal={'firmware' if active_h else 'os' if fw_failed_h else 'off'} "
+            f"capable={capable} kill_switch_off={kill_switch_off} "
+            f"invert_v={invert_v} invert_h={invert_h}"
+        )
+        if fw_failed_v or fw_failed_h:
+            axes = ", ".join(
+                ax for ax, failed in (("vertical", fw_failed_v), ("horizontal", fw_failed_h))
+                if failed
+            )
+            self._emit_status(
+                f"Firmware wheel invert unavailable ({axes}) -- "
+                "using OS-level inversion."
+            )
+        if new_active != prev_active:
+            self._notify_wheel_divert_change(new_active)
+
+    def _notify_wheel_divert_change(self, active: bool) -> None:
+        if self._wheel_divert_change_cb is None:
+            return
+        try:
+            self._wheel_divert_change_cb(bool(active))
+        except Exception as exc:
+            print(f"[Engine] wheel divert change callback raised: {exc}")
+
+    def set_wheel_divert_change_callback(self, cb) -> None:
+        """Register ``cb(active: bool)`` invoked whenever the HID++ wheel
+        divert lease toggles. Fires once immediately with the current
+        state. Pass ``None`` to detach the currently registered callback."""
+        self._wheel_divert_change_cb = cb
+        if cb is None:
+            return
+        try:
+            cb(bool(self._wheel_divert_active_local))
+        except Exception as exc:
+            print(f"[Engine] wheel divert change callback (initial) raised: {exc}")
+
+    @property
+    def wheel_native_invert_active(self) -> bool:
+        """True iff the connected device is performing scroll inversion at
+        the firmware level (so the OS-layer inversion path is suppressed)."""
+        return bool(self._wheel_divert_active_local)
 
     def _make_hscroll_handler(self, action_id):
         def handler(event):
@@ -418,6 +546,34 @@ class Engine:
     def set_gesture_event_callback(self, cb):
         """Register ``cb(event: dict)`` invoked for structured gesture debug events."""
         self._gesture_event_cb = cb
+
+    def set_gesture_outcome_callback(self, cb):
+        """Register ``cb(arrow, label, status, detail)`` for EVERY gesture
+        outcome. Unlike the debug event channel this always fires, so the UI
+        can show on-screen feedback and we always KNOW what a swipe did."""
+        self._gesture_outcome_cb = cb
+
+    # Arrow glyphs for on-screen feedback, keyed by gesture event type.
+    _GESTURE_ARROWS = {
+        "gesture_swipe_up": "↑",
+        "gesture_swipe_down": "↓",
+        "gesture_swipe_left": "←",
+        "gesture_swipe_right": "→",
+    }
+
+    def _report_gesture_outcome(self, event_type, label, status, detail=""):
+        """Always-on: log one line per gesture outcome and notify the UI.
+        ``status`` is "fired" | "failed" | "unmapped"."""
+        arrow = self._GESTURE_ARROWS.get(event_type, "•")
+        suffix = f": {detail}" if detail else ""
+        level = "ERROR" if status == "failed" else "Gesture"
+        print(f"[{level}] {arrow} {event_type} -> {label or '(none)'} [{status}]{suffix}")
+        cb = self._gesture_outcome_cb
+        if cb:
+            try:
+                cb(arrow, label, status, detail)
+            except Exception as exc:  # noqa: BLE001 - UI callback boundary
+                print(f"[Engine] gesture outcome callback error: {exc}")
 
     def set_debug_enabled(self, enabled):
         enabled = bool(enabled)
@@ -516,6 +672,19 @@ class Engine:
                     except Exception:
                         pass
 
+        # Phase A.5: re-apply HID++ native wheel invert with force=True so
+        # firmware that forgot invert state after sleep is realigned.
+        self._apply_wheel_invert_setting(force=True)
+        native_invert_target = (
+            coerce_wheel_divert_setting(
+                self.cfg.get("settings", {}).get("wheel_divert")
+            ) != WHEEL_DIVERT_OFF
+            and bool(getattr(self.connected_device, "has_hires_wheel", False)
+                     or getattr(self.connected_device, "has_thumbwheel", False))
+        )
+        if native_invert_target and not self._wheel_divert_active_local:
+            replay_ok = False
+
         time.sleep(3)
         hg = self.hook._hid_gesture
         if hg is None or getattr(hg, "connected_device", None) is None:
@@ -611,6 +780,16 @@ class Engine:
         connection_changed = connected != self._last_connection_state
         hid_features_ready = self.hid_features_ready
         hid_features_changed = hid_features_ready != self._last_hid_features_ready
+        if self._remote_forwarder is not None and connection_changed:
+            try:
+                if connected:
+                    self._remote_forwarder.notify_device_connected(
+                        self.hook.connected_device
+                    )
+                else:
+                    self._remote_forwarder.notify_device_disconnected()
+            except Exception as exc:  # noqa: BLE001 - relay boundary
+                print(f"[Engine] remote forwarder notify failed: {exc!r}")
         if connection_changed:
             self._last_connection_state = connected
             self._battery_poll_stop.set()
@@ -634,6 +813,11 @@ class Engine:
             self._battery_poll_thread.start()
         if hid_features_ready and hid_features_changed:
             self._request_saved_settings_replay()
+            if self._remote_forwarder is not None:
+                try:
+                    self._remote_forwarder.notify_decode_changed()
+                except Exception as exc:  # noqa: BLE001 - relay boundary
+                    print(f"[Engine] remote forwarder decode notify failed: {exc!r}")
 
     def _battery_poll_loop(self, stop_event):
         """Read battery and smart shift mode periodically until disconnected."""
@@ -658,8 +842,15 @@ class Engine:
                         except Exception:
                             pass
 
+                # Read ``_replay_inflight`` under the same lock that the
+                # replay thread uses to flip it, otherwise the battery
+                # loop can issue a Smart Shift poll partway through a
+                # replay round-trip and the firmware queues conflicting
+                # HID++ writes.
+                with self._replay_lock:
+                    replay_inflight = self._replay_inflight
                 if (
-                    not self._replay_inflight
+                    not replay_inflight
                     and now - _last_ss >= _ss_poll_interval
                     and hg.smart_shift_supported
                 ):
@@ -725,7 +916,7 @@ class Engine:
         hg = self.hook._hid_gesture
         if hg:
             return hg.set_dpi(dpi)
-        print("[Engine] No HID++ connection — DPI not applied")
+        print("[Engine] No HID++ connection -- DPI not applied")
         return False
 
     def set_smart_shift(self, mode, smart_shift_enabled=False, threshold=25):
@@ -744,7 +935,7 @@ class Engine:
             result = hg.set_smart_shift(mode, smart_shift_enabled, threshold)
             print(f"[Engine] set_smart_shift -> {'OK' if result else 'FAILED'}")
             return result
-        print("[Engine] set_smart_shift: No HID++ connection — not applied")
+        print("[Engine] set_smart_shift: No HID++ connection -- not applied")
         return False
 
     @property
@@ -764,6 +955,15 @@ class Engine:
             self._setup_hooks()
             self._emit_debug(f"reload_mappings profile={self._current_profile}")
 
+    def reload_kvm_integration(self):
+        """Restart Deskflow / KVM bridge clients after a settings change."""
+        with self._lock:
+            self.cfg = load_config()
+            self._stop_remote_forwarder()
+            self._stop_remote_device_server()
+            self._start_remote_device_server()
+            self._start_remote_forwarder()
+
     def set_enabled(self, enabled):
         self._enabled = bool(enabled)
 
@@ -780,10 +980,149 @@ class Engine:
         if status_message:
             self._emit_status(status_message)
 
+    def _start_remote_device_server(self):
+        """Start the loopback virtual-device server when configured.
+
+        Off by default; requires both the enabled flag and a non-empty token
+        in ``settings.remote_device`` so it can never be reached by accident.
+        Deskflow auto mode can supply token/port from the Deskflow manifest.
+        """
+        remote_cfg = self.cfg.get("settings", {}).get("remote_device", {}) or {}
+        from core.deskflow_integration import resolve_integration, use_transparent_transport
+        from core.remote_device import DEFAULT_PORT, RemoteDeviceServer
+
+        deskflow = resolve_integration(self.cfg)
+        enabled = bool(remote_cfg.get("enabled", False))
+        token = str(remote_cfg.get("token") or "")
+        port = DEFAULT_PORT
+        if deskflow and deskflow.get("client_sink"):
+            if not enabled:
+                enabled = True
+            if not token:
+                token = str(deskflow.get("token") or "")
+            try:
+                port = int(remote_cfg.get("port", deskflow.get("port", DEFAULT_PORT)))
+            except (TypeError, ValueError):
+                port = int(deskflow.get("port", DEFAULT_PORT))
+        else:
+            if not enabled:
+                return
+            try:
+                port = int(remote_cfg.get("port", DEFAULT_PORT))
+            except (TypeError, ValueError):
+                port = DEFAULT_PORT
+
+        if not token:
+            return
+
+        server = RemoteDeviceServer(
+            self.hook,
+            token=token,
+            port=port,
+            status_cb=self._emit_status,
+            decode_override=remote_cfg.get("decode"),
+            transparent_transport=use_transparent_transport(self.cfg),
+        )
+        if server.start():
+            self._remote_device_server = server
+            if deskflow and deskflow.get("client_sink") and not remote_cfg.get("enabled", False):
+                self._emit_status("Deskflow HID sink auto-enabled")
+
+    def _stop_remote_device_server(self):
+        if self._remote_device_server is None:
+            return
+        try:
+            self._remote_device_server.stop()
+        except Exception as exc:  # noqa: BLE001 - shutdown must complete
+            print(f"[Engine] stop: remote device server raised: {exc!r}")
+        self._remote_device_server = None
+
+    def _start_remote_forwarder(self):
+        """Start the KVM-bridge forwarder when configured (off by default)."""
+        fwd_cfg = self.cfg.get("settings", {}).get("remote_forward", {}) or {}
+        from core.deskflow_integration import resolve_integration
+        from core.remote_forward import DEFAULT_BRIDGE_PORT, RemoteForwarder
+
+        deskflow = resolve_integration(self.cfg)
+        enabled = bool(fwd_cfg.get("enabled", False))
+        decode_only = bool(fwd_cfg.get("passthrough_decode_only", False))
+        token = str(fwd_cfg.get("token") or "")
+        host = str(fwd_cfg.get("host", "127.0.0.1") or "127.0.0.1")
+        port = DEFAULT_BRIDGE_PORT
+
+        if deskflow and deskflow.get("host_bridge"):
+            enabled = True
+            decode_only = True
+            if not token:
+                token = str(deskflow.get("bridge_token") or "")
+            try:
+                port = int(fwd_cfg.get("port", deskflow.get("bridge_port", DEFAULT_BRIDGE_PORT)))
+            except (TypeError, ValueError):
+                port = int(deskflow.get("bridge_port", DEFAULT_BRIDGE_PORT))
+        elif not enabled:
+            return
+        else:
+            try:
+                port = int(fwd_cfg.get("port", DEFAULT_BRIDGE_PORT))
+            except (TypeError, ValueError):
+                port = DEFAULT_BRIDGE_PORT
+
+        if not token:
+            return
+
+        forwarder = RemoteForwarder(
+            token=token,
+            host=host,
+            port=port,
+            device_supplier=lambda: self.hook.connected_device,
+            decode_supplier=lambda: self.hook.gesture_decode_context(),
+            status_cb=self._emit_status,
+            decode_only=decode_only,
+        )
+        if forwarder.start():
+            self._remote_forwarder = forwarder
+            self.hook.set_remote_forwarder(forwarder)
+            if decode_only:
+                self._schedule_decode_publish()
+            if deskflow and deskflow.get("host_bridge") and not fwd_cfg.get("enabled", False):
+                self._emit_status("Deskflow decode bridge auto-enabled")
+
+    def _schedule_decode_publish(self):
+        """Poll until feat_idx is ready and published to the bridge."""
+        def poll():
+            for _ in range(50):
+                fwd = self._remote_forwarder
+                if fwd is None:
+                    return
+                try:
+                    fwd.notify_decode_changed()
+                except Exception as exc:  # noqa: BLE001 - relay boundary
+                    print(f"[Engine] decode publish poll failed: {exc!r}")
+                    return
+                if fwd.decode_published:
+                    return
+                time.sleep(0.2)
+
+        threading.Thread(
+            target=poll, daemon=True, name="DecodePublishPoll"
+        ).start()
+
+    def _stop_remote_forwarder(self):
+        if self._remote_forwarder is None:
+            return
+        self.hook.set_remote_forwarder(None)
+        try:
+            self._remote_forwarder.stop()
+        except Exception as exc:  # noqa: BLE001 - shutdown must complete
+            print(f"[Engine] stop: remote forwarder raised: {exc!r}")
+        self._remote_forwarder = None
+
     def start(self):
         self._emit_linux_permission_warning()
         self.hook.start()
         self._app_detector.start()
+        self._start_remote_device_server()
+        self._start_remote_forwarder()
         # Temporary safety-net: keep the old delayed replay path until the
         # hid-ready transition path has proven out in the field.
         def _startup_replay_fallback():
@@ -802,9 +1141,23 @@ class Engine:
         self._smart_shift_read_cb = cb
 
     def stop(self):
+        self._stop_remote_forwarder()
+        self._stop_remote_device_server()
         self._battery_poll_stop.set()
         if self._battery_poll_thread is not None:
             self._battery_poll_thread.join(timeout=5)
             self._battery_poll_thread = None
         self._app_detector.stop()
         self.hook.stop()
+        # Cancel any pending safety auto-release timers. Without this the
+        # threading.Timer scheduled by execute_action can still fire after
+        # ``stop()`` returns and call ``inject_mouse_up`` against a hook
+        # that has already been torn down -- one of the timers fires a
+        # phantom release every time Mouser quits during a long press.
+        timers = list(self._mouse_release_timers.values())
+        self._mouse_release_timers.clear()
+        for timer in timers:
+            try:
+                timer.cancel()
+            except Exception as exc:  # noqa: BLE001 - shutdown must complete
+                print(f"[Engine] stop: failed to cancel release timer: {exc!r}")

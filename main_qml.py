@@ -58,8 +58,12 @@ _t2 = _time.perf_counter()
 # Ensure PySide6 QML plugins are found
 import PySide6
 _pyside_dir = os.path.dirname(PySide6.__file__)
-os.environ.setdefault("QML2_IMPORT_PATH", os.path.join(_pyside_dir, "qml"))
-os.environ.setdefault("QT_PLUGIN_PATH", os.path.join(_pyside_dir, "plugins"))
+_qml_dir = os.path.join(_pyside_dir, "qml")
+_plugin_dir = os.path.join(_pyside_dir, "plugins")
+os.environ.setdefault("QML2_IMPORT_PATH", _qml_dir)
+os.environ.setdefault("QT_PLUGIN_PATH", _plugin_dir)
+QCoreApplication.addLibraryPath(_plugin_dir)
+QCoreApplication.addLibraryPath(_qml_dir)
 
 _t3 = _time.perf_counter()
 from core.config import load_config, save_config
@@ -1113,6 +1117,12 @@ def main():
 
     # ── QML Engine ─────────────────────────────────────────────
     qml_engine = QQmlApplicationEngine()
+
+    def _log_qml_warnings(warnings):
+        for warning in warnings:
+            print(f"[QML] {warning.toString()}")
+
+    qml_engine.warnings.connect(_log_qml_warnings)
     qml_engine.addImageProvider("appicons", AppIconProvider(ROOT))
     qml_engine.addImageProvider("systemicons", SystemIconProvider())
     qml_engine.rootContext().setContextProperty("backend", backend)
@@ -1136,17 +1146,26 @@ def main():
     root_window = qml_engine.rootObjects()[0]
 
     def show_main_window():
-        # Promote BEFORE show so the window registers with WindowServer's
-        # foreground-app surfaces (Dock + Cmd+Tab + Mission Control) at
-        # creation time on macOS. visibilityChanged below also catches the
-        # transition (idempotent), so promotion is correct on the initial
-        # launch path where this function is never called.
-        _set_macos_activation_policy(regular=True)
-        root_window.showNormal()
-        root_window.raise_()
-        root_window.requestActivate()
-        _schedule_macos_dock_icon_refresh()
-        _activate_macos_window()
+        def _present():
+            # Promote BEFORE show so the window registers with WindowServer's
+            # foreground-app surfaces (Dock + Cmd+Tab + Mission Control) at
+            # creation time on macOS. visibilityChanged below also catches the
+            # transition (idempotent), so promotion is correct on the initial
+            # launch path where this function is never called.
+            _set_macos_activation_policy(regular=True)
+            root_window.show()
+            if root_window.visibility() == QWindow.Visibility.Minimized:
+                root_window.showNormal()
+            root_window.raise_()
+            root_window.requestActivate()
+            _schedule_macos_dock_icon_refresh()
+            _activate_macos_window()
+
+        # macOS Accessory apps (start-minimized / menu-bar only) often ignore
+        # show/activate when triggered synchronously from a closing tray menu.
+        # Defer one event-loop tick so "Open Settings" reliably surfaces the
+        # window after NSStatusItem / QMenu handling completes.
+        QTimer.singleShot(0, _present)
 
     def _on_window_visibility_changed(visibility):
         # QWindow.Visibility: Hidden = 0; any other value (Windowed,
