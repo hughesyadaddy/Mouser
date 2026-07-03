@@ -36,6 +36,7 @@ WM_XBUTTONDOWN = 0x020B
 WM_XBUTTONUP = 0x020C
 WM_MBUTTONDOWN = 0x0207
 WM_MBUTTONUP = 0x0208
+WM_MOUSEMOVE = 0x0200
 WM_MOUSEHWHEEL = 0x020E
 WM_MOUSEWHEEL = 0x020A
 RI_MOUSE_WHEEL = 0x0400
@@ -284,6 +285,15 @@ class MouseHook(BaseMouseHook):
 
     def _low_level_handler_inner(self, nCode, wParam, lParam):
         if nCode == HC_ACTION:
+            # WM_MOUSEMOVE is the highest-frequency mouse event and Mouser
+            # never remaps it: button/wheel remap and gesture capture run off
+            # the Raw Input path, not this LL hook. Every WH_MOUSE_LL hook
+            # serializes all system mouse input through its callback, so a
+            # Python handler on the move hot path adds latency to every
+            # cursor move -- catastrophically when a network KVM injects
+            # moves at high frequency. Pass moves through before any work.
+            if wParam == WM_MOUSEMOVE:
+                return CallNextHookEx(self._hook, nCode, wParam, lParam)
             data = lParam.contents
             mouse_data = data.mouseData
             flags = data.flags
