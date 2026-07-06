@@ -83,6 +83,10 @@ class RemoteForwarder:
         self._focus_screen = None
         self._stopped = threading.Event()
         self._thread = None
+        # Optional: invoked (no args) whenever remote/local focus flips or
+        # the session drops. The platform hook uses it to re-evaluate
+        # whether its OS-level hook should stay installed.
+        self.on_focus_change = None
 
     # ── lifecycle ─────────────────────────────────────────────────
 
@@ -276,6 +280,16 @@ class RemoteForwarder:
             if was_remote != (not local):
                 state = "remote" if not local else "local"
                 print(f"[RemoteForward] Focus -> {state} (screen={screen})")
+                self._notify_focus_change()
+
+    def _notify_focus_change(self):
+        callback = self.on_focus_change
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception as exc:  # noqa: BLE001 - callback boundary
+            print(f"[RemoteForward] focus-change callback raised: {exc!r}")
 
     def _on_session_end(self):
         # Runs on the forwarder thread, which owns the reader.
@@ -296,6 +310,7 @@ class RemoteForwarder:
         if was_connected:
             self._emit_status("Disconnected from KVM bridge")
             print("[RemoteForward] Bridge connection lost")
+            self._notify_focus_change()
 
     def _shutdown_socket(self):
         """Thread-safe socket teardown; never touches the reader (owned by

@@ -93,6 +93,7 @@ INJECTED_FLAG = 0x00000001
 
 WM_INPUT = 0x00FF
 RIDEV_INPUTSINK = 0x00000100
+RIDEV_REMOVE = 0x00000001
 RID_INPUT = 0x10000003
 RIM_TYPEMOUSE = 0
 RIM_TYPEKEYBOARD = 1
@@ -217,6 +218,11 @@ def hiword(dword):
 WM_APP = 0x8000
 WM_APP_INJECT_VSCROLL = WM_APP + 1
 WM_APP_INJECT_HSCROLL = WM_APP + 2
+WM_APP_SYNC_HOOK = WM_APP + 3
+
+WM_TIMER = 0x0113
+SYNC_RETRY_TIMER_ID = 0x4D53  # 'MS'; retries a hook uninstall deferred mid-gesture
+SYNC_RETRY_INTERVAL_MS = 200
 
 WM_DEVICECHANGE = 0x0219
 DBT_DEVNODES_CHANGED = 0x0007
@@ -224,6 +230,13 @@ DBT_DEVNODES_CHANGED = 0x0007
 PostMessageW = windll.user32.PostMessageW
 PostMessageW.argtypes = [wintypes.HWND, c_uint, wintypes.WPARAM, wintypes.LPARAM]
 PostMessageW.restype = wintypes.BOOL
+
+SetTimer = windll.user32.SetTimer
+SetTimer.argtypes = [wintypes.HWND, ctypes.c_size_t, c_uint, c_void_p]
+SetTimer.restype = ctypes.c_size_t
+KillTimer = windll.user32.KillTimer
+KillTimer.argtypes = [wintypes.HWND, ctypes.c_size_t]
+KillTimer.restype = wintypes.BOOL
 
 
 class MouseHook(BaseMouseHook):
@@ -253,6 +266,10 @@ class MouseHook(BaseMouseHook):
         # WM_INPUT wheel marks from ``_process_raw_input``; used when the LL
         # hook's ``GetRawInputBuffer`` peek returns empty for the same stroke.
         self._last_logitech_wheel_monotonic = 0.0
+        # Dynamic hook lifecycle: the WH_MOUSE_LL hook (and the generic-mouse
+        # Raw Input registration that delivers a Python WM_INPUT per system
+        # mouse move) exist only while _hook_should_be_installed() is True.
+        self._generic_ri_registered = False
         self._init_dispatch_queue(maxsize=512)
         self._dispatch_worker_thread = None
 
@@ -420,6 +437,7 @@ class MouseHook(BaseMouseHook):
                         )
 
             if event:
+                should_block = self._pair_blocked_updown(event.event_type, should_block)
                 self._enqueue_dispatch_event(event)
                 if should_block:
                     return 1
@@ -512,6 +530,15 @@ class MouseHook(BaseMouseHook):
             self._hscroll_posted = False
             if delta != 0:
                 _inject_scroll_impl(MOUSEEVENTF_HWHEEL, delta)
+            return 0
+
+        if msg == WM_APP_SYNC_HOOK:
+            self._apply_hook_state()
+            return 0
+
+        if msg == WM_TIMER and wParam == SYNC_RETRY_TIMER_ID:
+            KillTimer(hwnd, SYNC_RETRY_TIMER_ID)
+            self._apply_hook_state()
             return 0
 
         if msg == WM_DEVICECHANGE:
@@ -628,35 +655,57 @@ class MouseHook(BaseMouseHook):
 
         ShowWindow(self._ri_hwnd, SW_HIDE)
 
-        devices = (RAWINPUTDEVICE * 4)()
-        devices[0].usUsagePage = 0x01
-        devices[0].usUsage = 0x02
+        # Vendor/consumer collections only fire for Logitech HID reports and
+        # are cheap to keep registered. The generic-mouse registration
+        # (usage page 0x01 / usage 0x02) delivers one Python WM_INPUT per
+        # system mouse move -- it is registered on demand together with the
+        # LL hook (_set_generic_mouse_ri), never unconditionally.
+        devices = (RAWINPUTDEVICE * 3)()
+        devices[0].usUsagePage = 0xFF43
+        devices[0].usUsage = 0x0202
         devices[0].dwFlags = RIDEV_INPUTSINK
         devices[0].hwndTarget = self._ri_hwnd
         devices[1].usUsagePage = 0xFF43
-        devices[1].usUsage = 0x0202
+        devices[1].usUsage = 0x0204
         devices[1].dwFlags = RIDEV_INPUTSINK
         devices[1].hwndTarget = self._ri_hwnd
-        devices[2].usUsagePage = 0xFF43
-        devices[2].usUsage = 0x0204
+        devices[2].usUsagePage = 0x0C
+        devices[2].usUsage = 0x01
         devices[2].dwFlags = RIDEV_INPUTSINK
         devices[2].hwndTarget = self._ri_hwnd
-        devices[3].usUsagePage = 0x0C
-        devices[3].usUsage = 0x01
-        devices[3].dwFlags = RIDEV_INPUTSINK
-        devices[3].hwndTarget = self._ri_hwnd
 
-        if RegisterRawInputDevices(devices, 4, sizeof(RAWINPUTDEVICE)):
-            print("[MouseHook] Raw Input: mice + Logitech HID + consumer")
+        if RegisterRawInputDevices(devices, 3, sizeof(RAWINPUTDEVICE)):
+            print("[MouseHook] Raw Input: Logitech HID + consumer")
             return True
         if RegisterRawInputDevices(devices, 2, sizeof(RAWINPUTDEVICE)):
-            print("[MouseHook] Raw Input: mice + Logitech HID short")
+            print("[MouseHook] Raw Input: Logitech HID short")
             return True
-        if RegisterRawInputDevices(devices, 1, sizeof(RAWINPUTDEVICE)):
-            print("[MouseHook] Raw Input: mice only")
-            return True
-        print("[MouseHook] Raw Input registration failed")
-        return False
+        print("[MouseHook] Raw Input vendor registration failed")
+        return True  # window still usable; generic-mouse RI follows the hook
+
+    def _set_generic_mouse_ri(self, enabled: bool):
+        """(Un)register the generic-mouse Raw Input sink with the hook.
+
+        RIDEV_REMOVE requires hwndTarget = NULL for the same usage pair.
+        """
+        if not self._ri_hwnd or enabled == self._generic_ri_registered:
+            return
+        device = (RAWINPUTDEVICE * 1)()
+        device[0].usUsagePage = 0x01
+        device[0].usUsage = 0x02
+        if enabled:
+            device[0].dwFlags = RIDEV_INPUTSINK
+            device[0].hwndTarget = self._ri_hwnd
+        else:
+            device[0].dwFlags = RIDEV_REMOVE
+            device[0].hwndTarget = None
+        if RegisterRawInputDevices(device, 1, sizeof(RAWINPUTDEVICE)):
+            self._generic_ri_registered = enabled
+        else:
+            print(
+                "[MouseHook] Raw Input generic-mouse "
+                f"{'register' if enabled else 'remove'} failed"
+            )
 
     def _dispatch_worker(self):
         while self._running:
@@ -671,21 +720,16 @@ class MouseHook(BaseMouseHook):
 
     def _run_hook(self):
         self._thread_id = windll.kernel32.GetCurrentThreadId()
-        self._hook_proc = HOOKPROC(self._low_level_handler)
-        self._hook = SetWindowsHookExW(
-            WH_MOUSE_LL,
-            self._hook_proc,
-            GetModuleHandleW(None),
-            0,
-        )
-        if not self._hook:
+        if not self._setup_raw_input():
             self._startup_ok = False
             self._startup_event.set()
-            print("[MouseHook] Failed to install hook!")
+            print("[MouseHook] Raw Input window unavailable -- hook thread aborting")
             return
-        print("[MouseHook] Hook installed successfully")
-        self._setup_raw_input()
         self._running = True
+        # Initial hook state is applied here, after the window exists, so a
+        # sync_hook_state() racing startup can never be lost: any posted
+        # WM_APP_SYNC_HOOK re-runs the same evaluation.
+        self._apply_hook_state()
         self._startup_ok = True
         self._startup_event.set()
 
@@ -706,6 +750,55 @@ class MouseHook(BaseMouseHook):
         self._running = False
         print("[MouseHook] Hook removed")
 
+    def sync_hook_state(self):
+        """Thread-safe: ask the hook thread to re-evaluate hook existence."""
+        hwnd = self._ri_hwnd
+        if hwnd and self._running:
+            PostMessageW(hwnd, WM_APP_SYNC_HOOK, 0, 0)
+        # else: _run_hook applies the initial state after window creation.
+
+    def _apply_hook_state(self):
+        """Hook thread only: converge installed state to the predicate."""
+        want = self._hook_should_be_installed()
+        if want and self._hook is None:
+            self._install_ll_hook()
+            self._set_generic_mouse_ri(True)
+        elif not want and self._hook is not None:
+            with self._gesture_lock:
+                gesture_active = self._gesture_active
+            if gesture_active:
+                # Never uninstall mid-capture: the gesture-up must pass
+                # through the same hook that swallowed the down. Retry
+                # shortly; the timer re-arms until the capture ends.
+                if self._ri_hwnd:
+                    SetTimer(self._ri_hwnd, SYNC_RETRY_TIMER_ID, SYNC_RETRY_INTERVAL_MS, None)
+                return
+            self._uninstall_ll_hook()
+            self._set_generic_mouse_ri(False)
+
+    def _install_ll_hook(self):
+        if self._hook:
+            return
+        self._hook_proc = HOOKPROC(self._low_level_handler)
+        self._hook = SetWindowsHookExW(
+            WH_MOUSE_LL,
+            self._hook_proc,
+            GetModuleHandleW(None),
+            0,
+        )
+        if self._hook:
+            print("[MouseHook] Hook installed successfully")
+        else:
+            print("[MouseHook] Failed to install hook!")
+
+    def _uninstall_ll_hook(self):
+        if not self._hook:
+            return
+        UnhookWindowsHookEx(self._hook)
+        self._hook = None
+        self._blocked_down_active.clear()
+        print("[MouseHook] Hook idle -- removed from input path")
+
     def _on_device_change(self):
         now = time.time()
         if now - self._last_rehook_time < 2.0:
@@ -721,20 +814,20 @@ class MouseHook(BaseMouseHook):
             self._hid_gesture.notify_device_arrival()
 
     def _reinstall_hook(self):
-        if self._hook:
+        """Device-change recovery: rebuild the hook only when it should exist.
+
+        Windows silently drops a WH_MOUSE_LL hook whose callback times out;
+        re-hooking on device change recovers that. When the predicate says
+        the hook should not exist, converge to uninstalled instead -- the
+        old unconditional reinstall kept resurrecting a pointless hook on
+        every devnode storm from the HID probe.
+        """
+        if self._hook is not None and self._hook_should_be_installed():
             UnhookWindowsHookEx(self._hook)
             self._hook = None
-        self._hook_proc = HOOKPROC(self._low_level_handler)
-        self._hook = SetWindowsHookExW(
-            WH_MOUSE_LL,
-            self._hook_proc,
-            GetModuleHandleW(None),
-            0,
-        )
-        if self._hook:
-            print("[MouseHook] Hook reinstalled successfully")
+            self._install_ll_hook()
         else:
-            print("[MouseHook] Failed to reinstall hook!")
+            self._apply_hook_state()
 
     def _on_hid_gesture_down(self):
         # MX4 routing: when the Sense Panel is the gesture source for this

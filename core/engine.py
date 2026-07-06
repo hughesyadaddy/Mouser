@@ -180,6 +180,11 @@ class Engine:
                     else:
                         self.hook.register(evt_type, self._make_handler(action_id))
 
+        # Settings applied above (invert toggles, blocked events) feed the
+        # hook-existence predicate; converge the OS hook to the new state.
+        # getattr: engine test fakes predate the dynamic-hook contract.
+        getattr(self.hook, "sync_hook_state", lambda: None)()
+
     def _make_handler(self, action_id):
         def handler(event):
             if not self._enabled:
@@ -407,6 +412,9 @@ class Engine:
         self._wheel_divert_active_local = new_active
         self.hook.wheel_native_invert_vertical = active_v
         self.hook.wheel_native_invert_horizontal = active_h
+        # Firmware-invert leases change whether the OS-layer scroll fallback
+        # (and therefore the LL hook) is needed at all.
+        getattr(self.hook, "sync_hook_state", lambda: None)()
         self._last_native_invert_target = desired
         if hg is not None and hasattr(hg, "set_wheel_divert_active_flags"):
             try:

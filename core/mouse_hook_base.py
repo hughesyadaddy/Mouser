@@ -23,6 +23,8 @@ class BaseMouseHook:
     def __init__(self):
         self._callbacks = {}
         self._blocked_events = set()
+        # Down events actually swallowed by the hook; see _pair_blocked_updown.
+        self._blocked_down_active = set()
         self._debug_callback = None
         self._gesture_callback = None
         self._status_callback = None
@@ -193,9 +195,67 @@ class BaseMouseHook:
             return False
         return True
 
+    def sync_hook_state(self):
+        """Re-evaluate whether the OS-level hook should be installed.
+
+        Platforms with dynamic hook lifecycles (Windows WH_MOUSE_LL)
+        override this; the default is a no-op so callers can invoke it
+        unconditionally from any thread.
+        """
+
+    def _scroll_invert_fallback_enabled(self) -> bool:
+        """True when either axis's OS-layer scroll-invert fallback could
+        fire — the one intercept that stays active while KVM focus is
+        remote, and therefore the one reason to keep the OS hook installed
+        without local focus. Mirrors the per-event gating of
+        :meth:`_apply_vscroll_invert_fallback` minus the event itself.
+        """
+        if not self._physical_logitech_bound():
+            return False
+        if self.invert_vscroll and not self.wheel_native_invert_vertical:
+            return True
+        return self.invert_hscroll and not self.wheel_native_invert_horizontal
+
+    def _hook_should_be_installed(self) -> bool:
+        """Whether the OS-level hook has any work at all.
+
+        When False the hook must not exist: a hook callback (Python, GIL)
+        sits in the delivery path of EVERY system mouse event, and a KVM
+        client injecting uncoalesced moves at full rate will freeze the
+        cursor behind a callback that has nothing to intercept anyway.
+        """
+        return self._should_intercept_events() or self._scroll_invert_fallback_enabled()
+
+    _UP_TO_DOWN_EVENT = {
+        MouseEvent.XBUTTON1_UP: MouseEvent.XBUTTON1_DOWN,
+        MouseEvent.XBUTTON2_UP: MouseEvent.XBUTTON2_DOWN,
+        MouseEvent.MIDDLE_UP: MouseEvent.MIDDLE_DOWN,
+    }
+
+    def _pair_blocked_updown(self, event_type, should_block: bool) -> bool:
+        """Only swallow an UP whose DOWN we swallowed.
+
+        A dynamic hook can (un)install between a physical press and its
+        release. Blocking an UP whose DOWN reached the OS would leave the
+        system with a stuck button; passing an UP whose DOWN we swallowed
+        is harmless (unmatched up). Downs record themselves when blocked.
+        """
+        down_type = self._UP_TO_DOWN_EVENT.get(event_type)
+        if down_type is None:
+            if should_block and event_type in self._UP_TO_DOWN_EVENT.values():
+                self._blocked_down_active.add(event_type)
+            return should_block
+        down_was_blocked = down_type in self._blocked_down_active
+        self._blocked_down_active.discard(down_type)
+        return should_block and down_was_blocked
+
     def set_remote_forwarder(self, forwarder):
         """Attach/detach a core.remote_forward.RemoteForwarder."""
         self._remote_forwarder = forwarder
+        if forwarder is not None:
+            # Focus flips change _should_intercept_events; follow them.
+            forwarder.on_focus_change = self.sync_hook_state
+        self.sync_hook_state()
 
     def _maybe_forward_raw_report(self, raw) -> bool:
         """Listener raw-report tap.
@@ -708,10 +768,12 @@ class BaseMouseHook:
             self._hid_gesture.connected_device if self._hid_gesture else None
         )
         self._set_device_connected(True)
+        self.sync_hook_state()
 
     def _on_hid_disconnect(self):
         self._connected_device = None
         self._set_device_connected(False)
+        self.sync_hook_state()
 
     def attach_deskflow_ingress(self, decode, product_id=None, product_name=None):
         """Route Deskflow passthrough through the main HID listener (Tier 1.5)."""
