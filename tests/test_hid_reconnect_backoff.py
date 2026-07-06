@@ -159,6 +159,27 @@ class ReprogNegativeCacheTests(unittest.TestCase):
         self.assertEqual(len(self.listener._reprog_negative_cache), 0)
         self.assertTrue(self.listener._device_arrival.is_set())
 
+    def test_repeated_arrivals_are_rate_limited(self):
+        # Probing the receiver itself fires DBT_DEVNODES_CHANGED, so an
+        # unthrottled clear would wipe the cache right after each probe
+        # cycle populates it and restart the storm forever.
+        self.listener.notify_device_arrival()
+        self.listener._device_arrival.clear()
+
+        self.assertFalse(self._try_connect())
+        self.assertEqual(len(self.listener._reprog_negative_cache), 1)
+
+        self.listener.notify_device_arrival()  # inside the 60 s window
+        self.assertEqual(len(self.listener._reprog_negative_cache), 1)
+        self.assertFalse(self.listener._device_arrival.is_set())
+
+        # Once the window passes, the next arrival clears again.
+        self.listener._last_arrival_clear = (
+            time.time() - hid_gesture.ARRIVAL_CLEAR_MIN_INTERVAL_S - 1)
+        self.listener.notify_device_arrival()
+        self.assertEqual(len(self.listener._reprog_negative_cache), 0)
+        self.assertTrue(self.listener._device_arrival.is_set())
+
 
 if __name__ == "__main__":
     unittest.main()

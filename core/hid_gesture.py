@@ -219,6 +219,14 @@ RECONNECT_BACKOFF_MAX_S = 60.0
 # healthy: reset the backoff.
 HEALTHY_SESSION_S = 30.0
 
+# Minimum spacing between device-arrival cache clears. DBT_DEVNODES_CHANGED
+# is noisy -- a sleeping mouse's receiver re-announces every few seconds --
+# and an unthrottled clear would wipe the negative cache right after each
+# probe cycle populates it, restarting the storm forever. The first arrival
+# in a quiet period still clears immediately (fresh USB plug reconnects
+# fast); repeats inside the window are ignored.
+ARRIVAL_CLEAR_MIN_INTERVAL_S = 60.0
+
 
 def _atexit_stop_listeners():
     """Best-effort undivert before interpreter exit so a Mouser crash or
@@ -1050,6 +1058,7 @@ class HidGestureListener:
         # without any WM_DEVICECHANGE, so entries must expire on their own.
         self._reprog_negative_cache = {}
         self._device_arrival = threading.Event()
+        self._last_arrival_clear = 0.0
 
     # ── Deskflow ingress (Tier 1.5 hidapi shim) ─────────────────────
 
@@ -1208,7 +1217,15 @@ class HidGestureListener:
         handler. Clears the REPROG_V4 negative cache and interrupts any
         in-progress reconnect backoff so the new device connects
         immediately instead of waiting out the timer.
+
+        Rate-limited: devnode-change events repeat every few seconds while
+        a paired mouse sleeps, and honoring each one would defeat the
+        negative cache entirely (see ARRIVAL_CLEAR_MIN_INTERVAL_S).
         """
+        now = time.time()
+        if now - self._last_arrival_clear < ARRIVAL_CLEAR_MIN_INTERVAL_S:
+            return
+        self._last_arrival_clear = now
         self._reprog_negative_cache.clear()
         self._device_arrival.set()
 
@@ -1518,6 +1535,10 @@ class HidGestureListener:
                     raise IOError(str(exc)) from exc
                 return None
             if raw is None:
+                # Guard against a busy-spin: some backends return instantly
+                # from read() when the interface is dead (sleeping device),
+                # which would otherwise peg a core for the whole timeout.
+                time.sleep(0.005)
                 continue
             msg = _parse(raw)
             if msg is None:
