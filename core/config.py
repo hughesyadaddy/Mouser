@@ -7,7 +7,6 @@ import json
 import os
 import stat
 import sys
-import tempfile
 from urllib.parse import quote
 from core import app_catalog
 
@@ -260,10 +259,26 @@ def load_config():
     return json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
 
 
+def _create_config_tmp():
+    """O_EXCL temp file in CONFIG_DIR that fails fast on permission errors.
+
+    Not tempfile.mkstemp: on Windows CPython retries PermissionError up to
+    os.TMP_MAX (INT_MAX) times, so a config dir with a broken ACL (e.g.
+    created by an elevated installer) spins the calling thread at 100% CPU
+    indefinitely instead of raising -- observed starving the mouse hook
+    chain and lagging the cursor.
+    """
+    tmp_path = os.path.join(
+        CONFIG_DIR, f".config-{os.getpid()}-{os.urandom(4).hex()}.tmp"
+    )
+    fd = os.open(tmp_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    return fd, tmp_path
+
+
 def save_config(cfg):
     """Persist config to disk via atomic write with restrictive permissions."""
     ensure_config_dir()
-    fd, tmp_path = tempfile.mkstemp(suffix=".tmp", dir=CONFIG_DIR)
+    fd, tmp_path = _create_config_tmp()
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)

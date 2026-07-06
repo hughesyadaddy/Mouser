@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 import errno
 import io
 import json
+import os
 from pathlib import Path
 import stat
 import subprocess
@@ -135,6 +136,34 @@ class _FakeHTTPResponse:
 
 
 class UpdateInstallerTests(unittest.TestCase):
+    def test_probe_directory_writable_impl_fails_fast_when_denied(self):
+        # Regression: tempfile.mkstemp on Windows retries PermissionError
+        # up to TMP_MAX times when the directory ACL denies writes, which
+        # spun a leaked probe thread at 100% CPU and lagged the cursor.
+        # The probe must make a single attempt and return False promptly.
+        import time as _time
+        from core.update_installer import _probe_directory_writable_impl
+
+        with tempfile.TemporaryDirectory() as tmp:
+            denied = Path(tmp) / "denied"
+            denied.mkdir()
+            if sys.platform == "win32":  # pragma: no cover - POSIX CI
+                self.skipTest("POSIX permission model required")
+            os.chmod(denied, 0o500)
+            try:
+                started = _time.time()
+                self.assertFalse(_probe_directory_writable_impl(denied))
+                self.assertLess(_time.time() - started, 1.0)
+            finally:
+                os.chmod(denied, 0o700)
+
+    def test_probe_directory_writable_impl_true_for_writable_dir(self):
+        from core.update_installer import _probe_directory_writable_impl
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertTrue(_probe_directory_writable_impl(Path(tmp)))
+            self.assertEqual(os.listdir(tmp), [])  # marker cleaned up
+
     def test_build_number_from_version_uses_semver_digits(self):
         self.assertEqual(build_number_from_version("v3.7.0"), 30700)
         self.assertEqual(build_number_from_version("3.7.12"), 30712)

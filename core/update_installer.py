@@ -568,10 +568,20 @@ def _probe_directory_writable(directory: Path, timeout: float = 2.0) -> bool:
 
 
 def _probe_directory_writable_impl(directory: Path) -> bool:
+    # Do NOT use tempfile.mkstemp here: on Windows CPython retries
+    # PermissionError indefinitely when the target is a directory, so
+    # probing a dir the user cannot write (machine-scope install under
+    # C:\Program Files) spins this thread at 100% CPU forever. The probe
+    # timeout in _probe_directory_writable abandons the thread but cannot
+    # stop it, and the leaked spinning daemon starves the WH_MOUSE_LL
+    # hook chain -- observed as severe injected-cursor lag. A single
+    # O_CREAT|O_EXCL attempt on a random name fails fast instead.
+    marker = directory / (
+        f".mouser-update-write-test-{os.getpid()}-{os.urandom(4).hex()}"
+    )
     try:
-        handle, marker = tempfile.mkstemp(
-            prefix=".mouser-update-write-test-",
-            dir=str(directory),
+        handle = os.open(
+            str(marker), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600
         )
     except OSError:
         return False
@@ -586,12 +596,12 @@ def _probe_directory_writable_impl(directory: Path) -> bool:
         except OSError:
             pass
         try:
-            Path(marker).unlink()
+            marker.unlink()
         except OSError:
             pass
         return False
     try:
-        Path(marker).unlink()
+        marker.unlink()
     except OSError:
         return False
     return True
