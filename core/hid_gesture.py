@@ -198,6 +198,28 @@ def _candidate_matches_cache(info, cached_candidate) -> bool:
     return _candidate_match_score(info, cached_candidate) > 0
 
 
+def _signature_key(sig: dict) -> tuple:
+    """Hashable identity for the REPROG_V4 negative cache."""
+    return tuple(sorted(sig.items()))
+
+
+# How long a candidate that opened without REPROG_V4 stays skipped. TTL
+# expiry (not just device-change events) is required: a sleeping mouse
+# wakes without firing WM_DEVICECHANGE.
+REPROG_NEGATIVE_CACHE_TTL_S = 300.0
+
+# Reconnect backoff bounds for sessions killed by consecutive HID++
+# request timeouts (device asleep / receiver unresponsive). The minimum
+# matches the historical 2 s reconnect pause, so the observed delay
+# sequence is simply 2, 4, 8, ... capped at the maximum.
+RECONNECT_BACKOFF_MIN_S = 2.0
+RECONNECT_BACKOFF_MAX_S = 60.0
+
+# A session that survives this long (or delivered real reports) is
+# healthy: reset the backoff.
+HEALTHY_SESSION_S = 30.0
+
+
 def _atexit_stop_listeners():
     """Best-effort undivert before interpreter exit so a Mouser crash or
     SIGTERM does not leave the device stuck in HID++ divert mode.
@@ -1017,6 +1039,17 @@ class HidGestureListener:
         self._deskflow_control_lock = threading.Lock()
         self._deskflow_attach_ready = None
         self._pending_decode_update = None
+        # Reconnect-storm protection: when a session dies from consecutive
+        # HID++ request timeouts (device asleep / power-cycled), back off
+        # exponentially instead of hammering open/probe/timeout loops that
+        # peg a core and starve the WH_MOUSE_LL hook chain.
+        self._reconnect_backoff_s = 0.0
+        # Candidates that opened but had no REPROG_V4 on any devIdx --
+        # skip them for a while so each retry doesn't re-pay their probe
+        # timeouts. TTL-based (not event-only): a sleeping mouse wakes
+        # without any WM_DEVICECHANGE, so entries must expire on their own.
+        self._reprog_negative_cache = {}
+        self._device_arrival = threading.Event()
 
     # ── Deskflow ingress (Tier 1.5 hidapi shim) ─────────────────────
 
@@ -1167,6 +1200,17 @@ class HidGestureListener:
         return True
 
     # ── public API ────────────────────────────────────────────────
+
+    def notify_device_arrival(self):
+        """A device was (re)plugged: forget failed probes, retry now.
+
+        Called from the platform hook's WM_DEVICECHANGE (or equivalent)
+        handler. Clears the REPROG_V4 negative cache and interrupts any
+        in-progress reconnect backoff so the new device connects
+        immediately instead of waiting out the timer.
+        """
+        self._reprog_negative_cache.clear()
+        self._device_arrival.set()
 
     def start(self):
         if not HIDAPI_OK and not _MAC_NATIVE_OK:
@@ -2605,6 +2649,17 @@ class HidGestureListener:
             source = info.get("source", "unknown")
             # Snapshot before inner branches rebind `info` to HID++ responses.
             candidate_signature = _candidate_signature(info)
+            cache_key = _signature_key(candidate_signature)
+            failed_at = self._reprog_negative_cache.get(cache_key)
+            if failed_at is not None:
+                if time.time() - failed_at < REPROG_NEGATIVE_CACHE_TTL_S:
+                    # Recently opened fine but exposed no REPROG_V4 on any
+                    # devIdx; skip so every retry doesn't re-pay its probe
+                    # timeouts (the open/timeout loop pegs a core).
+                    continue
+                # pop, not del: notify_device_arrival() clears the dict
+                # from the hook thread and a del here would raise KeyError.
+                self._reprog_negative_cache.pop(cache_key, None)
             device_spec = resolve_device(product_id=pid, product_name=product)
             self._feat_idx = None
             self._dpi_idx = None
@@ -2912,8 +2967,10 @@ class HidGestureListener:
                     "[HidGesture] Opened candidate but REPROG_V4 was not found "
                     f"on tested devIdx values PID=0x{int(pid or 0):04X} "
                     f"UP=0x{opened_up:04X} usage=0x{opened_usage:04X} "
-                    f"transport={opened_transport or '-'} source={source}"
+                    f"transport={opened_transport or '-'} source={source} "
+                    f"(skipping for {int(REPROG_NEGATIVE_CACHE_TTL_S)} s)"
                 )
+                self._reprog_negative_cache[cache_key] = time.time()
 
             # Couldn't use this interface -- close and try next
             try:
@@ -2924,6 +2981,44 @@ class HidGestureListener:
 
         return False
 
+    def _update_reconnect_backoff(self, session_healthy, timed_out_disconnect):
+        """Adjust the reconnect backoff and return the next delay (s).
+
+        Healthy sessions reset the backoff. Sessions killed by
+        consecutive request timeouts double it (1 s -> 60 s cap) so an
+        asleep or unresponsive device doesn't trigger a tight
+        open/probe/timeout reconnect storm.
+        """
+        if session_healthy:
+            self._reconnect_backoff_s = 0.0
+        elif timed_out_disconnect:
+            self._reconnect_backoff_s = min(
+                RECONNECT_BACKOFF_MAX_S,
+                max(RECONNECT_BACKOFF_MIN_S, self._reconnect_backoff_s * 2),
+            )
+            print(f"[HidGesture] Unhealthy session (request timeouts); "
+                  f"reconnect backoff {self._reconnect_backoff_s:.0f} s")
+        return max(2.0, self._reconnect_backoff_s)
+
+    def _wait_reconnect(self, delay_s):
+        """Interruptible wait before the next connect attempt.
+
+        Ends early when the listener stops, a Deskflow attach arrives, or
+        a device-arrival event fires. The event is only consumed (cleared)
+        here -- never pre-cleared -- so an arrival that fired during
+        session teardown still cuts the wait short instead of being lost.
+        Consuming an arrival also resets the backoff.
+        """
+        deadline = time.time() + delay_s
+        while self._running and time.time() < deadline:
+            if self._deskflow_attach is not None:
+                return
+            if self._device_arrival.is_set():
+                self._device_arrival.clear()
+                self._reconnect_backoff_s = 0.0
+                return
+            time.sleep(0.1)
+
     def _main_loop(self):
         """Outer loop: connect → listen → reconnect on error/disconnect."""
         retry_logged = False
@@ -2932,12 +3027,7 @@ class HidGestureListener:
                 if not retry_logged:
                     print("[HidGesture] No compatible device; retrying in 5 s…")
                     retry_logged = True
-                for _ in range(50):
-                    if not self._running:
-                        return
-                    if self._deskflow_attach is not None:
-                        break
-                    time.sleep(0.1)
+                self._wait_reconnect(5.0)
                 continue
             retry_logged = False
             self._reconnect_requested = False
@@ -2949,6 +3039,8 @@ class HidGestureListener:
                 except Exception:
                     pass
             print("[HidGesture] Listening for gesture events…")
+            _session_started = time.time()
+            _session_got_data = False
             _no_data_count = 0          # consecutive _rx() returning None
             _STALE_HOLD_LIMIT = 3       # force-release held buttons after this many empty reads (~3 s)
             _CONSECUTIVE_TIMEOUT_RECONNECT = 3  # force reconnect after this many request timeouts
@@ -2981,6 +3073,7 @@ class HidGestureListener:
                     raw = self._rx(1000)
                     if raw:
                         _no_data_count = 0
+                        _session_got_data = True
                         if not (self._on_raw_report and self._on_raw_report(raw)):
                             self._on_report(raw)
                     else:
@@ -2991,6 +3084,18 @@ class HidGestureListener:
                             self._force_release_stale_holds()
             except Exception as e:
                 print(f"[HidGesture] read error: {e}")
+
+            # Capture the disconnect reason before cleanup resets it: a
+            # session killed by consecutive request timeouts means the
+            # device is asleep/unresponsive and reconnecting immediately
+            # just repeats the probe storm.
+            _timed_out_disconnect = (
+                self._consecutive_request_timeouts >= _CONSECUTIVE_TIMEOUT_RECONNECT
+            )
+            _session_healthy = (
+                _session_got_data
+                or time.time() - _session_started >= HEALTHY_SESSION_S
+            )
 
             # Cleanup before potential reconnect
             if not self._deskflow_readonly:
@@ -3056,4 +3161,6 @@ class HidGestureListener:
                         pass
 
             if self._running:
-                time.sleep(2)
+                delay = self._update_reconnect_backoff(
+                    _session_healthy, _timed_out_disconnect)
+                self._wait_reconnect(delay)

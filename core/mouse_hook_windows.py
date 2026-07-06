@@ -715,6 +715,10 @@ class MouseHook(BaseMouseHook):
         self._device_name_cache.clear()
         self._prev_raw_buttons.clear()
         self._reinstall_hook()
+        # Let the HID++ listener retry immediately: clears its REPROG_V4
+        # negative cache and interrupts any reconnect backoff.
+        if self._hid_gesture is not None:
+            self._hid_gesture.notify_device_arrival()
 
     def _reinstall_hook(self):
         if self._hook:
