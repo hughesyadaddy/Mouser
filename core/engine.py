@@ -1082,9 +1082,20 @@ class Engine:
         if not token:
             return
 
+        # Re-read the host on every connection attempt. Deskflow re-elects a
+        # server whenever it restarts, so a value captured here goes stale the
+        # first time the fleet flips and the bridge never relinks.
+        def _live_host(default_host=host):
+            try:
+                cfg = self.config.get("settings", {}) or {}
+                live = str((cfg.get("remote_forward", {}) or {}).get("host", "") or "")
+                return live or default_host
+            except Exception:
+                return default_host
+
         forwarder = RemoteForwarder(
             token=token,
-            host=host,
+            host=_live_host,
             port=port,
             device_supplier=lambda: self.hook.connected_device,
             decode_supplier=lambda: self.hook.gesture_decode_context(),
@@ -1100,9 +1111,18 @@ class Engine:
                 self._emit_status("Deskflow device sharing auto-enabled")
 
     def _schedule_decode_publish(self):
-        """Poll until feat_idx is ready and published to the bridge."""
+        """Poll until feat_idx is ready and published to the bridge.
+
+        Until this lands the far machine cannot decode gestures, so the
+        interval is the delay between plugging in / regaining the mouse and
+        gestures actually working. A flat 200ms poll spent most of that time
+        asleep; ramp instead -- near-instant when the device is ready (the
+        normal case) and still patient when the feature index takes a while.
+        """
         def poll():
-            for _ in range(50):
+            delay = 0.02
+            waited = 0.0
+            while waited < 10.0:
                 fwd = self._remote_forwarder
                 if fwd is None:
                     return
@@ -1113,7 +1133,9 @@ class Engine:
                     return
                 if fwd.decode_published:
                     return
-                time.sleep(0.2)
+                time.sleep(delay)
+                waited += delay
+                delay = min(delay * 1.6, 0.2)
 
         threading.Thread(
             target=poll, daemon=True, name="DecodePublishPoll"

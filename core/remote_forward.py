@@ -37,7 +37,10 @@ import threading
 from core.remote_protocol import MAX_LINE_BYTES, PROTOCOL_VERSION
 
 DEFAULT_BRIDGE_PORT = 19796
-_RECONNECT_DELAYS_S = (1.0, 2.0, 5.0)
+# A Deskflow restart is a short outage, and every second of backoff is a
+# second the mouse's gestures are dead. Probe fast first, then ease off so a
+# genuinely absent bridge is not hammered.
+_RECONNECT_DELAYS_S = (0.25, 0.5, 1.0, 2.0)
 
 
 def _device_payload(device) -> dict:
@@ -68,7 +71,12 @@ class RemoteForwarder:
         forwarder publishes decode updates only and never relays events or
         suppresses local handling -- Deskflow owns the raw byte pipe."""
         self._token = str(token or "")
-        self._host = host
+        # A plain string pins the bridge to whichever machine was elected at
+        # construction. Deskflow re-elects on every restart, so a pinned host
+        # dials a machine that is no longer serving and never relinks. Accept
+        # a callable (same pattern as device_supplier) and re-resolve on every
+        # connection attempt.
+        self._host_supplier = host if callable(host) else (lambda h=host: h)
         self._port = int(port)
         self._device_supplier = device_supplier or (lambda: None)
         self._decode_supplier = decode_supplier or (lambda: None)
@@ -212,7 +220,11 @@ class RemoteForwarder:
 
     def _connect_and_hello(self):
         try:
-            sock = socket.create_connection((self._host, self._port), timeout=3)
+            host = self._host_supplier() or ""
+            if not host:
+                return None
+            self._host = host  # for logging/diagnostics only
+            sock = socket.create_connection((host, self._port), timeout=3)
         except OSError:
             return None
         try:
