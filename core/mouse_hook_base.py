@@ -212,6 +212,14 @@ class BaseMouseHook:
         """
         if not self._physical_logitech_bound():
             return False
+        # Never while KVM focus is on another machine. The OS hook is a Python
+        # callback in the delivery path of EVERY mouse event, so keeping it
+        # installed for scroll inversion taxes pointer and wheel latency on a
+        # machine Mouser is not even driving. Off-host, Mouser handles only
+        # decoded gestures relayed over the bridge and nothing else.
+        fwd = self._remote_forwarder
+        if fwd is not None and fwd.should_forward():
+            return False
         if self.invert_vscroll and not self.wheel_native_invert_vertical:
             return True
         return self.invert_hscroll and not self.wheel_native_invert_horizontal
