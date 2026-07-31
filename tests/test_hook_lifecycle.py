@@ -44,7 +44,7 @@ class HookPredicateTests(unittest.TestCase):
         self.hook.set_remote_forwarder(forwarder)
         self.assertFalse(self.hook._hook_should_be_installed())
 
-    def test_remote_focus_stands_down_even_with_invert_enabled(self):
+    def test_remote_focus_keeps_hook_when_invert_enabled(self):
         """Off-host, Mouser touches nothing but relayed gestures.
 
         The OS hook is a Python callback in the delivery path of EVERY
@@ -57,7 +57,7 @@ class HookPredicateTests(unittest.TestCase):
         self.hook.invert_hscroll = True
         forwarder = SimpleNamespace(should_forward=lambda: True)
         self.hook.set_remote_forwarder(forwarder)
-        self.assertFalse(self.hook._hook_should_be_installed())
+        self.assertTrue(self.hook._hook_should_be_installed())
 
     def test_local_focus_still_gets_the_invert_fallback(self):
         """...but on the host the fallback must still work when the
