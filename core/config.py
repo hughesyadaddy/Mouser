@@ -5,7 +5,9 @@ Supports per-application profiles (for future use).
 
 import json
 import os
+import shutil
 import stat
+import time
 import sys
 from urllib.parse import quote
 from core import app_catalog
@@ -255,7 +257,33 @@ def load_config():
             cfg = _validate_types(cfg, DEFAULT_CONFIG)
             return cfg
         except Exception as e:
+            # NEVER let a failed read silently become "defaults", because the
+            # app then saves those defaults over the file and the user's
+            # settings are gone with no trace. Preserve the unreadable file,
+            # try the last known-good copy, and say so loudly.
             print(f"[Config] Error loading config: {e}")
+            try:
+                stamp = time.strftime("%Y%m%d-%H%M%S")
+                salvage = f"{CONFIG_FILE}.unreadable-{stamp}"
+                shutil.copy2(CONFIG_FILE, salvage)
+                print(f"[Config] PRESERVED unreadable config at {salvage}")
+            except Exception as copy_exc:
+                print(f"[Config] could not preserve unreadable config: {copy_exc}")
+            backup = f"{CONFIG_FILE}.bak"
+            if os.path.exists(backup):
+                try:
+                    with open(backup, "r", encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    cfg = _migrate(cfg)
+                    cfg = _merge_defaults(cfg, DEFAULT_CONFIG)
+                    cfg = _validate_types(cfg, DEFAULT_CONFIG)
+                    print(f"[Config] RECOVERED settings from {backup}")
+                    return cfg
+                except Exception as bak_exc:
+                    print(f"[Config] backup unusable ({bak_exc}); falling back to defaults")
+            else:
+                print("[Config] no backup available; falling back to DEFAULTS "
+                      "-- previous settings are in the preserved file above")
     return json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
 
 
@@ -287,6 +315,12 @@ def save_config(cfg):
         if sys.platform != "win32":
             os.chmod(tmp_path, stat.S_IRUSR | stat.S_IWUSR)
         os.replace(tmp_path, CONFIG_FILE)
+        # Roll a known-good copy forward so a later unreadable config can be
+        # recovered instead of silently reverting to defaults.
+        try:
+            shutil.copy2(CONFIG_FILE, f"{CONFIG_FILE}.bak")
+        except Exception:
+            pass
     except BaseException:
         try:
             os.unlink(tmp_path)
