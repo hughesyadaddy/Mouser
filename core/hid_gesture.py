@@ -1058,6 +1058,7 @@ class HidGestureListener:
         # without any WM_DEVICECHANGE, so entries must expire on their own.
         self._reprog_negative_cache = {}
         self._device_arrival = threading.Event()
+        self._last_scan_had_candidates = False
         self._last_arrival_clear = 0.0
 
     # ── Deskflow ingress (Tier 1.5 hidapi shim) ─────────────────────
@@ -2640,6 +2641,10 @@ class HidGestureListener:
 
         print(f"[HidGesture] Backend preference: {_BACKEND_PREFERENCE}")
         print(f"[HidGesture] Candidate HID interfaces: {len(infos)}")
+        # A present-but-unopenable device (the KVM handoff case: the receiver
+        # never unplugs, so no WM_DEVICECHANGE fires) must be retried fast --
+        # the flat 5s wait below is for a genuinely absent device.
+        self._last_scan_had_candidates = bool(infos)
         if cached_candidate:
             print(
                 f"[HidGesture] Cached last-known device: "
@@ -3045,10 +3050,20 @@ class HidGestureListener:
         retry_logged = False
         while self._running:
             if not self._try_connect():
+                # The device is enumerated but could not be opened (owned by
+                # the other machine mid-KVM-handoff, or still settling): poll
+                # back quickly so gestures come alive as soon as it is free.
+                # Nothing enumerated at all means no receiver is attached --
+                # that deserves the patient interval.
+                present = getattr(self, "_last_scan_had_candidates", False)
                 if not retry_logged:
-                    print("[HidGesture] No compatible device; retrying in 5 s…")
+                    print(
+                        "[HidGesture] device present but not connectable; retrying fast…"
+                        if present
+                        else "[HidGesture] No compatible device; retrying in 5 s…"
+                    )
                     retry_logged = True
-                self._wait_reconnect(5.0)
+                self._wait_reconnect(0.25 if present else 5.0)
                 continue
             retry_logged = False
             self._reconnect_requested = False
