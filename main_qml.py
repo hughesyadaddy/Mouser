@@ -990,7 +990,31 @@ def _schedule_tray_minimized_notice(tray, locale_mgr) -> None:
     QTimer.singleShot(400, _tray_minimized_notice)
 
 
+def _raise_process_priority():
+    """Run above normal on Windows.
+
+    Mouser's LL hook sits in the delivery path of every system mouse event,
+    so when this process waits to be scheduled the whole desktop's input
+    waits with it. ABOVE_NORMAL needs no special rights and simply stops a
+    busy background app (screen capture, indexing) from delaying input.
+    Built in rather than applied by an external script so it survives
+    restarts and updates.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
+        handle = ctypes.windll.kernel32.GetCurrentProcess()
+        if not ctypes.windll.kernel32.SetPriorityClass(handle, ABOVE_NORMAL_PRIORITY_CLASS):
+            print("[Mouser] could not raise process priority")
+    except Exception as exc:  # noqa: BLE001 - never block startup on this
+        print(f"[Mouser] priority raise failed: {exc}")
+
+
 def main():
+    _raise_process_priority()
     # Re-exec through a `Mouser`-named symlink BEFORE anything Qt or
     # AppKit related runs. Necessary because macOS reads the Dock label /
     # Cmd+Tab caption from the executable basename at process creation;
