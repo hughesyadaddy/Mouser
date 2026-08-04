@@ -39,6 +39,7 @@ WM_MBUTTONUP = 0x0208
 WM_MOUSEMOVE = 0x0200
 WM_MOUSEHWHEEL = 0x020E
 WM_MOUSEWHEEL = 0x020A
+LLMHF_INJECTED = 0x00000001
 RI_MOUSE_WHEEL = 0x0400
 RI_MOUSE_HWHEEL = 0x0800
 
@@ -311,7 +312,21 @@ class MouseHook(BaseMouseHook):
             # moves at high frequency. Pass moves through before any work.
             if wParam == WM_MOUSEMOVE:
                 return CallNextHookEx(self._hook, nCode, wParam, lParam)
+            # Wheel events are the other high-frequency stream, and a fast
+            # scroll delivers them in a burst. Every one of them serializes
+            # through this Python callback, so when there is no scroll work
+            # to do the burst stalls all system mouse input behind the GIL --
+            # reported as "scrolling quickly freezes the whole system".
+            # Bail before touching lParam.contents.
+            if wParam in (WM_MOUSEWHEEL, WM_MOUSEHWHEEL) and not self._scroll_invert_fallback_enabled():
+                return CallNextHookEx(self._hook, nCode, wParam, lParam)
             data = lParam.contents
+            # Injected events are Deskflow relaying the far machine's mouse.
+            # Mouser already handled that device on the machine it is attached
+            # to; re-processing the relayed copy here is pure cost, and on a
+            # KVM client it is the bulk of the event stream.
+            if (data.flags & LLMHF_INJECTED) != 0:
+                return CallNextHookEx(self._hook, nCode, wParam, lParam)
             mouse_data = data.mouseData
             flags = data.flags
             event = None
