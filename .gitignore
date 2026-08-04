@@ -42,3 +42,10 @@ tools/probe_frozen_qml.py
 
 # Shortcuts (user-specific paths)
 *.lnk
+
+# Native hook filter build output (native/win/build.py). Built per machine
+# from mouser_hook.c; never committed, and optional at runtime.
+native/win/*.dll
+native/win/*.obj
+native/win/*.lib
+native/win/*.exp

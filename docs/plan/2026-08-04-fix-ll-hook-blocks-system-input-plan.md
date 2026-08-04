@@ -46,7 +46,14 @@ Rules for whoever builds this:
 
 ## Approach
 
-### Phase 1 — do not install the hook when there is nothing to swallow (recommended first)
+### Phase 1 — do not install the hook when there is nothing to swallow
+
+**Status: skipped, under rule 3 above.** `should_forward()` proves only that
+the host reached the bridge, not that the bridge delivered to the focused
+client — which is exactly the gap that killed gestures in `ec7fc04`. The
+bridge config lives in Deskflow's `deskflow.conf` on each Windows machine and
+could not be proven from the build host, so Phase 2 was built instead. Phase 1
+remains available if the bridge is ever verified end-to-end.
 
 The hook exists for exactly one job: *swallowing* remapped buttons. Detection
 (gestures, buttons) already runs off the Raw Input path, which cannot block
@@ -68,13 +75,31 @@ not exist.
 
 ### Phase 2 — native hook filter (the complete fix)
 
+**Status: built.** Awaiting the on-machine soak in Success criteria below.
+
 Even when installed, the callback must not enter Python for events Mouser
 does not act on.
 
-- [ ] Move the hook procedure into a small native extension that decides
+- [x] Move the hook procedure into a small native extension that decides
       natively from a shared, lock-free table (which buttons are remapped)
       and calls into Python **only** for events that are actually remapped.
-- [ ] Keep the existing early-outs as defence in depth.
+      → `native/win/mouser_hook.c`. The hook runs on a thread inside the DLL,
+      so it shares none with Python and cannot be delayed by the GIL at all.
+      Decisions come from three words Python pushes down (flags, interest
+      mask, block mask); acted-on events go into a lock-free SPSC ring that a
+      Python drain thread empties with the GIL released.
+- [x] Keep the existing early-outs as defence in depth.
+      → move / injected / no-wheel-work bail first in the native procedure
+      too, before it reads anything.
+
+Gestures cannot regress here by construction: the hook stays installed, and
+if the DLL is missing, stale, or fails to hook, `core/native_hook_win.py`
+returns None and the existing Python procedure runs unchanged.
+
+One behaviour deliberately differs from the Python procedure: a horizontal-
+scroll remap fires again with the native filter. `47578a4` had to bail on all
+wheel messages when invert was off, which silently disabled those remaps; the
+native side can consult the interest mask for free.
 
 Phase 2 is the durable answer; Phase 1 removes the pain immediately and is
 already mostly written.

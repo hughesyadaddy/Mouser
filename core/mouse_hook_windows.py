@@ -28,6 +28,8 @@ from core.key_simulator import MOUSEEVENTF_HWHEEL, MOUSEEVENTF_WHEEL
 from core.key_simulator import inject_scroll as _inject_scroll_impl
 from core.mouse_hook_base import BaseMouseHook, HidGestureListener
 from core.mouse_hook_types import LOGITECH_SCROLL_RECENT_S, MouseEvent
+from core.native_hook_filter import compute_filter, describe_filter
+from core.native_hook_win import NativeHookEvent, NativeHookFilter
 
 _LOGITECH_VID_RE = re.compile(r"vid_046d\b", re.IGNORECASE)
 
@@ -225,6 +227,11 @@ WM_TIMER = 0x0113
 SYNC_RETRY_TIMER_ID = 0x4D53  # 'MS'; retries a hook uninstall deferred mid-gesture
 SYNC_RETRY_INTERVAL_MS = 200
 
+# How long the drain thread parks in the DLL waiting for a queued event. It
+# waits with the GIL released, so this only bounds how quickly the thread
+# notices ``_running`` went False and re-pushes the filter.
+NATIVE_DRAIN_TIMEOUT_MS = 50
+
 WM_DEVICECHANGE = 0x0219
 DBT_DEVNODES_CHANGED = 0x0007
 
@@ -273,6 +280,15 @@ class MouseHook(BaseMouseHook):
         self._generic_ri_registered = False
         self._init_dispatch_queue(maxsize=512)
         self._dispatch_worker_thread = None
+        # Native WH_MOUSE_LL procedure (native/win/mouser_hook.c). When it
+        # loads, the hook lives on a thread inside the DLL and no system mouse
+        # event ever waits on the GIL. When it does not, everything below
+        # falls back to _low_level_handler and behaves exactly as before.
+        self._native = None
+        self._native_installed = False
+        self._native_drain_thread = None
+        self._native_filter_state = None
+        self._native_filter_lock = threading.Lock()
 
     _WM_NAMES = {
         0x0200: "WM_MOUSEMOVE",
@@ -318,6 +334,11 @@ class MouseHook(BaseMouseHook):
             # to do the burst stalls all system mouse input behind the GIL --
             # reported as "scrolling quickly freezes the whole system".
             # Bail before touching lParam.contents.
+            #
+            # The cost is that a horizontal-scroll remap does not fire while
+            # invert is off. The native procedure consults the interest mask
+            # here instead and so keeps that remap working; this path cannot,
+            # because consulting anything at all means taking the GIL first.
             if wParam in (WM_MOUSEWHEEL, WM_MOUSEHWHEEL) and not self._scroll_invert_fallback_enabled():
                 return CallNextHookEx(self._hook, nCode, wParam, lParam)
             data = lParam.contents
@@ -459,6 +480,73 @@ class MouseHook(BaseMouseHook):
 
         return CallNextHookEx(self._hook, nCode, wParam, lParam)
 
+    # ── native filter ─────────────────────────────────────────────
+
+    def _push_native_filter(self):
+        """Converge the native procedure's view of what Mouser wants.
+
+        Called from the hook thread on every state sync and from the drain
+        thread on every tick: ``invert_vscroll``, ``debug_mode`` and friends
+        are plain attribute writes with no hook to hang a push on, so the
+        tick is what guarantees they land. Unchanged state costs one
+        comparison.
+        """
+        native = self._native
+        if native is None:
+            return
+        state = compute_filter(self)
+        with self._native_filter_lock:
+            if state == self._native_filter_state:
+                return
+            self._native_filter_state = state
+        native.set_filter(*state)
+        self._emit_debug(f"Native filter {describe_filter(*state)}")
+
+    def _native_drain_worker(self):
+        """Collect events the native procedure queued.
+
+        ctypes releases the GIL for the wait inside the DLL, so this thread
+        holds nothing the hook procedure could ever need.
+        """
+        event = NativeHookEvent()
+        native = self._native
+        while self._running:
+            try:
+                got = native.next_event(event, NATIVE_DRAIN_TIMEOUT_MS)
+            except Exception as exc:  # noqa: BLE001 - native boundary
+                print(f"[MouseHook] native drain error: {exc}")
+                return
+            self._push_native_filter()
+            if got:
+                self._handle_native_event(event)
+
+    def _handle_native_event(self, event):
+        if self.debug_mode and self._debug_callback:
+            wm_name = self._WM_NAMES.get(event.message, f"0x{event.message:04X}")
+            info = (
+                f"{wm_name}  mouseData=0x{event.mouse_data:08X}  "
+                f"hiword={hiword(event.mouse_data)}  flags=0x{event.flags:04X}  "
+                f"extraInfo=0x{event.extra_info:X}"
+            )
+            try:
+                self._debug_callback(info)
+            except Exception:
+                pass
+        event_type = event.event_type
+        if event_type is None:
+            # Debug-only mirror: the procedure queued it purely so the log
+            # above stays complete.
+            return
+        # ``event.blocked`` is reported, not decided, here -- the native
+        # procedure already swallowed it and owns the down/up pairing that
+        # keeps a hook (un)installed mid-hold from stranding a button.
+        if event_type in (MouseEvent.HSCROLL_LEFT, MouseEvent.HSCROLL_RIGHT):
+            self._enqueue_dispatch_event(
+                MouseEvent(event_type, abs(hiword(event.mouse_data)))
+            )
+            return
+        self._enqueue_dispatch_event(MouseEvent(event_type))
+
     def _get_device_name(self, hDevice):
         if hDevice in self._device_name_cache:
             return self._device_name_cache[hDevice]
@@ -532,17 +620,25 @@ class MouseHook(BaseMouseHook):
             return 0
 
         if msg == WM_APP_INJECT_VSCROLL:
-            delta = self._pending_vscroll
-            self._pending_vscroll = 0
-            self._vscroll_posted = False
+            native = self._native
+            if native is not None:
+                delta = native.take_pending_vscroll()
+            else:
+                delta = self._pending_vscroll
+                self._pending_vscroll = 0
+                self._vscroll_posted = False
             if delta != 0:
                 _inject_scroll_impl(MOUSEEVENTF_WHEEL, delta)
             return 0
 
         if msg == WM_APP_INJECT_HSCROLL:
-            delta = self._pending_hscroll
-            self._pending_hscroll = 0
-            self._hscroll_posted = False
+            native = self._native
+            if native is not None:
+                delta = native.take_pending_hscroll()
+            else:
+                delta = self._pending_hscroll
+                self._pending_hscroll = 0
+                self._hscroll_posted = False
             if delta != 0:
                 _inject_scroll_impl(MOUSEEVENTF_HWHEEL, delta)
             return 0
@@ -585,6 +681,11 @@ class MouseHook(BaseMouseHook):
             mouse = RAWMOUSE.from_buffer_copy(buffer, sizeof(RAWINPUTHEADER))
             if mouse.usButtonFlags & (RI_MOUSE_WHEEL | RI_MOUSE_HWHEEL):
                 self._last_logitech_wheel_monotonic = time.monotonic()
+                # The native procedure runs on its own thread and so cannot
+                # read this one's raw-input queue; this mark is its whole
+                # basis for attributing a wheel message to the Logitech.
+                if self._native is not None:
+                    self._native.mark_logitech_wheel()
             self._check_raw_mouse_gesture(header.hDevice, buffer)
 
     def _check_raw_mouse_gesture(self, hDevice, buffer):
@@ -741,6 +842,7 @@ class MouseHook(BaseMouseHook):
             print("[MouseHook] Raw Input window unavailable -- hook thread aborting")
             return
         self._running = True
+        self._load_native_filter()
         # Initial hook state is applied here, after the window exists, so a
         # sync_hook_state() racing startup can never be lost: any posted
         # WM_APP_SYNC_HOOK re-runs the same evaluation.
@@ -756,14 +858,30 @@ class MouseHook(BaseMouseHook):
             TranslateMessage(ctypes.byref(message))
             DispatchMessageW(ctypes.byref(message))
 
+        self._uninstall_ll_hook()
         if self._ri_hwnd:
             DestroyWindow(self._ri_hwnd)
             self._ri_hwnd = None
-        if self._hook:
-            UnhookWindowsHookEx(self._hook)
-            self._hook = None
+        if self._native is not None:
+            self._native.set_inject_target(0, 0, 0)
         self._running = False
         print("[MouseHook] Hook removed")
+
+    def _load_native_filter(self):
+        """Hook thread only: adopt the native procedure when it is available.
+
+        Runs after the Raw Input window exists so the injection target can be
+        handed over in the same step. A missing or mismatched DLL is not an
+        error -- it means the Python procedure stays in charge.
+        """
+        native = NativeHookFilter.load()
+        if native is None:
+            return
+        native.set_inject_target(
+            self._ri_hwnd, WM_APP_INJECT_VSCROLL, WM_APP_INJECT_HSCROLL
+        )
+        self._native = native
+        print(f"[MouseHook] Native hook filter loaded: {native.path}")
 
     def sync_hook_state(self):
         """Thread-safe: ask the hook thread to re-evaluate hook existence."""
@@ -772,13 +890,24 @@ class MouseHook(BaseMouseHook):
             PostMessageW(hwnd, WM_APP_SYNC_HOOK, 0, 0)
         # else: _run_hook applies the initial state after window creation.
 
+    def _hook_is_installed(self) -> bool:
+        """True while a procedure -- native or Python -- is in the input path."""
+        if self._native is not None:
+            return self._native_installed
+        return self._hook is not None
+
     def _apply_hook_state(self):
         """Hook thread only: converge installed state to the predicate."""
         want = self._hook_should_be_installed()
-        if want and self._hook is None:
+        # Push first: the procedure must know what to swallow before the
+        # first event reaches it, and while installed this is how every
+        # focus/device/binding change reaches the native side.
+        self._push_native_filter()
+        installed = self._hook_is_installed()
+        if want and not installed:
             self._install_ll_hook()
             self._set_generic_mouse_ri(True)
-        elif not want and self._hook is not None:
+        elif not want and installed:
             with self._gesture_lock:
                 gesture_active = self._gesture_active
             if gesture_active:
@@ -792,6 +921,20 @@ class MouseHook(BaseMouseHook):
             self._set_generic_mouse_ri(False)
 
     def _install_ll_hook(self):
+        native = self._native
+        if native is not None:
+            if self._native_installed:
+                return
+            if native.install():
+                self._native_installed = True
+                print("[MouseHook] Hook installed (native filter)")
+                return
+            # The DLL loaded but could not hook. Drop it rather than run with
+            # no hook at all: a slow procedure still remaps and gestures.
+            print("[MouseHook] Native hook install failed -- using Python hook")
+            self._native = None
+            self._native_filter_state = None
+
         if self._hook:
             return
         self._hook_proc = HOOKPROC(self._low_level_handler)
@@ -802,11 +945,19 @@ class MouseHook(BaseMouseHook):
             0,
         )
         if self._hook:
-            print("[MouseHook] Hook installed successfully")
+            print("[MouseHook] Hook installed (python)")
         else:
             print("[MouseHook] Failed to install hook!")
 
     def _uninstall_ll_hook(self):
+        native = self._native
+        if native is not None and self._native_installed:
+            if not native.uninstall():
+                print("[MouseHook] Native hook uninstall timed out -- still installed")
+                return
+            self._native_installed = False
+            print("[MouseHook] Hook idle -- removed from input path")
+            return
         if not self._hook:
             return
         UnhookWindowsHookEx(self._hook)
@@ -837,9 +988,8 @@ class MouseHook(BaseMouseHook):
         old unconditional reinstall kept resurrecting a pointless hook on
         every devnode storm from the HID probe.
         """
-        if self._hook is not None and self._hook_should_be_installed():
-            UnhookWindowsHookEx(self._hook)
-            self._hook = None
+        if self._hook_is_installed() and self._hook_should_be_installed():
+            self._uninstall_ll_hook()
             self._install_ll_hook()
         else:
             self._apply_hook_state()
@@ -913,12 +1063,24 @@ class MouseHook(BaseMouseHook):
             name="HookDispatch",
         )
         self._dispatch_worker_thread.start()
+        if self._native is not None:
+            self._native_drain_thread = threading.Thread(
+                target=self._native_drain_worker,
+                daemon=True,
+                name="NativeHookDrain",
+            )
+            self._native_drain_thread.start()
         return True
 
     def stop(self):
         self._running = False
         self._stop_hid_listener()
         self._connected_device = None
+        if self._native_drain_thread:
+            self._native_drain_thread.join(
+                timeout=(NATIVE_DRAIN_TIMEOUT_MS / 1000.0) + 1
+            )
+            self._native_drain_thread = None
         if self._dispatch_worker_thread:
             self._dispatch_worker_thread.join(timeout=1)
             self._dispatch_worker_thread = None
@@ -931,6 +1093,11 @@ class MouseHook(BaseMouseHook):
         self._thread_id = None
         self._startup_ok = False
         self._startup_event.clear()
+        # _run_hook already uninstalled; drop the handle so a restart reloads
+        # the DLL against the fresh Raw Input window.
+        self._native = None
+        self._native_installed = False
+        self._native_filter_state = None
 
 
 MouseHook._platform_module = sys.modules[__name__]

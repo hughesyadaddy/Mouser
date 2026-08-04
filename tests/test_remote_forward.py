@@ -461,11 +461,13 @@ class WindowsScrollAttributionTests(unittest.TestCase):
         )
 
         def _fill_buffer(out, size_ref, hdr_size):
+            # The hook passes byref(size), which is a CArgObject -- the c_uint
+            # it wraps is reachable as _obj, not .contents.
             if out is None:
-                size_ref.contents = c_uint(total)
+                size_ref._obj.value = total
                 return 0
             ctypes.memmove(out, buf, total)
-            size_ref.contents = c_uint(total)
+            size_ref._obj.value = total
             return 1
 
         hook = mhw.MouseHook()

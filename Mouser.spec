@@ -79,10 +79,27 @@ def _write_build_info(version: str) -> str:
 APP_VERSION = _load_app_version()
 BUILD_INFO_DATA = _write_build_info(APP_VERSION)
 
+
+def _native_hook_binaries():
+    """Bundle the native WH_MOUSE_LL procedure when it has been built.
+
+    Optional by design: without it the Windows hook falls back to its Python
+    procedure and works as before, so a missing DLL must not fail the build.
+    Build it with  python native/win/build.py  (build.bat does this for you).
+    """
+    dll = os.path.join(ROOT, "native", "win", "mouser_hook_x64.dll")
+    if sys.platform != "win32" or not os.path.isfile(dll):
+        if sys.platform == "win32":
+            print("[Mouser] native/win/mouser_hook_x64.dll not built -- "
+                  "the app will use the slower Python hook procedure")
+        return []
+    print(f"[Mouser] bundling native hook filter: {dll}")
+    return [(dll, ".")]
+
 a = Analysis(
     ["main_qml.py"],
     pathex=[ROOT],
-    binaries=[],
+    binaries=_native_hook_binaries(),
     datas=[
         # QML UI files
         (os.path.join(ROOT, "ui", "qml"), os.path.join("ui", "qml")),

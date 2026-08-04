@@ -60,6 +60,16 @@ if /i "%~1"=="--clean" (
     )
 )
 
+:: ── 3b. Build the native hook filter ─────────────────────────
+:: Optional: without it Mouser falls back to the Python WH_MOUSE_LL
+:: procedure, which works but taxes every system mouse event with the GIL.
+echo [*] Building native hook filter...
+python native\win\build.py
+if %errorlevel% neq 0 (
+    echo [!] Native hook filter did not build — continuing with the Python
+    echo     hook procedure. See native\win\README.md to fix this.
+)
+
 :: ── 4. Run PyInstaller ───────────────────────────────────────
 echo [*] Building with PyInstaller...
 pyinstaller Mouser.spec --noconfirm
