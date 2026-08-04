@@ -174,5 +174,108 @@ class DeskflowListenerIngressTests(unittest.TestCase):
         self.assertTrue(hook._apply_vscroll_invert_fallback(linux_evdev=True))
 
 
+class _NeverReadyEvent:
+    """A ready event no listener thread will ever set -- returns the timeout
+    verdict immediately so the test does not sit through the real 5s wait."""
+
+    def set(self):
+        pass
+
+    def wait(self, timeout=None):
+        del timeout
+        return False
+
+
+def _instant_timeout():
+    return patch("core.hid_gesture.threading.Event", _NeverReadyEvent)
+
+
+class DeskflowAttachIdempotencyTests(unittest.TestCase):
+    """Deskflow re-announces the device on a cadence.
+
+    Every announcement used to force a reconnect, so the client's ingress
+    session died every 3-6 seconds -- never long enough to hold a gesture
+    across, which is how a swipe lost its motion mid-stroke.
+    """
+
+    def setUp(self):
+        self.listener = HidGestureListener()
+        # Stand in for a live read-only ingress session.
+        self.listener._deskflow_readonly = True
+        self.listener._connected = True
+
+    def _attach(self, decode=None, product_id=0xB042, product_name="MX Master 4"):
+        return self.listener.request_deskflow_attach(
+            decode if decode is not None else dict(DECODE),
+            product_id=product_id,
+            product_name=product_name,
+        )
+
+    def test_repeat_of_a_live_attach_does_not_force_a_reconnect(self):
+        self.listener._deskflow_attach = {
+            "decode": dict(DECODE),
+            "product_id": 0xB042,
+            "product_name": "MX Master 4",
+        }
+
+        self.assertTrue(self._attach())
+
+        self.assertFalse(self.listener._reconnect_requested)
+
+    def test_a_changed_decode_still_reconnects(self):
+        self.listener._deskflow_attach = {
+            "decode": dict(DECODE),
+            "product_id": 0xB042,
+            "product_name": "MX Master 4",
+        }
+        moved = dict(DECODE)
+        moved["feat_idx"] = 0x0D
+
+        self._attach(decode=moved)
+
+        self.assertTrue(self.listener._reconnect_requested)
+
+    def test_a_changed_device_still_reconnects(self):
+        self.listener._deskflow_attach = {
+            "decode": dict(DECODE),
+            "product_id": 0xB042,
+            "product_name": "MX Master 4",
+        }
+
+        self._attach(product_id=0xB034, product_name="MX Master 3S")
+
+        self.assertTrue(self.listener._reconnect_requested)
+
+    def test_a_repeat_while_the_previous_attach_is_still_pending_falls_through(self):
+        """Short-circuiting here would report success for an attach that never
+        happened -- the ingress is not live yet."""
+        self.listener._deskflow_readonly = False
+        self.listener._deskflow_attach = {
+            "decode": dict(DECODE),
+            "product_id": 0xB042,
+            "product_name": "MX Master 4",
+        }
+
+        # No listener thread is running, so the ready event never fires.
+        with _instant_timeout():
+            self.assertFalse(
+                self.listener.request_deskflow_attach(
+                    dict(DECODE), product_id=0xB042, product_name="MX Master 4"
+                )
+            )
+        self.assertTrue(self.listener._reconnect_requested)
+
+    def test_first_attach_is_never_short_circuited(self):
+        self.assertIsNone(self.listener._deskflow_attach)
+
+        with _instant_timeout():
+            self.assertFalse(self._attach())
+
+        self.assertTrue(self.listener._reconnect_requested)
+
+    def test_a_non_dict_decode_is_refused(self):
+        self.assertFalse(self.listener.request_deskflow_attach(None))
+
+
 if __name__ == "__main__":
     unittest.main()

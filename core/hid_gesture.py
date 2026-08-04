@@ -1070,16 +1070,34 @@ class HidGestureListener:
             ready.set()
 
     def request_deskflow_attach(self, decode, product_id=None, product_name=None):
-        """Queue a read-only Deskflow sink connection (no USB probe)."""
+        """Queue a read-only Deskflow sink connection (no USB probe).
+
+        Idempotent while the ingress is already live on the same device:
+        Deskflow re-announces the device on a cadence, and every announcement
+        used to set ``_reconnect_requested`` and tear the session down. The
+        client reconnected every 3-6 seconds -- never long enough to hold a
+        gesture across, so a swipe lost its motion mid-stroke.
+
+        A repeat only short-circuits when the session is actually up
+        (``_deskflow_readonly`` and connected). An identical request that
+        arrives while the previous one is still pending must fall through, or
+        it would report success for an attach that never happened.
+        """
         if not isinstance(decode, dict):
             return False
+        request = {
+            "decode": dict(decode),
+            "product_id": product_id,
+            "product_name": product_name,
+        }
         ready = threading.Event()
         with self._deskflow_control_lock:
-            self._deskflow_attach = {
-                "decode": dict(decode),
-                "product_id": product_id,
-                "product_name": product_name,
-            }
+            # Compare against the PREVIOUS request, before overwriting it --
+            # comparing after the assignment would always be equal.
+            unchanged = self._deskflow_attach == request
+            if unchanged and self._deskflow_readonly and self._connected:
+                return True
+            self._deskflow_attach = request
             self._deskflow_attach_ready = ready
         if self._connected:
             self._reconnect_requested = True
