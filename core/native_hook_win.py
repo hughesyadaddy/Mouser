@@ -73,7 +73,12 @@ def _resolve_dll_path():
 
 
 class NativeHookFilter:
-    """Thin, typed wrapper over the DLL's exports."""
+    """Thin, typed wrapper over the DLL's exports.
+
+    The DLL's state -- the hook, its thread, the filter, the event ring -- is
+    process-global, so this wraps a singleton however many instances exist.
+    Mouser runs one MouseHook per process, which is what makes that fine.
+    """
 
     def __init__(self, lib, path):
         self._lib = lib
@@ -131,8 +136,6 @@ class NativeHookFilter:
         lib.mouser_hook_install.argtypes = []
         lib.mouser_hook_uninstall.restype = ctypes.c_int
         lib.mouser_hook_uninstall.argtypes = []
-        lib.mouser_hook_installed.restype = ctypes.c_int
-        lib.mouser_hook_installed.argtypes = []
         lib.mouser_hook_set_filter.restype = None
         lib.mouser_hook_set_filter.argtypes = [
             ctypes.c_uint32,
@@ -167,10 +170,6 @@ class NativeHookFilter:
 
     def uninstall(self) -> bool:
         return bool(self._lib.mouser_hook_uninstall())
-
-    @property
-    def installed(self) -> bool:
-        return bool(self._lib.mouser_hook_installed())
 
     # ── configuration ─────────────────────────────────────────────
 

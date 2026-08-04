@@ -28,7 +28,11 @@ from core.key_simulator import MOUSEEVENTF_HWHEEL, MOUSEEVENTF_WHEEL
 from core.key_simulator import inject_scroll as _inject_scroll_impl
 from core.mouse_hook_base import BaseMouseHook, HidGestureListener
 from core.mouse_hook_types import LOGITECH_SCROLL_RECENT_S, MouseEvent
-from core.native_hook_filter import compute_filter, describe_filter
+from core.native_hook_filter import (
+    HOOK_THREAD_JOIN_S,
+    compute_filter,
+    describe_filter,
+)
 from core.native_hook_win import NativeHookEvent, NativeHookFilter
 
 _LOGITECH_VID_RE = re.compile(r"vid_046d\b", re.IGNORECASE)
@@ -495,11 +499,21 @@ class MouseHook(BaseMouseHook):
         if native is None:
             return
         state = compute_filter(self)
+        # The DLL write stays inside the lock. Comparing and writing as two
+        # steps lets the hook thread and the drain thread interleave, and the
+        # loser's stale filter would land last while the cache claims the
+        # newer one won -- stranding the procedure on it until the next
+        # change. set_filter is a couple of interlocked stores; holding the
+        # lock across it costs nothing and the hook never waits on it.
         with self._native_filter_lock:
             if state == self._native_filter_state:
                 return
+            try:
+                native.set_filter(*state)
+            except Exception as exc:  # noqa: BLE001 - native boundary
+                print(f"[MouseHook] native set_filter failed: {exc}")
+                return
             self._native_filter_state = state
-        native.set_filter(*state)
         self._emit_debug(f"Native filter {describe_filter(*state)}")
 
     def _native_drain_worker(self):
@@ -510,15 +524,28 @@ class MouseHook(BaseMouseHook):
         """
         event = NativeHookEvent()
         native = self._native
+        dropped_seen = 0
         while self._running:
             try:
                 got = native.next_event(event, NATIVE_DRAIN_TIMEOUT_MS)
+                # Converge here rather than only on sync_hook_state: invert
+                # toggles and debug_mode are plain attribute writes with no
+                # hook to hang a push on. Inside the try because a failure
+                # here must degrade, not end the thread -- a dead drain
+                # thread is every remap silently gone.
+                self._push_native_filter()
+                if got:
+                    self._handle_native_event(event)
+                dropped = native.dropped
             except Exception as exc:  # noqa: BLE001 - native boundary
                 print(f"[MouseHook] native drain error: {exc}")
                 return
-            self._push_native_filter()
-            if got:
-                self._handle_native_event(event)
+            if dropped > dropped_seen:
+                print(
+                    f"[MouseHook] native ring dropped {dropped - dropped_seen} "
+                    "event(s) -- drain thread fell behind"
+                )
+                dropped_seen = dropped
 
     def _handle_native_event(self, event):
         if self.debug_mode and self._debug_callback:
@@ -526,7 +553,8 @@ class MouseHook(BaseMouseHook):
             info = (
                 f"{wm_name}  mouseData=0x{event.mouse_data:08X}  "
                 f"hiword={hiword(event.mouse_data)}  flags=0x{event.flags:04X}  "
-                f"extraInfo=0x{event.extra_info:X}"
+                f"extraInfo=0x{event.extra_info:X}  "
+                f"blocked={'yes' if event.blocked else 'no'}"
             )
             try:
                 self._debug_callback(info)
@@ -537,7 +565,7 @@ class MouseHook(BaseMouseHook):
             # Debug-only mirror: the procedure queued it purely so the log
             # above stays complete.
             return
-        # ``event.blocked`` is reported, not decided, here -- the native
+        # ``event.blocked`` above is reported, not decided, here -- the native
         # procedure already swallowed it and owns the down/up pairing that
         # keeps a hook (un)installed mid-hold from stranding a button.
         if event_type in (MouseEvent.HSCROLL_LEFT, MouseEvent.HSCROLL_RIGHT):
@@ -1073,9 +1101,16 @@ class MouseHook(BaseMouseHook):
         return True
 
     def stop(self):
-        self._running = False
         self._stop_hid_listener()
         self._connected_device = None
+        # Stop the producer before the consumers: WM_QUIT is what makes
+        # _run_hook uninstall the hook, and anything the procedure queues
+        # after the drain thread has gone is lost.
+        if self._thread_id:
+            PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
+        if self._hook_thread:
+            self._hook_thread.join(timeout=HOOK_THREAD_JOIN_S)
+        self._running = False
         if self._native_drain_thread:
             self._native_drain_thread.join(
                 timeout=(NATIVE_DRAIN_TIMEOUT_MS / 1000.0) + 1
@@ -1084,10 +1119,6 @@ class MouseHook(BaseMouseHook):
         if self._dispatch_worker_thread:
             self._dispatch_worker_thread.join(timeout=1)
             self._dispatch_worker_thread = None
-        if self._thread_id:
-            PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
-        if self._hook_thread:
-            self._hook_thread.join(timeout=2)
         self._hook = None
         self._ri_hwnd = None
         self._thread_id = None

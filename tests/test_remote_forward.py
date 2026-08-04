@@ -14,6 +14,7 @@ from core.mouse_hook_types import (
     DEVICE_SOURCE_REMOTE_VIRTUAL,
 )
 from core.remote_forward import RemoteForwarder
+from tests.support.windows_hook_import import import_windows_hook
 
 TOKEN = "bridge-token"
 
@@ -402,13 +403,18 @@ class HookForwardingGateTests(unittest.TestCase):
 
 
 class WindowsScrollAttributionTests(unittest.TestCase):
-    """Windows per-event scroll attribution via GetRawInputBuffer."""
+    """Windows per-event scroll attribution via GetRawInputBuffer.
+
+    Imports the Windows hook itself rather than hoping another test module
+    already did -- see tests/support/windows_hook_import.py.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mhw = import_windows_hook()
 
     def test_returns_false_when_raw_buffer_empty(self):
-        try:
-            from core import mouse_hook_windows as mhw
-        except ImportError:
-            self.skipTest("Windows hook unavailable")
+        mhw = self.mhw
         hook = mhw.MouseHook()
         with patch.object(mhw, "GetRawInputBuffer", return_value=0):
             self.assertFalse(
@@ -418,12 +424,9 @@ class WindowsScrollAttributionTests(unittest.TestCase):
             )
 
     def test_returns_true_for_logitech_wheel_packet(self):
-        try:
-            from core import mouse_hook_windows as mhw
-            import ctypes
-            from ctypes import c_uint
-        except ImportError:
-            self.skipTest("Windows hook unavailable")
+        import ctypes
+
+        mhw = self.mhw
         header_size = ctypes.sizeof(mhw.RAWINPUTHEADER)
         mouse_size = ctypes.sizeof(mhw.RAWMOUSE)
         total = header_size + mouse_size
@@ -482,10 +485,7 @@ class WindowsScrollAttributionTests(unittest.TestCase):
             )
 
     def test_falls_back_to_recent_wm_input_wheel_mark(self):
-        try:
-            from core import mouse_hook_windows as mhw
-        except ImportError:
-            self.skipTest("Windows hook unavailable")
+        mhw = self.mhw
         hook = mhw.MouseHook()
         hook._last_logitech_wheel_monotonic = time.monotonic()
         with patch.object(mhw, "GetRawInputBuffer", return_value=0):
@@ -496,10 +496,7 @@ class WindowsScrollAttributionTests(unittest.TestCase):
             )
 
     def test_vid_match_requires_vid_token_not_bare_substring(self):
-        try:
-            from core import mouse_hook_windows as mhw
-        except ImportError:
-            self.skipTest("Windows hook unavailable")
+        mhw = self.mhw
         hook = mhw.MouseHook()
         hook._device_name_cache[1] = r"\\?\HID#VID_DEAD&PID_BEEF"
         hook._device_name_cache[2] = r"\\?\HID#VID_046D&PID_C52B"

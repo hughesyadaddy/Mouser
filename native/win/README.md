@@ -36,6 +36,28 @@ gestures, and scroll inversion all keep working, just with the input latency
 this DLL exists to remove. Mouser logs which procedure it installed at
 startup (`[MouseHook] Hook installed (native filter)` or `(python)`).
 
+## Verifying it on Windows
+
+The suite cross-compiles this source and asserts its constants match
+`core/native_hook_filter.py`, but it cannot *run* the procedure — that needs
+Windows. Work through this by hand after a change to `mouser_hook.c`:
+
+1. `python native/win/build.py`, then start Mouser and confirm the log says
+   `Hook installed (native filter)`, not `(python)`.
+2. Press each remapped button. Every mapped action must fire, and the original
+   button must not leak through to the focused app.
+3. Perform a side-swipe gesture on the host. Confirm the mapped action fires.
+4. With scroll invert on, scroll both axes and confirm the direction flips —
+   and that a fast scroll no longer stalls the cursor.
+5. Switch KVM focus to another machine, then back. Gestures and remaps must
+   still work on the machine holding the mouse.
+6. Under load (WinStream running), check Deskflow's probe:
+   `Select-String 'worst SendInput' C:\ProgramData\Deskflow\deskflow-daemon.log | Select -Last 8`
+   — every sample should be well under 5000us.
+
+Rename or delete the DLL and repeat steps 2–5 to confirm the Python fallback
+still carries them.
+
 ## Keeping the two sides in step
 
 The struct layout, event codes, and filter flags are duplicated in

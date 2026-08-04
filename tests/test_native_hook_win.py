@@ -29,7 +29,6 @@ EXPORTS = (
     "mouser_hook_event_size",
     "mouser_hook_install",
     "mouser_hook_uninstall",
-    "mouser_hook_installed",
     "mouser_hook_set_filter",
     "mouser_hook_set_inject_target",
     "mouser_hook_mark_logitech_wheel",
@@ -226,10 +225,6 @@ class WrapperTests(unittest.TestCase):
         self.lib.mouser_hook_uninstall.result = 0
         self.assertTrue(self.native.install())
         self.assertFalse(self.native.uninstall())
-
-    def test_installed_reflects_the_dll(self):
-        self.lib.mouser_hook_installed.result = 1
-        self.assertTrue(self.native.installed)
 
     def test_set_filter_passes_all_three_words(self):
         self.native.set_filter(0b1011, 0x2A, 0x08)

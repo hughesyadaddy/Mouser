@@ -96,10 +96,18 @@ Gestures cannot regress here by construction: the hook stays installed, and
 if the DLL is missing, stale, or fails to hook, `core/native_hook_win.py`
 returns None and the existing Python procedure runs unchanged.
 
-One behaviour deliberately differs from the Python procedure: a horizontal-
-scroll remap fires again with the native filter. `47578a4` had to bail on all
-wheel messages when invert was off, which silently disabled those remaps; the
-native side can consult the interest mask for free.
+Two behaviours deliberately differ from the Python procedure:
+
+- A horizontal-scroll remap fires again. `47578a4` had to bail on all wheel
+  messages when invert was off, which silently disabled those remaps; the
+  native side can consult the interest mask for free.
+- Logitech attribution for scroll invert now rests solely on the WM_INPUT
+  recency mark (80 ms). The Python procedure also drained the thread's
+  raw-input queue with `GetRawInputBuffer`, which only worked because the hook
+  shared a thread with the raw-input window — and stole packets that window
+  was about to receive. The hook has its own thread now, so that call would
+  read an unrelated queue. This slightly widens the window in which a
+  non-Logitech wheel event could be misattributed right after a Logitech one.
 
 Phase 2 is the durable answer; Phase 1 removes the pain immediately and is
 already mostly written.

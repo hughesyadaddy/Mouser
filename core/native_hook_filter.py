@@ -22,7 +22,19 @@ from core.mouse_hook_types import MouseEvent
 # Bumped whenever the struct layout or export signatures change. The loader
 # refuses a DLL that disagrees and falls back to the Python procedure, so a
 # stale binary next to a new build can never be silently half-compatible.
-ABI_VERSION = 1
+ABI_VERSION = 2
+
+#: The native side packs flags, interest, and block into one 64-bit word,
+#: 16 bits each, so it can read a combination Python actually pushed rather
+#: than a torn mix of two. Nothing may outgrow its field.
+FILTER_FIELD_BITS = 16
+
+#: How long the Windows hook waits for its hook thread to come down. Must stay
+#: ABOVE the DLL's own NATIVE_UNINSTALL_WAIT_MS: if Python gave up first, stop()
+#: would drop its handle on a thread still running and a later install() would
+#: race it. Lives here rather than in the Windows module so the test that
+#: enforces the ordering can read both sides on any platform.
+HOOK_THREAD_JOIN_S = 3
 
 # ── filter flags (first argument of set_filter) ────────────────────────
 
@@ -61,9 +73,6 @@ EVENT_CODES = {
 }
 
 EVENT_NAMES = {code: name for name, code in EVENT_CODES.items()}
-
-#: Horizontal wheel is the only queued event carrying a delta.
-HSCROLL_EVENT_CODES = frozenset((EVT_HSCROLL_LEFT, EVT_HSCROLL_RIGHT))
 
 
 def event_bit(event_type) -> int:
@@ -115,6 +124,7 @@ def compute_filter(hook):
     scroll inversion is host-local: Deskflow forwards scroll through
     untouched and must not need to know about the setting.
     """
+    mapped, blocked = hook.bindings_snapshot()
     physical = hook._physical_logitech_bound()
     flags = build_filter_flags(
         intercept=hook._should_intercept_events(),
@@ -130,8 +140,8 @@ def compute_filter(hook):
         ),
         debug=bool(hook.debug_mode and hook._debug_callback),
     )
-    block_mask = build_mask(hook._blocked_events)
-    interest_mask = build_mask(hook._callbacks) | block_mask
+    block_mask = build_mask(blocked)
+    interest_mask = build_mask(mapped) | block_mask
     return flags, interest_mask, block_mask
 
 

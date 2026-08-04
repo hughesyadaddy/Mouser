@@ -13,10 +13,12 @@ import unittest
 from types import SimpleNamespace
 
 from core.mouse_hook_base import BaseMouseHook
-from core.mouse_hook_types import MouseEvent
+from core.mouse_hook_types import LOGITECH_SCROLL_RECENT_S, MouseEvent
 from core.native_hook_filter import (
     ABI_VERSION,
     EVENT_CODES,
+    FILTER_FIELD_BITS,
+    HOOK_THREAD_JOIN_S,
     EVENT_NAMES,
     EVT_HSCROLL_LEFT,
     EVT_HSCROLL_RIGHT,
@@ -249,7 +251,8 @@ class CSourceAgreementTests(unittest.TestCase):
 
     def _defined(self, name):
         match = re.search(
-            rf"^#define\s+{re.escape(name)}\s+\(?([0-9]+)u?\s*(?:<<\s*([0-9]+)u?)?\)?\s*$",
+            rf"^#define\s+{re.escape(name)}\s+"
+            rf"\(?([0-9]+)[uUlL]*\s*(?:<<\s*([0-9]+)[uUlL]*)?\)?\s*$",
             self.source,
             re.MULTILINE,
         )
@@ -259,6 +262,41 @@ class CSourceAgreementTests(unittest.TestCase):
 
     def test_abi_version_matches(self):
         self.assertEqual(self._defined("MOUSER_HOOK_ABI"), ABI_VERSION)
+
+    def test_wheel_recency_window_matches_the_python_constant(self):
+        """The native procedure attributes a wheel message to the Logitech
+        purely from this window, so a drift here silently changes which
+        scrolls get inverted."""
+        self.assertEqual(
+            self._defined("LOGITECH_WHEEL_RECENT_MS"),
+            round(LOGITECH_SCROLL_RECENT_S * 1000),
+        )
+
+    def test_uninstall_wait_stays_under_the_python_join(self):
+        """If the DLL outwaited Python, stop() would drop its handle on a
+        thread still running and a later install() would race it."""
+        self.assertLess(
+            self._defined("NATIVE_UNINSTALL_WAIT_MS") / 1000.0,
+            HOOK_THREAD_JOIN_S,
+        )
+
+    def test_every_mask_fits_the_packed_filter_field(self):
+        """The three words share one 64-bit register, 16 bits each."""
+        widest = max(event_bit(name) for name in EVENT_CODES)
+        self.assertLess(widest, 1 << FILTER_FIELD_BITS)
+        self.assertLess(
+            build_filter_flags(
+                intercept=True,
+                vscroll_invert=True,
+                hscroll_invert=True,
+                debug=True,
+            ),
+            1 << FILTER_FIELD_BITS,
+        )
+        for name in ("FILTER_FLAGS_SHIFT", "FILTER_INTEREST_SHIFT",
+                     "FILTER_BLOCK_SHIFT"):
+            with self.subTest(shift=name):
+                self.assertEqual(self._defined(name) % FILTER_FIELD_BITS, 0)
 
     def test_filter_flags_match(self):
         for name, expected in (

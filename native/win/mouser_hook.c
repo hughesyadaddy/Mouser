@@ -28,7 +28,12 @@
 
 #include <windows.h>
 
-#define MOUSER_HOOK_ABI 1u
+#define MOUSER_HOOK_ABI 2u
+
+/* How long uninstall waits for the hook thread to come down. Must stay BELOW
+ * HOOK_THREAD_JOIN_S in core/mouse_hook_windows.py, so Python never gives up
+ * on a thread that is still running and drop its handle on it. */
+#define NATIVE_UNINSTALL_WAIT_MS 2000u
 
 #define EXPORT __declspec(dllexport)
 
@@ -94,14 +99,22 @@ static DWORD  g_thread_id;
 static HANDLE g_ready;
 static HANDLE g_sem;
 
-static volatile LONG g_flags;
-static volatile LONG g_interest_mask;
-static volatile LONG g_block_mask;
+/* flags, interest mask, and block mask packed into one word so the procedure
+ * reads a combination Python actually pushed. Read as three separate volatiles
+ * they could tear -- a new block mask paired with the old flags is a state no
+ * compute_filter() result ever produced, and the procedure would act on it.
+ * 16 bits each is ample: 4 flags, 9 event codes. */
+#define FILTER_FLAGS_SHIFT    0
+#define FILTER_INTEREST_SHIFT 16
+#define FILTER_BLOCK_SHIFT    32
+#define FILTER_FIELD_MASK     0xFFFFull
+
+static volatile LONG64 g_filter;
 
 /* Only the hook thread touches this: which swallowed DOWNs are still held. */
 static unsigned int g_blocked_down_active;
 
-static HWND         g_inject_hwnd;
+static void *volatile g_inject_hwnd;
 static volatile LONG g_inject_vscroll_msg;
 static volatile LONG g_inject_hscroll_msg;
 static volatile LONG g_pending_vscroll;
@@ -169,7 +182,8 @@ static BOOL invert_wheel(BOOL vertical, int delta)
     volatile LONG *pending = vertical ? &g_pending_vscroll : &g_pending_hscroll;
     volatile LONG *posted  = vertical ? &g_vscroll_posted  : &g_hscroll_posted;
     LONG message = vertical ? g_inject_vscroll_msg : g_inject_hscroll_msg;
-    HWND target = g_inject_hwnd;
+    HWND target = (HWND)InterlockedCompareExchangePointer(
+        (void *volatile *)&g_inject_hwnd, NULL, NULL);
 
     if (delta == 0 || target == NULL || message == 0) {
         return FALSE;
@@ -287,9 +301,14 @@ static LRESULT CALLBACK ll_mouse_proc(int nCode, WPARAM wParam, LPARAM lParam)
         return CallNextHookEx(g_hook, nCode, wParam, lParam);
     }
 
-    flags = (unsigned int)g_flags;
-    interest = (unsigned int)g_interest_mask;
-    blocked_mask = (unsigned int)g_block_mask;
+    {
+        /* One read of the packed word: the three fields are guaranteed to
+         * come from the same push. */
+        LONG64 filter = InterlockedCompareExchange64(&g_filter, 0, 0);
+        flags = (unsigned int)((filter >> FILTER_FLAGS_SHIFT) & FILTER_FIELD_MASK);
+        interest = (unsigned int)((filter >> FILTER_INTEREST_SHIFT) & FILTER_FIELD_MASK);
+        blocked_mask = (unsigned int)((filter >> FILTER_BLOCK_SHIFT) & FILTER_FIELD_MASK);
+    }
     debug = (flags & FILTER_DEBUG) != 0;
 
     /* Wheel is the other high-frequency stream and a fast scroll delivers it
@@ -459,7 +478,7 @@ EXPORT int mouser_hook_uninstall(void)
         return 1;
     }
     PostThreadMessageW(g_thread_id, WM_QUIT, 0, 0);
-    if (WaitForSingleObject(g_thread, 5000) != WAIT_OBJECT_0) {
+    if (WaitForSingleObject(g_thread, NATIVE_UNINSTALL_WAIT_MS) != WAIT_OBJECT_0) {
         /* The thread is wedged; leaking its handle beats tearing the hook
          * out from under a procedure that may still be running. */
         return 0;
@@ -471,18 +490,15 @@ EXPORT int mouser_hook_uninstall(void)
     return 1;
 }
 
-EXPORT int mouser_hook_installed(void)
-{
-    return g_hook != NULL ? 1 : 0;
-}
-
 EXPORT void mouser_hook_set_filter(unsigned int flags,
                                    unsigned int interest_mask,
                                    unsigned int block_mask)
 {
-    InterlockedExchange(&g_interest_mask, (LONG)interest_mask);
-    InterlockedExchange(&g_block_mask, (LONG)block_mask);
-    InterlockedExchange(&g_flags, (LONG)flags);
+    LONG64 packed =
+        ((LONG64)(flags & FILTER_FIELD_MASK) << FILTER_FLAGS_SHIFT) |
+        ((LONG64)(interest_mask & FILTER_FIELD_MASK) << FILTER_INTEREST_SHIFT) |
+        ((LONG64)(block_mask & FILTER_FIELD_MASK) << FILTER_BLOCK_SHIFT);
+    InterlockedExchange64(&g_filter, packed);
 }
 
 EXPORT void mouser_hook_set_inject_target(void *hwnd,
@@ -491,7 +507,7 @@ EXPORT void mouser_hook_set_inject_target(void *hwnd,
 {
     InterlockedExchange(&g_inject_vscroll_msg, (LONG)vscroll_msg);
     InterlockedExchange(&g_inject_hscroll_msg, (LONG)hscroll_msg);
-    g_inject_hwnd = (HWND)hwnd;
+    InterlockedExchangePointer((void *volatile *)&g_inject_hwnd, hwnd);
 }
 
 EXPORT void mouser_hook_mark_logitech_wheel(void)

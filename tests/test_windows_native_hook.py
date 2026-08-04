@@ -7,13 +7,12 @@ gesture, which is the one outcome this work is not allowed to produce -- so
 the fallback to the Python procedure is tested as hard as the native path.
 
 ``core.mouse_hook_windows`` binds ``ctypes.windll`` at import, so it is
-imported here against a stub. Only module-level Win32 declarations touch it;
-none of the behaviour under test calls into the OS.
+imported through the shared helper. Only module-level Win32 declarations touch
+it; none of the behaviour under test calls into the OS.
 """
 
-import ctypes
-import importlib
 import queue
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -26,41 +25,9 @@ from core.native_hook_filter import (
     EVT_XBUTTON1_DOWN,
     FILTER_INTERCEPT,
 )
+from tests.support.windows_hook_import import import_windows_hook
 
-
-class _Win32Stub:
-    def __init__(self):
-        self.restype = None
-        self.argtypes = None
-        self.result = 0
-
-    def __call__(self, *args):
-        return self.result
-
-
-class _Win32Lib:
-    def __getattr__(self, name):
-        stub = _Win32Stub()
-        setattr(self, name, stub)
-        return stub
-
-
-class _WinDllStub:
-    def __getattr__(self, name):
-        lib = _Win32Lib()
-        setattr(self, name, lib)
-        return lib
-
-
-_had_windll = hasattr(ctypes, "windll")
-if not _had_windll:
-    ctypes.windll = _WinDllStub()
-try:
-    mouse_hook_windows = importlib.import_module("core.mouse_hook_windows")
-finally:
-    if not _had_windll:
-        del ctypes.windll
-
+mouse_hook_windows = import_windows_hook()
 MouseHook = mouse_hook_windows.MouseHook
 
 
@@ -192,6 +159,74 @@ class FilterPushTests(unittest.TestCase):
         self.assertEqual(len(native.filters), pushes + 1)
 
 
+class FilterPushConcurrencyTests(unittest.TestCase):
+    """The hook thread and the drain thread both push. If the cache and the
+    DLL write can be reordered against each other, the DLL ends up stranded
+    on a stale filter and every later remap decision is made from it."""
+
+    def test_the_dll_never_ends_on_a_state_older_than_the_cache(self):
+        native = _FakeNative()
+        hook = _hook(native=native)
+        barrier = threading.Barrier(2)
+        errors = []
+
+        def flip(blocked_event):
+            try:
+                barrier.wait(timeout=5)
+                for _ in range(200):
+                    hook.block(blocked_event)
+                    hook._push_native_filter()
+                    hook.unblock(blocked_event)
+                    hook._push_native_filter()
+            except Exception as exc:  # noqa: BLE001 - surfaced below
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=flip, args=(MouseEvent.XBUTTON1_DOWN,)),
+            threading.Thread(target=flip, args=(MouseEvent.XBUTTON2_DOWN,)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(native.filters[-1], hook._native_filter_state)
+
+    def test_iterating_bindings_survives_concurrent_rebinding(self):
+        """`compute_filter` used to iterate the live collections; the engine
+        rewrites them from another thread whenever an app profile activates,
+        and CPython raises on a set that changes size mid-iteration."""
+        hook = _hook(native=_FakeNative())
+        stop = threading.Event()
+        errors = []
+
+        def churn():
+            while not stop.is_set():
+                hook.register(MouseEvent.MIDDLE_DOWN, lambda event: None)
+                hook.block(MouseEvent.MIDDLE_DOWN)
+                hook.reset_bindings()
+
+        def push():
+            try:
+                for _ in range(500):
+                    hook._push_native_filter()
+            except Exception as exc:  # noqa: BLE001 - surfaced below
+                errors.append(exc)
+            finally:
+                stop.set()
+
+        churner = threading.Thread(target=churn, daemon=True)
+        churner.start()
+        pusher = threading.Thread(target=push)
+        pusher.start()
+        pusher.join(timeout=10)
+        stop.set()
+        churner.join(timeout=5)
+
+        self.assertEqual(errors, [])
+
+
 class InstallRoutingTests(unittest.TestCase):
     def test_install_uses_the_native_procedure(self):
         native = _FakeNative()
@@ -315,6 +350,53 @@ class ApplyHookStateTests(unittest.TestCase):
         self.assertTrue(hook._native_installed)
 
 
+class FallbackApplyHookStateTests(unittest.TestCase):
+    """The same state machine with no DLL loaded.
+
+    The Python procedure is what keeps remaps and gestures alive when the
+    native filter is unavailable, so its lifecycle has to be held to the same
+    guarantees -- not merely assumed to still work because it used to.
+    """
+
+    def setUp(self):
+        self.hook = _hook()
+        self.install = patch.object(
+            mouse_hook_windows, "SetWindowsHookExW", return_value=4321
+        )
+        self.install.start()
+        self.addCleanup(self.install.stop)
+
+    def test_state_converges_to_installed_then_uninstalled(self):
+        self.hook._apply_hook_state()
+        self.assertEqual(self.hook._hook, 4321)
+        self.assertTrue(self.hook._hook_is_installed())
+
+        self.hook._on_hid_disconnect()
+        with patch.object(mouse_hook_windows, "UnhookWindowsHookEx"):
+            self.hook._apply_hook_state()
+
+        self.assertIsNone(self.hook._hook)
+        self.assertFalse(self.hook._hook_is_installed())
+
+    def test_uninstall_is_deferred_mid_gesture(self):
+        self.hook._apply_hook_state()
+        self.hook._ri_hwnd = 99
+        self.hook._gesture_active = True
+        self.hook._on_hid_disconnect()
+
+        with patch.object(mouse_hook_windows, "SetTimer") as set_timer, \
+                patch.object(mouse_hook_windows, "UnhookWindowsHookEx") as unhook:
+            self.hook._apply_hook_state()
+
+        set_timer.assert_called_once()
+        unhook.assert_not_called()
+        self.assertEqual(self.hook._hook, 4321)
+
+    def test_pushing_a_filter_is_harmless_with_no_dll(self):
+        self.hook._apply_hook_state()
+        self.assertIsNone(self.hook._native_filter_state)
+
+
 class NativeEventTests(unittest.TestCase):
     def _drain(self, hook):
         events = []
@@ -405,6 +487,55 @@ class DrainWorkerTests(unittest.TestCase):
             MouseEvent.XBUTTON1_DOWN,
         )
         self.assertTrue(native.filters, "drain tick never pushed the filter")
+
+    def test_a_failing_filter_push_does_not_kill_the_worker(self):
+        """A dead drain thread is every remapped button silently gone, so a
+        push that raises has to degrade rather than end the loop."""
+        native = _FakeNative()
+        hook = _hook(native=native)
+        native.queue(
+            event_code=EVT_XBUTTON1_DOWN,
+            message=mouse_hook_windows.WM_XBUTTONDOWN,
+        )
+        hook._running = True
+        pushes = []
+
+        def boom(*_args):
+            pushes.append(1)
+            if len(pushes) >= 3:
+                hook._running = False
+            raise OSError("set_filter blew up")
+
+        native.set_filter = boom
+
+        hook._native_drain_worker()
+
+        self.assertGreaterEqual(len(pushes), 3)
+        self.assertEqual(
+            hook._dispatch_queue.get_nowait().event_type,
+            MouseEvent.XBUTTON1_DOWN,
+        )
+
+    def test_a_ring_overflow_is_reported(self):
+        native = _FakeNative()
+        hook = _hook(native=native)
+        native.dropped = 4
+        hook._running = True
+        original = native.next_event
+
+        def next_event(event, timeout_ms):
+            hook._running = False
+            return original(event, timeout_ms)
+
+        native.next_event = next_event
+
+        with patch("builtins.print") as printed:
+            hook._native_drain_worker()
+
+        self.assertTrue(
+            any("dropped 4" in str(call) for call in printed.call_args_list),
+            f"overflow never reported: {printed.call_args_list}",
+        )
 
     def test_worker_exits_on_a_native_error(self):
         native = _FakeNative()
@@ -524,8 +655,9 @@ class LogitechWheelMarkTests(unittest.TestCase):
         self.assertEqual(native.wheel_marks, 1)
 
     @staticmethod
-    def _sized(_lparam, _cmd, buffer, size, _header_size):
-        size._obj.value = 64 if buffer is None else 64
+    def _sized(_lparam, _cmd, _buffer, size, _header_size):
+        # Both the sizing call and the fetch report the same packet size.
+        size._obj.value = 64
         return 64
 
 

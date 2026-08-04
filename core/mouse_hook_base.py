@@ -23,6 +23,11 @@ class BaseMouseHook:
     def __init__(self):
         self._callbacks = {}
         self._blocked_events = set()
+        # Guards the two collections above against iteration mid-rewrite.
+        # The engine rebuilds them from any thread when bindings change,
+        # while the Windows hook's drain thread reads them to tell the
+        # native filter what to swallow. See bindings_snapshot().
+        self._bindings_lock = threading.Lock()
         # Down events actually swallowed by the hook; see _pair_blocked_updown.
         self._blocked_down_active = set()
         self._debug_callback = None
@@ -93,17 +98,33 @@ class BaseMouseHook:
             self._emit_debug(f"Dropped event due to full dispatch queue: {event.event_type}")
 
     def register(self, event_type, callback):
-        self._callbacks.setdefault(event_type, []).append(callback)
+        with self._bindings_lock:
+            self._callbacks.setdefault(event_type, []).append(callback)
 
     def block(self, event_type):
-        self._blocked_events.add(event_type)
+        with self._bindings_lock:
+            self._blocked_events.add(event_type)
 
     def unblock(self, event_type):
-        self._blocked_events.discard(event_type)
+        with self._bindings_lock:
+            self._blocked_events.discard(event_type)
 
     def reset_bindings(self):
-        self._callbacks.clear()
-        self._blocked_events.clear()
+        with self._bindings_lock:
+            self._callbacks.clear()
+            self._blocked_events.clear()
+
+    def bindings_snapshot(self):
+        """``(mapped event types, blocked event types)`` as of right now.
+
+        The only safe way to *iterate* the binding collections: the engine
+        rewrites them whenever the user changes a mapping or an app-specific
+        profile activates, and iterating a set mid-mutation raises. Single
+        reads (``in``, ``get``) stay lock-free -- they are atomic under the
+        GIL and sit on the hook's hot path.
+        """
+        with self._bindings_lock:
+            return tuple(self._callbacks), tuple(self._blocked_events)
 
     def configure_gestures(self, enabled=False, threshold=50, **_deprecated):
         """Configure swipe detection. ``threshold`` is the net rawXY
