@@ -513,6 +513,16 @@ class BaseMouseHook:
         self._gesture_input_source = None
         self._gesture_fired = False
 
+    #: Per-source scaling applied before the threshold test. The threshold is
+    #: expressed in HID++ rawXY sensor counts, so any source measuring in
+    #: something else has to be converted first or the tap gate is meaningless.
+    #: ``kvm_pointer`` deltas are screen pixels from a Deskflow client, which
+    #: are coarser than sensor counts by roughly this factor. PROVISIONAL --
+    #: it needs confirming against a deliberate full-width swipe on a real
+    #: client; too low and every swipe reads as a tap, which is the exact bug
+    #: this source exists to fix.
+    GESTURE_SOURCE_SCALE = {"kvm_pointer": 3.0}
+
     def _classify_gesture(self, delta_x, delta_y):
         """Map the net displacement of a completed capture to a swipe
         direction, or None when the stroke reads as a tap.
@@ -523,8 +533,9 @@ class BaseMouseHook:
         zone, so the first stroke past the threshold always resolves to a
         direction.
         """
-        abs_x = abs(delta_x)
-        abs_y = abs(delta_y)
+        scale = self.GESTURE_SOURCE_SCALE.get(self._gesture_input_source, 1.0)
+        abs_x = abs(delta_x) * scale
+        abs_y = abs(delta_y) * scale
 
         # Tap gate: below the activation threshold the hold is a click.
         if max(abs_x, abs_y) < self._gesture_threshold:

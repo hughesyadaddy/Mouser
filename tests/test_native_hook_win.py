@@ -33,6 +33,7 @@ EXPORTS = (
     "mouser_hook_set_inject_target",
     "mouser_hook_mark_logitech_wheel",
     "mouser_hook_next_event",
+    "mouser_hook_take_capture_delta",
     "mouser_hook_take_pending_vscroll",
     "mouser_hook_take_pending_hscroll",
     "mouser_hook_dropped",
@@ -244,6 +245,16 @@ class WrapperTests(unittest.TestCase):
         self.native.set_inject_target(0x1234, 0x8001, 0x8002)
         (hwnd, _v, _h), = self.lib.mouser_hook_set_inject_target.calls
         self.assertEqual(hwnd.value, 0x1234)
+
+    def test_capture_delta_is_returned_and_reset_by_the_dll(self):
+        """The C side writes through the out-params and zeroes its own
+        accumulator, so a second drain in the same stroke reads nothing."""
+        def fake(dx_ref, dy_ref):
+            dx_ref._obj.value = -412
+            dy_ref._obj.value = 37
+
+        self.lib.mouser_hook_take_capture_delta = fake
+        self.assertEqual(self.native.take_capture_delta(), (-412, 37))
 
     def test_pending_scroll_deltas_are_signed(self):
         self.lib.mouser_hook_take_pending_vscroll.result = -120

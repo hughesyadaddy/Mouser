@@ -155,6 +155,11 @@ class NativeHookFilter:
             ctypes.POINTER(NativeHookEvent),
             ctypes.c_uint32,
         ]
+        lib.mouser_hook_take_capture_delta.restype = None
+        lib.mouser_hook_take_capture_delta.argtypes = [
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+        ]
         lib.mouser_hook_take_pending_vscroll.restype = ctypes.c_int
         lib.mouser_hook_take_pending_vscroll.argtypes = []
         lib.mouser_hook_take_pending_hscroll.restype = ctypes.c_int
@@ -207,6 +212,17 @@ class NativeHookFilter:
         return bool(self._lib.mouser_hook_next_event(
             ctypes.byref(event), ctypes.c_uint32(timeout_ms)
         ))
+
+    def take_capture_delta(self):
+        """``(dx, dy)`` accumulated since the last call, and reset to zero.
+
+        Screen-pixel deltas, diffed from successive ``MSLLHOOKSTRUCT.pt``
+        values by the procedure. Drained once per gesture, off the input path.
+        """
+        dx = ctypes.c_int(0)
+        dy = ctypes.c_int(0)
+        self._lib.mouser_hook_take_capture_delta(ctypes.byref(dx), ctypes.byref(dy))
+        return dx.value, dy.value
 
     def take_pending_vscroll(self) -> int:
         return int(self._lib.mouser_hook_take_pending_vscroll())

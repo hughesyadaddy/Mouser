@@ -22,7 +22,7 @@ from core.mouse_hook_types import MouseEvent
 # Bumped whenever the struct layout or export signatures change. The loader
 # refuses a DLL that disagrees and falls back to the Python procedure, so a
 # stale binary next to a new build can never be silently half-compatible.
-ABI_VERSION = 2
+ABI_VERSION = 3
 
 #: The native side packs flags, interest, and block into one 64-bit word,
 #: 16 bits each, so it can read a combination Python actually pushed rather
@@ -47,6 +47,10 @@ FILTER_HSCROLL_INVERT = 1 << 2
 #: Mirror every non-move event to the queue so debug logging stays complete.
 #: Off, the native side queues only events in the interest mask.
 FILTER_DEBUG = 1 << 3
+#: A gesture is being held on a KVM client: the procedure accumulates the
+#: pointer motion Deskflow injects and swallows it, so the cursor freezes for
+#: the length of the stroke. Off, ``WM_MOUSEMOVE`` bails as cheaply as ever.
+FILTER_CAPTURE = 1 << 4
 
 # ── event codes (``event_code`` on a queued event) ─────────────────────
 
@@ -96,8 +100,9 @@ def build_filter_flags(
     vscroll_invert: bool,
     hscroll_invert: bool,
     debug: bool,
+    capture: bool = False,
 ) -> int:
-    """Pack the four native decisions into the flags word."""
+    """Pack the native decisions into the flags word."""
     flags = 0
     if intercept:
         flags |= FILTER_INTERCEPT
@@ -107,7 +112,25 @@ def build_filter_flags(
         flags |= FILTER_HSCROLL_INVERT
     if debug:
         flags |= FILTER_DEBUG
+    if capture:
+        flags |= FILTER_CAPTURE
     return flags
+
+
+def gesture_capture_wants_pointer(hook) -> bool:
+    """True while this machine must decode a swipe from its own pointer motion.
+
+    Only on a KVM client. With a physical Logitech attached the motion already
+    arrives over HID++ rawXY (or the Sense Panel raw-mouse fallback), and
+    swallowing moves there would freeze the cursor for no gain. Off-host the
+    device is a Deskflow shim, the host cannot forward rawXY this device never
+    produces, and the injected pointer motion is the only motion there is.
+    """
+    return bool(
+        hook._gesture_active
+        and hook._gesture_direction_enabled
+        and not hook._physical_logitech_bound()
+    )
 
 
 def compute_filter(hook):
@@ -139,6 +162,7 @@ def compute_filter(hook):
             and not hook.wheel_native_invert_horizontal
         ),
         debug=bool(hook.debug_mode and hook._debug_callback),
+        capture=gesture_capture_wants_pointer(hook),
     )
     block_mask = build_mask(blocked)
     interest_mask = build_mask(mapped) | block_mask
@@ -154,6 +178,7 @@ def describe_filter(flags: int, interest_mask: int, block_mask: int) -> str:
             ("vinvert", FILTER_VSCROLL_INVERT),
             ("hinvert", FILTER_HSCROLL_INVERT),
             ("debug", FILTER_DEBUG),
+            ("capture", FILTER_CAPTURE),
         )
         if flags & bit
     ]

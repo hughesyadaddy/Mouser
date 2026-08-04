@@ -28,7 +28,7 @@
 
 #include <windows.h>
 
-#define MOUSER_HOOK_ABI 2u
+#define MOUSER_HOOK_ABI 3u
 
 /* How long uninstall waits for the hook thread to come down. Must stay BELOW
  * HOOK_THREAD_JOIN_S in core/mouse_hook_windows.py, so Python never gives up
@@ -43,6 +43,14 @@
 #define FILTER_VSCROLL_INVERT  (1u << 1)
 #define FILTER_HSCROLL_INVERT  (1u << 2)
 #define FILTER_DEBUG           (1u << 3)
+#define FILTER_CAPTURE         (1u << 4)
+
+/* A capture swallows every mouse move, so a button-down whose release never
+ * arrives would freeze the pointer for good. Only the native side can unfreeze
+ * the native side -- Python cannot preempt a procedure running off the GIL --
+ * so the procedure times its own capture out. Generous enough for a slow
+ * deliberate swipe, short enough that a stuck one reads as a hiccup. */
+#define CAPTURE_MAX_MS 3000ull
 
 /* ── event codes: mirror core/native_hook_filter.py ──────────────────── */
 
@@ -124,6 +132,17 @@ static volatile LONG g_hscroll_posted;
 
 static volatile LONG64 g_last_logitech_wheel_ms;
 
+/* Gesture capture on a KVM client. The pointer motion Deskflow injects is the
+ * only motion available off-host: this device cannot divert rawXY, so the host
+ * decodes from its own event tap and has nothing to forward. Only the hook
+ * thread touches the accumulator; set_filter owns the reset and the deadline. */
+static volatile LONG g_capture_dx;
+static volatile LONG g_capture_dy;
+static volatile LONG64 g_capture_deadline_ms;
+static LONG g_capture_prev_x;
+static LONG g_capture_prev_y;
+static BOOL g_capture_have_prev;
+
 static MouserHookEvent g_ring[RING_SIZE];
 static volatile LONG g_ring_head;  /* producer: hook thread */
 static volatile LONG g_ring_tail;  /* consumer: Python drain thread */
@@ -173,6 +192,47 @@ static BOOL wheel_is_logitech(void)
         return FALSE;
     }
     return (LONG64)GetTickCount64() - marked <= (LONG64)LOGITECH_WHEEL_RECENT_MS;
+}
+
+/* True while a gesture capture is live and has not outrun its deadline.
+ *
+ * The deadline is the backstop for a button-down whose release never arrives
+ * (device unplugged, HID++ report dropped, ingress torn down mid-hold). Once
+ * it passes, motion flows again on its own -- no Python involvement, because
+ * a Python thread cannot interrupt a procedure that runs off the GIL. */
+static BOOL capture_active(void)
+{
+    LONG64 deadline = InterlockedCompareExchange64(&g_capture_deadline_ms, 0, 0);
+    if (deadline == 0) {
+        return FALSE;
+    }
+    return (LONG64)GetTickCount64() < deadline;
+}
+
+/* Fold one move into the capture and report whether to swallow it.
+ *
+ * MSLLHOOKSTRUCT carries screen coordinates for both of Deskflow's injection
+ * modes (absolute and relative), so diffing successive points is the one
+ * treatment that covers both. Swallowing freezes the pointer for the length
+ * of the hold, matching how the host pins its own cursor mid-gesture. */
+static BOOL capture_motion(const MSLLHOOKSTRUCT *data)
+{
+    LONG x;
+    LONG y;
+
+    if (data == NULL) {
+        return FALSE;
+    }
+    x = (LONG)data->pt.x;
+    y = (LONG)data->pt.y;
+    if (g_capture_have_prev) {
+        InterlockedExchangeAdd(&g_capture_dx, x - g_capture_prev_x);
+        InterlockedExchangeAdd(&g_capture_dy, y - g_capture_prev_y);
+    }
+    g_capture_prev_x = x;
+    g_capture_prev_y = y;
+    g_capture_have_prev = TRUE;
+    return TRUE;
 }
 
 /* Accumulate an inverted wheel delta and wake the injector window once.
@@ -294,10 +354,18 @@ static LRESULT CALLBACK ll_mouse_proc(int nCode, WPARAM wParam, LPARAM lParam)
 
     message = (UINT)wParam;
 
-    /* WM_MOUSEMOVE is the highest-frequency mouse event and Mouser never
-     * remaps it -- gesture capture runs off the Raw Input path. Bail before
-     * reading anything. */
+    /* WM_MOUSEMOVE is the highest-frequency mouse event, and Mouser remaps it
+     * only while a gesture is held on a KVM client -- see capture_motion.
+     * Read the one flag that can change that, then bail before touching
+     * anything else. This is the path the whole native filter exists to keep
+     * cheap. */
     if (message == WM_MOUSEMOVE) {
+        if (!capture_active()) {
+            return CallNextHookEx(g_hook, nCode, wParam, lParam);
+        }
+        if (capture_motion((const MSLLHOOKSTRUCT *)lParam)) {
+            return 1;
+        }
         return CallNextHookEx(g_hook, nCode, wParam, lParam);
     }
 
@@ -487,6 +555,12 @@ EXPORT int mouser_hook_uninstall(void)
     g_thread = NULL;
     g_thread_id = 0;
     g_blocked_down_active = 0u;
+    /* Never leave a capture armed across an uninstall: with no procedure in
+     * the input path nothing would ever drain or expire it. */
+    InterlockedExchange64(&g_capture_deadline_ms, 0);
+    InterlockedExchange(&g_capture_dx, 0);
+    InterlockedExchange(&g_capture_dy, 0);
+    g_capture_have_prev = FALSE;
     return 1;
 }
 
@@ -498,7 +572,37 @@ EXPORT void mouser_hook_set_filter(unsigned int flags,
         ((LONG64)(flags & FILTER_FIELD_MASK) << FILTER_FLAGS_SHIFT) |
         ((LONG64)(interest_mask & FILTER_FIELD_MASK) << FILTER_INTEREST_SHIFT) |
         ((LONG64)(block_mask & FILTER_FIELD_MASK) << FILTER_BLOCK_SHIFT);
-    InterlockedExchange64(&g_filter, packed);
+    LONG64 previous = InterlockedExchange64(&g_filter, packed);
+    unsigned int was = (unsigned int)((previous >> FILTER_FLAGS_SHIFT)
+                                      & FILTER_FIELD_MASK);
+
+    if ((flags & FILTER_CAPTURE) != 0) {
+        if ((was & FILTER_CAPTURE) == 0) {
+            /* false->true: a fresh stroke. Clear the accumulator first, or a
+             * stale delta from an aborted one seeds this capture, and drop the
+             * anchor so the first move of the stroke contributes nothing --
+             * the pointer may have travelled since the last capture. */
+            InterlockedExchange(&g_capture_dx, 0);
+            InterlockedExchange(&g_capture_dy, 0);
+            g_capture_have_prev = FALSE;
+        }
+        InterlockedExchange64(&g_capture_deadline_ms,
+                              (LONG64)GetTickCount64() + (LONG64)CAPTURE_MAX_MS);
+    } else {
+        InterlockedExchange64(&g_capture_deadline_ms, 0);
+    }
+}
+
+EXPORT void mouser_hook_take_capture_delta(int *dx, int *dy)
+{
+    LONG x = InterlockedExchange(&g_capture_dx, 0);
+    LONG y = InterlockedExchange(&g_capture_dy, 0);
+    if (dx != NULL) {
+        *dx = (int)x;
+    }
+    if (dy != NULL) {
+        *dy = (int)y;
+    }
 }
 
 EXPORT void mouser_hook_set_inject_target(void *hwnd,

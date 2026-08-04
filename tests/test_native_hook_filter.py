@@ -28,11 +28,13 @@ from core.native_hook_filter import (
     EVT_XBUTTON2_UP,
     FILTER_DEBUG,
     FILTER_HSCROLL_INVERT,
+    FILTER_CAPTURE,
     FILTER_INTERCEPT,
     FILTER_VSCROLL_INVERT,
     build_filter_flags,
     build_mask,
     compute_filter,
+    gesture_capture_wants_pointer,
     describe_filter,
     event_bit,
 )
@@ -99,6 +101,7 @@ class FilterFlagTests(unittest.TestCase):
             ("vscroll_invert", FILTER_VSCROLL_INVERT),
             ("hscroll_invert", FILTER_HSCROLL_INVERT),
             ("debug", FILTER_DEBUG),
+            ("capture", FILTER_CAPTURE),
         )
         for name, bit in cases:
             with self.subTest(flag=name):
@@ -107,6 +110,7 @@ class FilterFlagTests(unittest.TestCase):
                     vscroll_invert=False,
                     hscroll_invert=False,
                     debug=False,
+                    capture=False,
                 )
                 kwargs[name] = True
                 self.assertEqual(build_filter_flags(**kwargs), bit)
@@ -240,6 +244,81 @@ class ComputeFilterTests(unittest.TestCase):
         self.assertEqual((interest, block), (0, 0))
 
 
+class GestureCaptureArmingTests(unittest.TestCase):
+    """When this machine must decode a swipe from its own pointer motion.
+
+    Arming it anywhere else swallows mouse moves for no gain -- on a machine
+    with the mouse physically attached that would freeze the cursor during
+    every gesture while rawXY was already supplying the motion.
+    """
+
+    def setUp(self):
+        self.hook = BaseMouseHook()
+        self.hook._gesture_direction_enabled = True
+
+    def _bind(self, source):
+        self.hook._hid_gesture = SimpleNamespace(
+            connected_device=SimpleNamespace(name="MX Master 4", source=source)
+        )
+        self.hook._on_hid_connect()
+
+    def test_armed_on_a_kvm_client_mid_capture(self):
+        self._bind("deskflow-shim")
+        self.hook._gesture_active = True
+        self.assertTrue(gesture_capture_wants_pointer(self.hook))
+        self.assertTrue(compute_filter(self.hook)[0] & FILTER_CAPTURE)
+
+    def test_not_armed_without_a_capture(self):
+        self._bind("deskflow-shim")
+        self.assertFalse(gesture_capture_wants_pointer(self.hook))
+
+    def test_not_armed_with_a_physical_mouse(self):
+        """rawXY (or the Sense Panel fallback) already supplies the motion."""
+        self._bind("usb")
+        self.hook._gesture_active = True
+        self.assertFalse(gesture_capture_wants_pointer(self.hook))
+
+    def test_not_armed_when_direction_detection_is_off(self):
+        self._bind("deskflow-shim")
+        self.hook._gesture_active = True
+        self.hook._gesture_direction_enabled = False
+        self.assertFalse(gesture_capture_wants_pointer(self.hook))
+
+
+class GestureSourceScaleTests(unittest.TestCase):
+    """The tap gate is in HID++ sensor counts; a KVM client measures pixels."""
+
+    def setUp(self):
+        self.hook = BaseMouseHook()
+        self.hook._gesture_direction_enabled = True
+        self.hook._gesture_threshold = 50.0
+
+    def test_pixels_are_scaled_before_the_tap_gate(self):
+        self.hook._gesture_input_source = "kvm_pointer"
+        scale = BaseMouseHook.GESTURE_SOURCE_SCALE["kvm_pointer"]
+        # Just under the gate unscaled, comfortably over it once scaled.
+        pixels = (50.0 / scale) + 1
+        self.assertLess(pixels, 50.0, "test would not prove anything unscaled")
+        self.assertEqual(
+            self.hook._classify_gesture(-pixels, 0), MouseEvent.GESTURE_SWIPE_LEFT
+        )
+
+    def test_a_genuine_tap_still_reads_as_a_tap(self):
+        self.hook._gesture_input_source = "kvm_pointer"
+        self.assertIsNone(self.hook._classify_gesture(1, 1))
+
+    def test_rawxy_is_unscaled(self):
+        self.hook._gesture_input_source = "hid_rawxy"
+        self.assertIsNone(self.hook._classify_gesture(49, 0))
+        self.assertEqual(
+            self.hook._classify_gesture(51, 0), MouseEvent.GESTURE_SWIPE_RIGHT
+        )
+
+    def test_an_unknown_source_is_unscaled(self):
+        self.hook._gesture_input_source = "something_new"
+        self.assertIsNone(self.hook._classify_gesture(49, 0))
+
+
 class CSourceAgreementTests(unittest.TestCase):
     """The C procedure hard-codes the same numbering. Drift here means the
     native side swallows the wrong button, so assert they match."""
@@ -304,6 +383,7 @@ class CSourceAgreementTests(unittest.TestCase):
             ("FILTER_VSCROLL_INVERT", FILTER_VSCROLL_INVERT),
             ("FILTER_HSCROLL_INVERT", FILTER_HSCROLL_INVERT),
             ("FILTER_DEBUG", FILTER_DEBUG),
+            ("FILTER_CAPTURE", FILTER_CAPTURE),
         ):
             with self.subTest(flag=name):
                 self.assertEqual(self._defined(name), expected)

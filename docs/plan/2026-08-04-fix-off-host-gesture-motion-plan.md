@@ -162,7 +162,7 @@ On-machine checks must run in console session 1.
 
 ### Phase 2: Decode off-host swipes from client-local pointer motion
 
-- **Status:** Not started
+- **Status:** Done
 - **Scope:** Native capture-active bit with in-C accumulation and cursor
   swallow, the drain export and its Python wiring, the per-source scale factor,
   and the capture-lifetime guards that make a frozen cursor impossible to get

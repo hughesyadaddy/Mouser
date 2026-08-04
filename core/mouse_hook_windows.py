@@ -32,6 +32,7 @@ from core.native_hook_filter import (
     HOOK_THREAD_JOIN_S,
     compute_filter,
     describe_filter,
+    gesture_capture_wants_pointer,
 )
 from core.native_hook_win import NativeHookEvent, NativeHookFilter
 
@@ -912,7 +913,18 @@ class MouseHook(BaseMouseHook):
         print(f"[MouseHook] Native hook filter loaded: {native.path}")
 
     def sync_hook_state(self):
-        """Thread-safe: ask the hook thread to re-evaluate hook existence."""
+        """Thread-safe: ask the hook thread to re-evaluate hook existence.
+
+        Also the focus-change entry point. Narrowly: only a *pointer* capture
+        is aborted here, because only that one freezes the cursor. When KVM
+        focus leaves mid-stroke the button-up is never coming, and
+        _apply_hook_state would re-arm its retry timer forever while the
+        pointer stayed frozen. An ordinary local gesture keeps the existing
+        deferral instead -- its up still wants the hook that swallowed its
+        down.
+        """
+        if gesture_capture_wants_pointer(self) and not self._hook_should_be_installed():
+            self._abort_gesture_capture("hook standing down")
         hwnd = self._ri_hwnd
         if hwnd and self._running:
             PostMessageW(hwnd, WM_APP_SYNC_HOOK, 0, 0)
@@ -1021,6 +1033,57 @@ class MouseHook(BaseMouseHook):
             self._install_ll_hook()
         else:
             self._apply_hook_state()
+
+    # ── gesture capture on a KVM client ───────────────────────────
+
+    def _begin_gesture_capture(self, source_label):
+        """Arm the native capture as the stroke opens.
+
+        Pushed immediately rather than waiting for the drain thread's tick --
+        50ms of a swipe is the part where the user has already committed to a
+        direction, and losing it biases every classification.
+        """
+        super()._begin_gesture_capture(source_label)
+        self._push_native_filter()
+
+    def _end_gesture_capture(self, source_label):
+        """Fold the captured motion in, then let the base resolve the stroke.
+
+        The drain has to happen before super(), which reads the accumulated
+        deltas and clears the capture.
+        """
+        self._drain_capture_motion()
+        try:
+            super()._end_gesture_capture(source_label)
+        finally:
+            self._push_native_filter()
+
+    def _abort_gesture_capture(self, reason):
+        """End a capture nothing will ever release.
+
+        Focus moving to another machine, the Deskflow ingress dropping, or the
+        device disconnecting all leave a stroke open with no button-up coming.
+        The native deadline would expire on its own, but only after freezing
+        the pointer for the rest of it -- so unfreeze now and let the stroke
+        resolve on whatever it gathered.
+        """
+        with self._gesture_lock:
+            if not self._gesture_active:
+                return
+        self._emit_debug(f"Gesture capture aborted: {reason}")
+        self._end_gesture_capture(f"aborted ({reason})")
+
+    def _drain_capture_motion(self):
+        native = self._native
+        if native is None:
+            return
+        try:
+            delta_x, delta_y = native.take_capture_delta()
+        except Exception as exc:  # noqa: BLE001 - native boundary
+            print(f"[MouseHook] native capture drain failed: {exc}")
+            return
+        if delta_x or delta_y:
+            self._accumulate_gesture_delta(delta_x, delta_y, "kvm_pointer")
 
     def _on_hid_gesture_down(self):
         # MX4 routing: when the Sense Panel is the gesture source for this

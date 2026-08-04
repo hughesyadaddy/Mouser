@@ -23,6 +23,7 @@ from core.native_hook_filter import (
     EVT_MIDDLE_DOWN,
     EVT_NONE,
     EVT_XBUTTON1_DOWN,
+    FILTER_CAPTURE,
     FILTER_INTERCEPT,
 )
 from tests.support.windows_hook_import import import_windows_hook
@@ -45,6 +46,7 @@ class _FakeNative:
         self.pending_vscroll = 0
         self.pending_hscroll = 0
         self.dropped = 0
+        self.capture_delta = (0, 0)
         self._queued = []
 
     def install(self):
@@ -68,6 +70,11 @@ class _FakeNative:
 
     def take_pending_vscroll(self):
         delta, self.pending_vscroll = self.pending_vscroll, 0
+        return delta
+
+    def take_capture_delta(self):
+        delta = self.capture_delta
+        self.capture_delta = (0, 0)
         return delta
 
     def take_pending_hscroll(self):
@@ -395,6 +402,132 @@ class FallbackApplyHookStateTests(unittest.TestCase):
     def test_pushing_a_filter_is_harmless_with_no_dll(self):
         self.hook._apply_hook_state()
         self.assertIsNone(self.hook._native_filter_state)
+
+
+class GestureCaptureTests(unittest.TestCase):
+    """Arming, draining and -- above all -- always disarming the capture.
+
+    The swallow happens in C, off the GIL, so a capture nothing closes freezes
+    the pointer. Every exit path is tested because there is no recovering from
+    a missed one at runtime.
+    """
+
+    def _client_hook(self, native=None):
+        native = native or _FakeNative()
+        hook = MouseHook()
+        hook._native = native
+        hook._gesture_direction_enabled = True
+        hook._hid_gesture = SimpleNamespace(
+            connected_device=SimpleNamespace(
+                name="MX Master 4", source="deskflow-shim"
+            )
+        )
+        hook._on_hid_connect()
+        return hook, native
+
+    def _capture_armed(self, native):
+        if not native.filters:
+            return False
+        return bool(native.filters[-1][0] & FILTER_CAPTURE)
+
+    def test_capture_arms_as_the_stroke_opens(self):
+        """Waiting for the drain tick would drop the first 50ms of the swipe --
+        the part where the direction is already decided."""
+        hook, native = self._client_hook()
+
+        hook._begin_gesture_capture("HID gesture")
+
+        self.assertTrue(self._capture_armed(native))
+
+    def test_accumulated_motion_classifies_the_swipe(self):
+        hook, native = self._client_hook()
+        dispatched = []
+        hook._dispatch = dispatched.append
+        hook._begin_gesture_capture("HID gesture")
+        native.capture_delta = (-400, 10)
+
+        hook._end_gesture_capture("HID gesture")
+
+        self.assertEqual(
+            [event.event_type for event in dispatched],
+            [MouseEvent.GESTURE_SWIPE_LEFT],
+        )
+        self.assertFalse(self._capture_armed(native))
+
+    def test_a_tap_stays_a_tap(self):
+        hook, native = self._client_hook()
+        dispatched = []
+        hook._dispatch = dispatched.append
+        hook._begin_gesture_capture("HID gesture")
+        native.capture_delta = (1, 1)
+
+        hook._end_gesture_capture("HID gesture")
+
+        self.assertEqual(
+            [event.event_type for event in dispatched], [MouseEvent.GESTURE_CLICK]
+        )
+
+    def test_capture_disarms_even_when_the_stroke_raises(self):
+        hook, native = self._client_hook()
+        hook._begin_gesture_capture("HID gesture")
+
+        def boom(event):
+            raise RuntimeError("dispatch blew up")
+
+        hook._dispatch = boom
+        native.capture_delta = (-400, 0)
+
+        with self.assertRaises(RuntimeError):
+            hook._end_gesture_capture("HID gesture")
+
+        self.assertFalse(
+            self._capture_armed(native),
+            "a raising dispatch must not leave the pointer frozen",
+        )
+
+    def test_focus_leaving_the_machine_aborts_an_open_capture(self):
+        """The button-up is never coming once focus moves; without this the
+        retry timer spins forever and the pointer stays frozen."""
+        hook, native = self._client_hook()
+        hook._begin_gesture_capture("HID gesture")
+        self.assertTrue(self._capture_armed(native))
+
+        hook.set_remote_forwarder(SimpleNamespace(should_forward=lambda: True))
+
+        self.assertFalse(hook._gesture_active)
+        self.assertFalse(self._capture_armed(native))
+
+    def test_device_loss_aborts_an_open_capture(self):
+        hook, native = self._client_hook()
+        hook._begin_gesture_capture("HID gesture")
+
+        hook._on_hid_disconnect()
+
+        self.assertFalse(hook._gesture_active)
+        self.assertFalse(self._capture_armed(native))
+
+    def test_aborting_without_a_capture_is_a_no_op(self):
+        hook, native = self._client_hook()
+        hook._abort_gesture_capture("nothing open")
+        self.assertFalse(hook._gesture_active)
+
+    def test_a_failing_drain_does_not_strand_the_capture(self):
+        hook, native = self._client_hook()
+        hook._begin_gesture_capture("HID gesture")
+
+        def boom():
+            raise OSError("dll went away")
+
+        native.take_capture_delta = boom
+        hook._end_gesture_capture("HID gesture")
+
+        self.assertFalse(self._capture_armed(native))
+
+    def test_no_capture_arming_without_the_dll(self):
+        hook = MouseHook()
+        hook._gesture_direction_enabled = True
+        hook._begin_gesture_capture("HID gesture")
+        hook._end_gesture_capture("HID gesture")  # must not raise
 
 
 class NativeEventTests(unittest.TestCase):
