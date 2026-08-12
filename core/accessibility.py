@@ -76,9 +76,19 @@ def _create_prompt_options(app_services, core_foundation):
 
 
 def is_process_trusted(prompt: bool = False) -> bool:
+    """Return whether macOS has granted Accessibility access.
+
+    Accessibility permission is not applicable on other platforms, so those
+    callers are treated as trusted. On macOS, an unavailable framework or a
+    failed trust query is indeterminate and must fail closed. Treating either
+    case as trusted would let startup continue with nonfunctional input hooks.
+    """
+    if not is_supported():
+        return True
+
     frameworks = _load_frameworks()
     if not frameworks:
-        return True
+        return False
 
     app_services, core_foundation = frameworks
 
@@ -93,4 +103,4 @@ def is_process_trusted(prompt: bool = False) -> bool:
 
         return bool(app_services.AXIsProcessTrusted())
     except Exception:
-        return True
+        return False

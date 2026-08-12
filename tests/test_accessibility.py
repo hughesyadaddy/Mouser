@@ -24,6 +24,33 @@ class AccessibilityTests(unittest.TestCase):
         )):
             self.assertFalse(accessibility.is_process_trusted())
 
+    def test_macos_framework_load_failure_is_not_trusted(self):
+        with (
+            patch.object(accessibility.sys, "platform", "darwin"),
+            patch("core.accessibility._load_frameworks", return_value=False),
+        ):
+            self.assertFalse(accessibility.is_process_trusted())
+
+    def test_macos_trust_check_failure_is_not_trusted(self):
+        def fail_trust_check():
+            raise RuntimeError("trust API unavailable")
+
+        fake_app_services = SimpleNamespace(
+            AXIsProcessTrusted=fail_trust_check,
+        )
+        fake_core_foundation = SimpleNamespace(
+            CFRelease=lambda _: None,
+        )
+
+        with (
+            patch.object(accessibility.sys, "platform", "darwin"),
+            patch("core.accessibility._load_frameworks", return_value=(
+                fake_app_services,
+                fake_core_foundation,
+            )),
+        ):
+            self.assertFalse(accessibility.is_process_trusted())
+
     def test_uses_prompt_api_when_requested(self):
         calls = []
         fake_app_services = SimpleNamespace(
