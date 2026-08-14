@@ -12,7 +12,7 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE_NAME = "Mouser"
 
 # macOS
-MACOS_LAUNCH_AGENT_LABEL = "io.github.tombadash.mouser"
+MACOS_LAUNCH_AGENT_LABEL = "io.github.hughesyadaddy.mouser"
 MACOS_PLIST_NAME = f"{MACOS_LAUNCH_AGENT_LABEL}.plist"
 
 # Linux
