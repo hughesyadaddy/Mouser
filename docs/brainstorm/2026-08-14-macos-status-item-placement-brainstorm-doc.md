@@ -1,7 +1,21 @@
 # macOS menu-bar status item fails to render — brainstorm
 
+> **RESOLVED (72b49b5).** Root cause: macOS 26.2 corrupts SystemUIServer's
+> per-bundle-identifier menu-bar state when the app runs; the damage persists
+> for that identifier until the menu-bar services restart. Not a code defect —
+> an unrelated 20-line app could be broken purely by renaming it to Mouser's
+> identifier. macbookpro (macOS 26.5.1) was never affected.
+>
+> Fixed by shipping the fork under its own identifier,
+> `io.github.hughesyadaddy.mouser`, which the fork should have had regardless:
+> it was using upstream's while carrying a subsystem upstream does not have.
+> Verified on the packaged app — status item at y=3, visually confirmed.
+>
+> Cost: new app identity, so Accessibility and Input Monitoring grants reset
+> once, and the old LaunchAgent label should be removed.
+
 **Date:** 2026-08-14
-**Status:** mechanism identified and reproducible; the specific triggering call is still unknown
+**Status:** RESOLVED — fixed in 72b49b5
 **Goal:** the menu-bar icon renders correctly on every macOS device, not just some
 
 ## Problem
