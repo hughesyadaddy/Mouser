@@ -155,9 +155,11 @@ class ApplyLoginStartupMacTests(unittest.TestCase):
         with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", "/Users/test")):
             plist_path = st._macos_plist_path()
 
+        # Derived from the constant rather than hardcoded: the fork ships under
+        # its own bundle identifier, and the agent label must track it.
         self.assertEqual(
             plist_path,
-            "/Users/test/Library/LaunchAgents/io.github.tombadash.mouser.plist",
+            f"/Users/test/Library/LaunchAgents/{st.MACOS_LAUNCH_AGENT_LABEL}.plist",
         )
 
     def test_macos_enable_writes_plist_and_bootstraps(self):
