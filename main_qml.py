@@ -749,7 +749,11 @@ def _set_macos_activation_policy(regular: bool) -> None:
     if regular:
         _install_macos_dock_icon()
         _schedule_macos_dock_icon_refresh()
-        _schedule_macos_status_item_reinstall()
+    # Re-install on BOTH directions of the flip. AppKit drops the status
+    # item's menu-bar slot on the .regular -> .accessory demotion (hiding the
+    # window) exactly as it does on the promotion, so handling only the
+    # promotion leaves the icon gone the first time the window is dismissed.
+    _schedule_macos_status_item_reinstall()
 
 
 def _activate_macos_window():

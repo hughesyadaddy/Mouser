@@ -266,6 +266,12 @@ class MacOSStatusItemReinstallTests(unittest.TestCase):
         )
         callbacks = []
 
+        status_item = self._attached_status_item()
+
+        def install(*_args):
+            main_qml._MACOS_NATIVE_STATUS_ITEM = status_item
+            return status_item
+
         with (
             patch.object(main_qml.sys, "platform", "darwin"),
             patch.object(main_qml, "_macos_appkit", return_value=appkit),
@@ -276,17 +282,61 @@ class MacOSStatusItemReinstallTests(unittest.TestCase):
                 "singleShot",
                 side_effect=lambda delay, callback: callbacks.append((delay, callback)),
             ),
-            patch.object(main_qml, "_install_native_macos_status_item") as installer,
+            patch.object(
+                main_qml,
+                "_install_native_macos_status_item",
+                side_effect=install,
+            ) as installer,
         ):
             main_qml._set_macos_activation_policy(regular=True)
             main_qml._set_macos_activation_policy(regular=False)
-            self.assertEqual([delay for delay, _ in callbacks], [0, 250])
-            immediate, delayed = [callback for _, callback in callbacks]
-            immediate()
-            delayed()
+            # Both directions schedule a pair: AppKit drops the menu-bar slot
+            # on the .regular -> .accessory demotion as well as the promotion.
+            self.assertEqual([delay for delay, _ in callbacks], [0, 250, 0, 250])
+            stale_immediate, stale_delayed, live_immediate, live_delayed = [
+                callback for _, callback in callbacks
+            ]
+            # The second flip bumped the generation, so the first pair must be
+            # inert -- otherwise a stale callback tears down a newer item.
+            stale_immediate()
+            stale_delayed()
+            self.assertEqual(installer.call_args_list, [])
+            live_immediate()
+            live_delayed()
 
-        installer.assert_not_called()
+        installer.assert_called_once_with("menu", ANY)
         self.assertEqual(main_qml._MACOS_STATUS_ITEM_REINSTALL_GENERATION, 12)
+
+    def test_demotion_to_accessory_also_reinstalls_status_item(self):
+        """Hiding the window demotes .regular -> .accessory, which detaches the
+        status item just as the promotion does. Handling only the promotion
+        left the icon gone the first time the window was dismissed."""
+        main_qml._MACOS_STATUS_ITEM_PARAMS = ("menu", lambda: None)
+        main_qml._MACOS_ACTIVATION_POLICY_REGULAR = True
+        appkit = SimpleNamespace(
+            NSApplicationActivationPolicyRegular="regular",
+            NSApplicationActivationPolicyAccessory="accessory",
+            NSApp=SimpleNamespace(setActivationPolicy_=MagicMock()),
+        )
+        callbacks = []
+
+        with (
+            patch.object(main_qml.sys, "platform", "darwin"),
+            patch.object(main_qml, "_macos_appkit", return_value=appkit),
+            patch.object(main_qml, "_install_macos_dock_icon") as dock_icon,
+            patch.object(main_qml, "_schedule_macos_dock_icon_refresh"),
+            patch.object(
+                main_qml.QTimer,
+                "singleShot",
+                side_effect=lambda delay, callback: callbacks.append((delay, callback)),
+            ),
+        ):
+            main_qml._set_macos_activation_policy(regular=False)
+
+        self.assertEqual([delay for delay, _ in callbacks], [0, 250])
+        # The Dock icon is a promotion-only concern; only the status item needs
+        # re-installing on the way back down to .accessory.
+        dock_icon.assert_not_called()
 
     def test_failed_initial_native_install_leaves_qt_fallback_unarmed(self):
         main_qml._MACOS_STATUS_ITEM_PARAMS = None
