@@ -382,6 +382,8 @@ if sys.platform == "darwin":
         _iokit.IOHIDManagerSetDeviceMatching.argtypes = [c_void_p, c_void_p]
         _iokit.IOHIDManagerOpen.argtypes = [c_void_p, c_int]
         _iokit.IOHIDManagerOpen.restype = c_int
+        _iokit.IOHIDManagerClose.argtypes = [c_void_p, c_int]
+        _iokit.IOHIDManagerClose.restype = c_int
         _iokit.IOHIDManagerCopyDevices.argtypes = [c_void_p]
         _iokit.IOHIDManagerCopyDevices.restype = c_void_p
 
@@ -508,6 +510,23 @@ if _MAC_NATIVE_OK:
             finally:
                 _cf.CFRelease(key)
 
+        @staticmethod
+        def _close_manager(manager):
+            """Balance IOHIDManagerOpen before releasing the CF wrapper.
+
+            IOHIDManagerClose releases the IOKit user-client (its Mach ports)
+            and the enclosed-device opens; a bare CFRelease does not, so the
+            manager object and roughly two Mach ports leak on every open. This
+            was the dominant leak in issue #238: tens of thousands of live
+            IOHIDManager objects after a day of reconnect churn."""
+            if not manager:
+                return
+            try:
+                _iokit.IOHIDManagerClose(manager, 0)
+            except Exception:
+                pass
+            _cf.CFRelease(manager)
+
         @classmethod
         def enumerate_infos(cls):
             infos = []
@@ -570,12 +589,24 @@ if _MAC_NATIVE_OK:
                 if matching:
                     _cf.CFRelease(matching)
                 if manager:
-                    _cf.CFRelease(manager)
+                    cls._close_manager(manager)
                 for item in matching_refs:
                     _cf.CFRelease(item)
             return infos
 
         def open(self):
+            """Exception-safe open. On any partial failure, release every
+            CoreFoundation object allocated so far so a failed open cannot
+            leak the manager, matching dict, matching refs, or the retained
+            device. ``close()`` is idempotent and guards each field, so a
+            failed open is safe to unwind through it (issue #238)."""
+            try:
+                self._open()
+            except Exception:
+                self.close()
+                raise
+
+        def _open(self):
             keys = [
                 self._cfstring("VendorID"),
                 self._cfstring("ProductID"),
@@ -672,7 +703,7 @@ if _MAC_NATIVE_OK:
                 _cf.CFRelease(self._matching)
                 self._matching = None
             if self._manager:
-                _cf.CFRelease(self._manager)
+                self._close_manager(self._manager)
                 self._manager = None
             for item in self._matching_refs:
                 _cf.CFRelease(item)
@@ -739,6 +770,15 @@ if _MAC_NATIVE_OK:
                     if deadline is not None:
                         continue
                     return b""
+
+        def __del__(self):
+            # Backstop: an instance discarded without an explicit close() (for
+            # example a caller that drops a half-open device) must not leak
+            # IOKit resources. close() is idempotent; never raise from __del__.
+            try:
+                self.close()
+            except Exception:
+                pass
 
 # ── Constants ─────────────────────────────────────────────────────
 LOGI_VID       = 0x046D
