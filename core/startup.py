@@ -1,5 +1,12 @@
 """Cross-platform login startup helpers for Windows, macOS, and Linux."""
 
+# This module is imported by scripts/build_and_install.py, which runs under
+# whatever `python3` is first on PATH -- on a stock macOS that is the Xcode
+# Command Line Tools' 3.9, which cannot parse `str | None` at import time.
+# Deferring annotation evaluation keeps the installer working there; the
+# sibling installer modules already do the same.
+from __future__ import annotations
+
 import os
 import plistlib
 import shutil
