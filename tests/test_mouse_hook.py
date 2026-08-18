@@ -211,12 +211,17 @@ class BaseMouseHookOnReleaseCaptureTests(unittest.TestCase):
     def _dispatched(self, hook):
         return [c.args[0] for c in hook._dispatch.call_args_list]
 
-    def test_hid_rawxy_swipe_resolves_on_release(self):
+    def test_hid_rawxy_decisive_swipe_fires_live_mid_hold(self):
+        # A committed stroke lands while the finger is still down -- users
+        # expect the action the moment they slide, not on release.
         hook = self._hook()
         hook._begin_gesture_capture("HID gesture")
         hook._accumulate_gesture_delta(-150, 0, "hid_rawxy")
-        # Nothing fires mid-hold; the swipe lands only on release.
-        self.assertEqual(hook._dispatch.call_count, 0)
+        self.assertEqual(
+            [e.event_type for e in self._dispatched(hook)],
+            [MouseEvent.GESTURE_SWIPE_LEFT],
+        )
+        # Release is a no-op: one motion must never dispatch twice.
         hook._end_gesture_capture("HID gesture")
         self.assertEqual(
             [e.event_type for e in self._dispatched(hook)],
@@ -270,34 +275,53 @@ class BaseMouseHookOnReleaseCaptureTests(unittest.TestCase):
             [MouseEvent.GESTURE_CLICK],
         )
 
-    def test_hid_rawxy_nothing_fires_until_release(self):
-        # A near-diagonal opening must NOT fire a random direction mid-hold;
-        # nothing dispatches until release, then the net direction wins.
-        # net = (140, 50) -> RIGHT.
+    def test_hid_rawxy_ambiguous_opening_does_not_fire(self):
+        # A near-diagonal opening must NOT commit a direction: it is exactly
+        # the wobble that made the first live implementation pick wrong. It
+        # fires only once the stroke separates. net = (140, 50) -> RIGHT.
         hook = self._hook()
         hook._begin_gesture_capture("HID gesture")
         hook._accumulate_gesture_delta(60, 50, "hid_rawxy")  # ambiguous
         self.assertEqual(hook._dispatch.call_count, 0)
-        hook._accumulate_gesture_delta(80, 0, "hid_rawxy")   # now nets right
-        self.assertEqual(hook._dispatch.call_count, 0)       # still nothing live
-        hook._end_gesture_capture("HID gesture")
+        hook._accumulate_gesture_delta(80, 0, "hid_rawxy")   # now clearly right
         self.assertEqual(
             [e.event_type for e in self._dispatched(hook)],
             [MouseEvent.GESTURE_SWIPE_RIGHT],
         )
+        hook._end_gesture_capture("HID gesture")
+        self.assertEqual(hook._dispatch.call_count, 1)
 
-    def test_hid_rawxy_back_and_forth_nets_to_tap(self):
-        # No premature latch: a stroke that goes right then fully back left
-        # nets to ~zero displacement, so it resolves as a tap, not a swipe.
-        # (Under the old live-fire it wrongly fired RIGHT and latched.)
+    def test_hid_rawxy_small_back_and_forth_nets_to_tap(self):
+        # A wobble that never passes the live gate still resolves from net
+        # displacement on release -- so a jittery press is a tap, not a swipe.
         hook = self._hook()
         hook._begin_gesture_capture("HID gesture")
-        hook._accumulate_gesture_delta(120, 0, "hid_rawxy")
-        hook._accumulate_gesture_delta(-120, 0, "hid_rawxy")
+        hook._accumulate_gesture_delta(60, 0, "hid_rawxy")
+        self.assertEqual(hook._dispatch.call_count, 0)
+        hook._accumulate_gesture_delta(-60, 0, "hid_rawxy")
         hook._end_gesture_capture("HID gesture")
         self.assertEqual(
             [e.event_type for e in self._dispatched(hook)],
             [MouseEvent.GESTURE_CLICK],
+        )
+
+    def test_hid_rawxy_committed_stroke_is_not_undone_by_returning(self):
+        # Deliberate behaviour change: once a stroke commits mid-hold it has
+        # already fired, so sliding back cannot retract it. This is what native
+        # Logitech does, and the cost of acting while the finger is still down.
+        hook = self._hook()
+        hook._begin_gesture_capture("HID gesture")
+        hook._accumulate_gesture_delta(120, 0, "hid_rawxy")
+        self.assertEqual(
+            [e.event_type for e in self._dispatched(hook)],
+            [MouseEvent.GESTURE_SWIPE_RIGHT],
+        )
+        hook._accumulate_gesture_delta(-120, 0, "hid_rawxy")
+        hook._end_gesture_capture("HID gesture")
+        # Still exactly one event: the latch prevents a second dispatch.
+        self.assertEqual(
+            [e.event_type for e in self._dispatched(hook)],
+            [MouseEvent.GESTURE_SWIPE_RIGHT],
         )
 
     def test_direction_disabled_resolves_to_click(self):

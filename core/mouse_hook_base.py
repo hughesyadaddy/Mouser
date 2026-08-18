@@ -523,6 +523,48 @@ class BaseMouseHook:
     #: this source exists to fix.
     GESTURE_SOURCE_SCALE = {"kvm_pointer": 3.0}
 
+    #: How far the dominant axis must lead the other before a swipe may fire
+    #: mid-hold, and how much further it must travel than the release
+    #: threshold. Both gates are needed, and dominance alone is not enough:
+    #: a stroke that opens (60, -10) on its way to a net (50, -180) has a
+    #: dominant axis leading 6:1 on its FIRST report, so a ratio test commits
+    #: rightward on the opening leg of an upward swipe -- the precise bug that
+    #: got the earlier live implementation reverted. Requiring the dominant
+    #: axis to also pass GESTURE_LIVE_THRESHOLD_FACTOR x the release threshold
+    #: means an opening leg is too short to win, while a deliberate swipe still
+    #: commits well before the finger lifts. Strokes that never separate this
+    #: cleanly do not fire live at all; they resolve on release from net
+    #: displacement, exactly as before.
+    GESTURE_LIVE_DOMINANCE = 1.6
+    GESTURE_LIVE_THRESHOLD_FACTOR = 2.0
+
+
+    def _classify_gesture_live(self, delta_x, delta_y):
+        """Direction for a mid-hold commit, or None while the stroke is still
+        ambiguous.
+
+        Stricter than :meth:`_classify_gesture` on purpose. That one runs on
+        release, where the net displacement of the finished stroke is known and
+        a plain 45-degree split is the right call. Mid-hold there is no such
+        certainty: the opening jitter of a vertical swipe routinely shows more
+        horizontal travel than vertical for the first few reports. Committing
+        there is what made the earlier live implementation pick the wrong
+        direction, so this additionally demands the dominant axis lead the
+        other by GESTURE_LIVE_DOMINANCE before it will resolve.
+        """
+        scale = self.GESTURE_SOURCE_SCALE.get(self._gesture_input_source, 1.0)
+        abs_x = abs(delta_x) * scale
+        abs_y = abs(delta_y) * scale
+
+        dominant, other = (abs_x, abs_y) if abs_x >= abs_y else (abs_y, abs_x)
+        if dominant < self._gesture_threshold * self.GESTURE_LIVE_THRESHOLD_FACTOR:
+            return None
+        # `other` can be 0 on a perfectly straight stroke -- that is maximally
+        # unambiguous, so treat it as passing rather than dividing by zero.
+        if other > 0 and dominant < other * self.GESTURE_LIVE_DOMINANCE:
+            return None
+        return self._classify_gesture(delta_x, delta_y)
+
     def _classify_gesture(self, delta_x, delta_y):
         """Map the net displacement of a completed capture to a swipe
         direction, or None when the stroke reads as a tap.
@@ -555,9 +597,12 @@ class BaseMouseHook:
 
     def _accumulate_gesture_delta(self, delta_x, delta_y, source):
         """Fold one movement report into the running net displacement for the
-        current hold. The swipe direction is resolved once, on release, from
-        the net displacement (see _end_gesture_capture) -- Logi Options'
-        OnRelease semantics. Nothing dispatches from here."""
+        current hold.
+
+        A swipe dispatches from here the moment the stroke becomes
+        unambiguous; ambiguous strokes still resolve on release. Dispatch runs
+        outside the lock, matching _end_gesture_capture."""
+        live_event = None
         with self._gesture_lock:
             if not (self._gesture_direction_enabled and self._gesture_active):
                 return
@@ -609,14 +654,67 @@ class BaseMouseHook:
                 }
             )
 
-            # Resolve the swipe on RELEASE from the NET displacement of the
-            # whole stroke (see _end_gesture_capture) -- NOT live on the first
-            # axis to cross the threshold. Firing live latched the direction
-            # on the few units of sideways jitter every swipe opens with, so
-            # the horizontal axis almost always won first: it ate up/down
-            # swipes and repeated the prior direction on quick strokes. The
-            # net displacement over the full hold reflects the user's intent.
-            # This is the Logi Options behaviour (commit on release).
+            # Fire mid-hold as soon as the stroke is unambiguous, so a
+            # hold-and-slide lands while the finger is still down -- the
+            # behaviour Logi Options has and users expect. Waiting for release
+            # made every gesture feel like it needed a deliberate pause.
+            #
+            # An earlier live implementation was reverted because it committed
+            # on the first axis merely to cross the threshold: swipes open with
+            # a few units of sideways jitter, so horizontal won the race and ate
+            # up/down swipes. _classify_gesture_live additionally requires the
+            # dominant axis to LEAD the other by GESTURE_LIVE_DOMINANCE, which
+            # is what separates a committed stroke from that opening wobble.
+            #
+            # Strokes that never separate cleanly do not fire here at all; they
+            # still resolve on release from net displacement, so the ambiguous
+            # case keeps exactly the old behaviour. _gesture_fired latches so a
+            # single motion can never dispatch twice (see _end_gesture_capture).
+            # Only the authoritative HID++ rawXY feed may commit mid-hold. An
+            # OS-level fallback segment can be superseded by rawXY arriving
+            # later in the same hold (see the promotion branch above), and a
+            # live fire cannot be taken back -- firing from event_tap then
+            # promoting to rawXY dispatches two swipes for one stroke.
+            if not self._gesture_fired and source == "hid_rawxy":
+                live_swipe = self._classify_gesture_live(
+                    self._gesture_delta_x, self._gesture_delta_y
+                )
+                if live_swipe is not None:
+                    self._gesture_fired = True
+                    live_dx = self._gesture_delta_x
+                    live_dy = self._gesture_delta_y
+                    live_source = self._gesture_input_source
+                    self._emit_debug(
+                        f"Gesture fired live {live_swipe} "
+                        f"dx={live_dx} dy={live_dy} source={live_source}"
+                    )
+                    print(
+                        f"[Gesture] decoded {live_swipe} live "
+                        f"(dx={live_dx:.0f} dy={live_dy:.0f}, src={live_source})"
+                    )
+                    self._emit_gesture_event(
+                        {
+                            "type": "detected",
+                            "event_name": live_swipe,
+                            "source": live_source,
+                            "dx": live_dx,
+                            "dy": live_dy,
+                            "live": True,
+                        }
+                    )
+                    live_event = MouseEvent(
+                        live_swipe,
+                        {
+                            "delta_x": live_dx,
+                            "delta_y": live_dy,
+                            "source": live_source,
+                        },
+                    )
+
+        # Outside the lock: _dispatch runs user actions (key injection, app
+        # switches) and must never hold the gesture lock while doing so.
+        if live_event is not None:
+            self._dispatch(live_event)
 
     def _begin_gesture_capture(self, source_label):
         """Open a capture on gesture-button press (HID++ divert or the
