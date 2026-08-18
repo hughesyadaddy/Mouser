@@ -216,7 +216,11 @@ class BaseMouseHookOnReleaseCaptureTests(unittest.TestCase):
         # expect the action the moment they slide, not on release.
         hook = self._hook()
         hook._begin_gesture_capture("HID gesture")
+        # First qualifying report proposes a direction but does not commit it.
         hook._accumulate_gesture_delta(-150, 0, "hid_rawxy")
+        self.assertEqual(hook._dispatch.call_count, 0)
+        # The direction still holds as the stroke advances -> commit, mid-hold.
+        hook._accumulate_gesture_delta(-40, 0, "hid_rawxy")
         self.assertEqual(
             [e.event_type for e in self._dispatched(hook)],
             [MouseEvent.GESTURE_SWIPE_LEFT],
@@ -283,7 +287,32 @@ class BaseMouseHookOnReleaseCaptureTests(unittest.TestCase):
         hook._begin_gesture_capture("HID gesture")
         hook._accumulate_gesture_delta(60, 50, "hid_rawxy")  # ambiguous
         self.assertEqual(hook._dispatch.call_count, 0)
-        hook._accumulate_gesture_delta(80, 0, "hid_rawxy")   # now clearly right
+        hook._accumulate_gesture_delta(80, 0, "hid_rawxy")   # separates right
+        self.assertEqual(hook._dispatch.call_count, 0)
+        hook._accumulate_gesture_delta(40, 0, "hid_rawxy")   # holds -> commit
+        self.assertEqual(
+            [e.event_type for e in self._dispatched(hook)],
+            [MouseEvent.GESTURE_SWIPE_RIGHT],
+        )
+        hook._end_gesture_capture("HID gesture")
+        self.assertEqual(hook._dispatch.call_count, 1)
+
+    def test_hid_rawxy_right_swipe_opening_upward_resolves_right(self):
+        # Reported bug: "if I go to the right, mostly but a little up, it thinks
+        # I'm going up". Real strokes arc -- the finger lifts before it travels.
+        # The opening leg here is dominantly vertical (20, -110): 110 clears the
+        # live threshold and leads 5.5:1, so a first-past-the-post commit fires
+        # UP on a stroke the user means as RIGHT. Requiring the direction to
+        # survive further travel lets the arc lose to the real stroke.
+        hook = self._hook()
+        hook._begin_gesture_capture("HID gesture")
+        hook._accumulate_gesture_delta(20, -110, "hid_rawxy")   # arc proposes UP
+        self.assertEqual(hook._dispatch.call_count, 0)
+        hook._accumulate_gesture_delta(100, -30, "hid_rawxy")   # ambiguous again
+        self.assertEqual(hook._dispatch.call_count, 0)
+        hook._accumulate_gesture_delta(130, -10, "hid_rawxy")   # proposes RIGHT
+        self.assertEqual(hook._dispatch.call_count, 0)
+        hook._accumulate_gesture_delta(50, 0, "hid_rawxy")      # holds -> commit
         self.assertEqual(
             [e.event_type for e in self._dispatched(hook)],
             [MouseEvent.GESTURE_SWIPE_RIGHT],
@@ -312,11 +341,12 @@ class BaseMouseHookOnReleaseCaptureTests(unittest.TestCase):
         hook = self._hook()
         hook._begin_gesture_capture("HID gesture")
         hook._accumulate_gesture_delta(120, 0, "hid_rawxy")
+        hook._accumulate_gesture_delta(40, 0, "hid_rawxy")
         self.assertEqual(
             [e.event_type for e in self._dispatched(hook)],
             [MouseEvent.GESTURE_SWIPE_RIGHT],
         )
-        hook._accumulate_gesture_delta(-120, 0, "hid_rawxy")
+        hook._accumulate_gesture_delta(-160, 0, "hid_rawxy")
         hook._end_gesture_capture("HID gesture")
         # Still exactly one event: the latch prevents a second dispatch.
         self.assertEqual(

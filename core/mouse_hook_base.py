@@ -51,6 +51,9 @@ class BaseMouseHook:
         # Latched once a swipe fires live mid-hold, so a single hold cannot
         # fire twice and the button release becomes a no-op.
         self._gesture_fired = False
+        # Direction awaiting confirmation, and the travel it was first seen at.
+        self._gesture_live_candidate = None
+        self._gesture_live_candidate_travel = 0.0
         # Guards the capture state above: the HID++ listener thread, the
         # OS-level hook thread, and the remote bridge can all touch an
         # in-flight capture concurrently.
@@ -505,6 +508,8 @@ class BaseMouseHook:
         self._gesture_delta_y = 0.0
         self._gesture_input_source = None
         self._gesture_fired = False
+        self._gesture_live_candidate = None
+        self._gesture_live_candidate_travel = 0.0
 
     def _finish_gesture_tracking(self):
         self._gesture_tracking = False
@@ -512,6 +517,8 @@ class BaseMouseHook:
         self._gesture_delta_y = 0.0
         self._gesture_input_source = None
         self._gesture_fired = False
+        self._gesture_live_candidate = None
+        self._gesture_live_candidate_travel = 0.0
 
     #: Per-source scaling applied before the threshold test. The threshold is
     #: expressed in HID++ rawXY sensor counts, so any source measuring in
@@ -537,6 +544,45 @@ class BaseMouseHook:
     #: displacement, exactly as before.
     GESTURE_LIVE_DOMINANCE = 1.6
     GESTURE_LIVE_THRESHOLD_FACTOR = 2.0
+
+    #: Extra travel, as a fraction of the release threshold, that a direction
+    #: must survive before it commits. Without it the first sample to clear the
+    #: gates wins outright, and a swipe that opens with an arc commits to the
+    #: arc: a rightward stroke that begins (20, 110) shows a dominant axis of
+    #: 110 leading 5.5:1, so it latches "up" before any rightward travel exists.
+    #: Requiring the SAME direction to still hold after the stroke advances
+    #: another half-threshold lets the arc fall away -- it stops being dominant
+    #: as the real direction accumulates -- while a deliberate swipe, whose
+    #: direction does not change, confirms on the very next report and still
+    #: lands while the finger is down.
+    GESTURE_LIVE_CONFIRM_TRAVEL_FACTOR = 0.5
+
+    def _evaluate_live_commit(self, delta_x, delta_y):
+        """Direction to commit mid-hold, or None while the stroke is unproven.
+
+        Wraps :meth:`_classify_gesture_live` with a persistence requirement so
+        a momentary lead cannot decide the whole gesture.
+        """
+        candidate = self._classify_gesture_live(delta_x, delta_y)
+        if candidate is None:
+            # Ambiguous again: drop any pending candidate so an arc that briefly
+            # dominated cannot resume its streak once the real stroke takes over.
+            self._gesture_live_candidate = None
+            self._gesture_live_candidate_travel = 0.0
+            return None
+
+        scale = self.GESTURE_SOURCE_SCALE.get(self._gesture_input_source, 1.0)
+        travel = max(abs(delta_x), abs(delta_y)) * scale
+
+        if candidate != self._gesture_live_candidate:
+            self._gesture_live_candidate = candidate
+            self._gesture_live_candidate_travel = travel
+            return None
+
+        confirm = self._gesture_threshold * self.GESTURE_LIVE_CONFIRM_TRAVEL_FACTOR
+        if travel - self._gesture_live_candidate_travel < confirm:
+            return None
+        return candidate
 
 
     def _classify_gesture_live(self, delta_x, delta_y):
@@ -676,7 +722,7 @@ class BaseMouseHook:
             # live fire cannot be taken back -- firing from event_tap then
             # promoting to rawXY dispatches two swipes for one stroke.
             if not self._gesture_fired and source == "hid_rawxy":
-                live_swipe = self._classify_gesture_live(
+                live_swipe = self._evaluate_live_commit(
                     self._gesture_delta_x, self._gesture_delta_y
                 )
                 if live_swipe is not None:

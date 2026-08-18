@@ -322,6 +322,10 @@ class MouseHook(BaseMouseHook):
                     }
                 )
                 if self._gesture_input_source == "hid_rawxy":
+                    # Dropping the event stops the pointer; re-pin as well so
+                    # drift from before the capture engaged cannot persist.
+                    if self._gesture_anchor is not None:
+                        self._warp_cursor(self._gesture_anchor)
                     return None
                 self._accumulate_gesture_delta(
                     Quartz.CGEventGetIntegerValueField(
@@ -488,12 +492,18 @@ class MouseHook(BaseMouseHook):
         self._release_gesture_anchor()
 
     def _arm_gesture_anchor(self):
-        """Pin the cursor for the event-tap gesture path. No-op when the
-        device streams rawXY (firmware pins the cursor itself) so we never
-        fight a feed that already keeps the pointer still."""
-        if getattr(self._hid_gesture, "_rawxy_enabled", False):
-            self._gesture_anchor = None
-            return
+        """Pin the cursor at the moment the gesture button goes down.
+
+        This used to no-op whenever the device streamed rawXY, on the premise
+        that the firmware already held the pointer still. That premise only
+        covers the Sense Panel's own touch coordinates. Moving the mouse BODY
+        still drives the pointer, and nothing pins it during the window between
+        the physical press and _gesture_active flipping -- so grabbing the pad
+        mid-movement let the cursor coast before the gesture took hold. Pinning
+        here is safe on the rawXY path too: panel motion never reaches the tap
+        (it returns early) and body motion is dropped once the capture is live,
+        so there is no feed to fight -- only the pre-capture drift to undo.
+        """
         if not self._gesture_direction_enabled:
             self._gesture_anchor = None
             return
