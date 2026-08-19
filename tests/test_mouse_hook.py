@@ -216,11 +216,11 @@ class BaseMouseHookOnReleaseCaptureTests(unittest.TestCase):
         # expect the action the moment they slide, not on release.
         hook = self._hook()
         hook._begin_gesture_capture("HID gesture")
-        # First qualifying report proposes a direction but does not commit it.
+        # A fast flick arrives as a SINGLE report. Requiring a second sample to
+        # confirm made the decision depend on HID report count -- a function of
+        # polling rate and hand speed, not intent -- so the faster the swipe,
+        # the more likely it missed. Distance decides, not sample count.
         hook._accumulate_gesture_delta(-150, 0, "hid_rawxy")
-        self.assertEqual(hook._dispatch.call_count, 0)
-        # The direction still holds as the stroke advances -> commit, mid-hold.
-        hook._accumulate_gesture_delta(-40, 0, "hid_rawxy")
         self.assertEqual(
             [e.event_type for e in self._dispatched(hook)],
             [MouseEvent.GESTURE_SWIPE_LEFT],
@@ -287,9 +287,7 @@ class BaseMouseHookOnReleaseCaptureTests(unittest.TestCase):
         hook._begin_gesture_capture("HID gesture")
         hook._accumulate_gesture_delta(60, 50, "hid_rawxy")  # ambiguous
         self.assertEqual(hook._dispatch.call_count, 0)
-        hook._accumulate_gesture_delta(80, 0, "hid_rawxy")   # separates right
-        self.assertEqual(hook._dispatch.call_count, 0)
-        hook._accumulate_gesture_delta(40, 0, "hid_rawxy")   # holds -> commit
+        hook._accumulate_gesture_delta(80, 0, "hid_rawxy")   # separates -> commit
         self.assertEqual(
             [e.event_type for e in self._dispatched(hook)],
             [MouseEvent.GESTURE_SWIPE_RIGHT],
@@ -297,28 +295,41 @@ class BaseMouseHookOnReleaseCaptureTests(unittest.TestCase):
         hook._end_gesture_capture("HID gesture")
         self.assertEqual(hook._dispatch.call_count, 1)
 
-    def test_hid_rawxy_right_swipe_opening_upward_resolves_right(self):
-        # Reported bug: "if I go to the right, mostly but a little up, it thinks
-        # I'm going up". Real strokes arc -- the finger lifts before it travels.
-        # The opening leg here is dominantly vertical (20, -110): 110 clears the
-        # live threshold and leads 5.5:1, so a first-past-the-post commit fires
-        # UP on a stroke the user means as RIGHT. Requiring the direction to
-        # survive further travel lets the arc lose to the real stroke.
+    def test_near_diagonal_stroke_fires_nothing_rather_than_guessing(self):
+        # Real capture from the field: 47 degrees, axes 7% apart. The release
+        # path used to pick an axis with a bare abs_x >= abs_y, so this resolved
+        # "up" and threw the user into Mission Control. A stroke this close to
+        # the diagonal has no honest answer -- decline it.
         hook = self._hook()
         hook._begin_gesture_capture("HID gesture")
-        hook._accumulate_gesture_delta(20, -110, "hid_rawxy")   # arc proposes UP
+        hook._accumulate_gesture_delta(11433, -12248, "hid_rawxy")
+        hook._end_gesture_capture("HID gesture")
         self.assertEqual(hook._dispatch.call_count, 0)
-        hook._accumulate_gesture_delta(100, -30, "hid_rawxy")   # ambiguous again
-        self.assertEqual(hook._dispatch.call_count, 0)
-        hook._accumulate_gesture_delta(130, -10, "hid_rawxy")   # proposes RIGHT
-        self.assertEqual(hook._dispatch.call_count, 0)
-        hook._accumulate_gesture_delta(50, 0, "hid_rawxy")      # holds -> commit
+
+    def test_ambiguous_stroke_is_not_reported_as_a_tap(self):
+        # It must not collapse into GESTURE_CLICK either: a 16,000-count sweep
+        # is plainly deliberate, and firing the tap binding for it is just a
+        # different wrong answer.
+        hook = self._hook()
+        hook._begin_gesture_capture("HID gesture")
+        hook._accumulate_gesture_delta(11433, -12248, "hid_rawxy")
+        hook._end_gesture_capture("HID gesture")
+        self.assertNotIn(
+            MouseEvent.GESTURE_CLICK,
+            [e.event_type for e in self._dispatched(hook)],
+        )
+
+    def test_dominant_stroke_just_past_the_cone_still_fires(self):
+        # The cut only rejects genuine diagonals. 1.65:1 was the tightest ratio
+        # among correct decisions in the field log, and it must survive.
+        hook = self._hook()
+        hook._begin_gesture_capture("HID gesture")
+        hook._accumulate_gesture_delta(1084, -658, "hid_rawxy")
+        hook._end_gesture_capture("HID gesture")
         self.assertEqual(
             [e.event_type for e in self._dispatched(hook)],
             [MouseEvent.GESTURE_SWIPE_RIGHT],
         )
-        hook._end_gesture_capture("HID gesture")
-        self.assertEqual(hook._dispatch.call_count, 1)
 
     def test_hid_rawxy_small_back_and_forth_nets_to_tap(self):
         # A wobble that never passes the live gate still resolves from net
