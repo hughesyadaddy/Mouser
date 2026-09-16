@@ -101,6 +101,51 @@ def run_powershell(command: str) -> None:
         raise RuntimeError(f"PowerShell command failed ({result.returncode})")
 
 
+def sign_windows_dist(dist_root: Path) -> bool:
+    """Authenticode-sign every binary under *dist_root* with the fleet cert.
+
+    Delegates to deskflow's ``scripts/sign-windows.ps1`` (see
+    ``install_lifecycle.deskflow_root``), which signs each ``.exe`` / ``.dll``
+    with the certificate named by ``DESKFLOW_SIGN_THUMBPRINT`` and throws when
+    that variable is unset or ``signtool`` is missing. Those throws surface
+    here as ``RuntimeError`` so the build stops rather than installing an
+    unsigned tree. Returns ``False`` (and signs nothing) only when the deskflow
+    script is not present on this machine, and does nothing off Windows.
+    """
+    if sys.platform != "win32":
+        return False
+
+    from scripts.install_lifecycle import windows_sign_script
+
+    script = windows_sign_script()
+    if script is None:
+        print(
+            "[!] deskflow scripts/sign-windows.ps1 not found "
+            "(set DESKFLOW_ROOT); dist left unsigned."
+        )
+        return False
+
+    args = [
+        "powershell",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(script),
+        "-Root",
+        str(dist_root),
+    ]
+    print("+ " + " ".join(args))
+    result = subprocess.run(args, text=True, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Windows code signing failed ({result.returncode}) via {script}. "
+            "DESKFLOW_SIGN_THUMBPRINT must name an installed certificate and "
+            "signtool.exe must be on PATH."
+        )
+    return True
+
+
 def create_shortcut(shortcut_path: Path, target: Path, working_dir: Path) -> None:
     shortcut_path.parent.mkdir(parents=True, exist_ok=True)
     command = (

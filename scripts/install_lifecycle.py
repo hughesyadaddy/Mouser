@@ -16,6 +16,33 @@ WINDOWS_EXECUTABLE = "Mouser.exe"
 DEFAULT_MACOS_INSTALL_DIR = Path("/Applications")
 
 
+def deskflow_root() -> Path:
+    """Checkout of the deskflow repo that hosts the shared fleet tooling.
+
+    Mouser borrows two pieces of fleet infrastructure from deskflow:
+    ``tools/fleet-gui-exec.py`` (run a command in the console session so it can
+    reach the login keychain) and ``scripts/sign-windows.ps1`` (signtool
+    wrapper keyed by ``DESKFLOW_SIGN_THUMBPRINT``). ``DESKFLOW_ROOT`` overrides
+    the default sibling checkout.
+    """
+    override = os.environ.get("DESKFLOW_ROOT", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / "Desktop" / "deskflow"
+
+
+def fleet_gui_exec_script() -> Path | None:
+    """Path to deskflow's ``fleet-gui-exec.py`` when that checkout has it."""
+    candidate = deskflow_root() / "tools" / "fleet-gui-exec.py"
+    return candidate if candidate.is_file() else None
+
+
+def windows_sign_script() -> Path | None:
+    """Path to deskflow's ``sign-windows.ps1`` when that checkout has it."""
+    candidate = deskflow_root() / "scripts" / "sign-windows.ps1"
+    return candidate if candidate.is_file() else None
+
+
 def restart_enabled() -> bool:
     """True unless MOUSER_RESTART is set to a falsey string."""
     value = (os.environ.get("MOUSER_RESTART") or "1").strip().lower()

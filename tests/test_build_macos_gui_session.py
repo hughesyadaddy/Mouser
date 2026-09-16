@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -83,6 +84,77 @@ class BuildCommandTests(unittest.TestCase):
     def test_quotes_arguments(self):
         cmd = gui.build_command(["--flag", "a b"], "/tmp/x.log")
         self.assertIn("'a b'", cmd)
+
+
+class FleetGuiExecDelegationTests(unittest.TestCase):
+    """Over SSH the build is handed to deskflow's shared fleet-gui-exec when present."""
+
+    def test_no_delegation_when_deskflow_tool_is_absent(self):
+        with mock.patch.object(gui, "fleet_gui_exec_script", return_value=None):
+            self.assertIsNone(gui.fleet_gui_exec_command(["--dry-run"]))
+
+    def test_delegates_with_double_dash_and_build_script(self):
+        tool = Path("/opt/deskflow/tools/fleet-gui-exec.py")
+        with mock.patch.object(gui, "fleet_gui_exec_script", return_value=tool):
+            cmd = gui.fleet_gui_exec_command(["--dry-run"])
+        self.assertEqual(cmd[1], str(tool))
+        self.assertEqual(cmd[2], "--")
+        self.assertEqual(cmd[3], "python3")
+        self.assertEqual(cmd[4], str(gui.ROOT / "scripts" / "build_and_install.py"))
+        self.assertEqual(cmd[-1], "--dry-run")
+
+    def test_delegated_command_never_forces_adhoc_signing(self):
+        tool = Path("/opt/deskflow/tools/fleet-gui-exec.py")
+        with mock.patch.object(gui, "fleet_gui_exec_script", return_value=tool):
+            cmd = gui.fleet_gui_exec_command([])
+        self.assertNotIn("MOUSER_SIGN_IDENTITY=-", " ".join(cmd))
+        self.assertNotIn("-", [part for part in cmd if part != "--"])
+
+    def test_deskflow_root_env_override_locates_the_tool(self):
+        from scripts import install_lifecycle
+        with tempfile.TemporaryDirectory() as tmp:
+            tool = Path(tmp) / "tools" / "fleet-gui-exec.py"
+            tool.parent.mkdir(parents=True)
+            tool.write_text("#!/usr/bin/env python3\n")
+            with mock.patch.dict(os.environ, {"DESKFLOW_ROOT": tmp}, clear=False):
+                self.assertEqual(install_lifecycle.fleet_gui_exec_script(), tool)
+            with mock.patch.dict(os.environ, {"DESKFLOW_ROOT": str(Path(tmp) / "nope")}, clear=False):
+                self.assertIsNone(install_lifecycle.fleet_gui_exec_script())
+
+
+class MainRoutingTests(unittest.TestCase):
+    def _completed(self, code):
+        return subprocess.CompletedProcess(args=[], returncode=code, stdout="", stderr="")
+
+    def test_routed_build_uses_fleet_gui_exec_when_present(self):
+        tool = Path("/opt/deskflow/tools/fleet-gui-exec.py")
+        with mock.patch.object(gui, "should_route_through_gui_session", return_value=True), \
+             mock.patch.object(gui, "fleet_gui_exec_script", return_value=tool), \
+             mock.patch.object(gui, "_osascript_run") as osascript, \
+             mock.patch.object(gui.subprocess, "run", return_value=self._completed(7)) as run:
+            self.assertEqual(gui.main(["--dry-run"]), 7)
+        osascript.assert_not_called()
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[1], str(tool))
+        self.assertIn("--dry-run", argv)
+
+    def test_routed_build_falls_back_to_terminal_without_deskflow(self):
+        with mock.patch.object(gui, "should_route_through_gui_session", return_value=True), \
+             mock.patch.object(gui, "fleet_gui_exec_script", return_value=None), \
+             mock.patch.object(gui, "console_user", return_value="alex"), \
+             mock.patch.object(gui, "_osascript_run") as osascript, \
+             mock.patch.object(gui, "_wait_for_exit", return_value=3):
+            self.assertEqual(gui.main([]), 3)
+        osascript.assert_called_once()
+        self.assertNotIn("MOUSER_SIGN_IDENTITY=-", osascript.call_args.args[0])
+
+    def test_unrouted_build_runs_in_place(self):
+        with mock.patch.object(gui, "should_route_through_gui_session", return_value=False), \
+             mock.patch.object(gui, "fleet_gui_exec_script", return_value=Path("/x")), \
+             mock.patch.object(gui.subprocess, "run", return_value=self._completed(0)) as run:
+            self.assertEqual(gui.main(["--dry-run"]), 0)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[1], str(gui.ROOT / "scripts" / "build_and_install.py"))
 
 
 class WaitForExitTests(unittest.TestCase):

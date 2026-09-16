@@ -14,7 +14,12 @@ the fleet ended up re-prompting for permissions on every deploy.
 
 Instead, hand the build to the session that already holds the keychain. When
 run from a terminal that can reach the keychain this just execs the normal
-build; over SSH it drives Terminal.app in the console session and waits.
+build; over SSH it delegates to the fleet-wide ``deskflow/tools/fleet-gui-exec.py``
+when that checkout is present (``DESKFLOW_ROOT`` or ``~/Desktop/deskflow``),
+and otherwise drives Terminal.app in the console session itself and waits.
+
+Whichever path runs, the identity check inside ``build_and_install.py`` still
+applies: this wrapper never supplies an identity and never relaxes the check.
 
 Usage:
     python3 scripts/build_macos_gui_session.py [build_and_install.py args...]
@@ -30,6 +35,10 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.install_lifecycle import fleet_gui_exec_script  # noqa: E402
 
 #: Written as the final line of the log so the poller can tell "finished" from
 #: "still running" without racing a partially flushed file.
@@ -93,6 +102,25 @@ def build_command(extra_args: list[str], log_path: str) -> str:
     )
 
 
+def fleet_gui_exec_command(extra_args: list[str]) -> list[str] | None:
+    """argv that hands the build to deskflow's fleet-gui-exec, or None.
+
+    None means the deskflow checkout (or its tool) is absent and the local
+    Terminal.app implementation below must be used instead.
+    """
+    script = fleet_gui_exec_script()
+    if script is None:
+        return None
+    return [
+        sys.executable,
+        str(script),
+        "--",
+        "python3",
+        str(ROOT / "scripts" / "build_and_install.py"),
+        *extra_args,
+    ]
+
+
 def _osascript_run(command: str) -> None:
     script = f'tell application "Terminal" to do script "{command}"'
     subprocess.run(["osascript", "-e", script], check=True, capture_output=True)
@@ -120,6 +148,12 @@ def main(argv: list[str] | None = None) -> int:
         return subprocess.run(
             [sys.executable, str(ROOT / "scripts" / "build_and_install.py"), *extra_args]
         ).returncode
+
+    delegated = fleet_gui_exec_command(extra_args)
+    if delegated is not None:
+        print(f"Keychain is unreachable here; delegating to {delegated[1]} "
+              f"(shared fleet GUI-session route).")
+        return subprocess.run(delegated, cwd=ROOT).returncode
 
     log_path = f"/tmp/mouser-build-{os.getpid()}.log"
     print(f"Keychain is unreachable here; running the build in {console_user()}'s "
