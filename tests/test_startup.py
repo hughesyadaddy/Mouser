@@ -188,6 +188,44 @@ class ApplyLoginStartupMacTests(unittest.TestCase):
                 ["launchctl", "bootstrap", domain, plist]
             )
 
+    def test_macos_plist_has_supervision_keys(self):
+        with patch("core.startup.os.path.expanduser", side_effect=lambda p: p.replace("~", "/Users/test")):
+            payload = st.macos_launch_agent_payload(["/X/Mouser"])
+        self.assertEqual(payload["Label"], st.MACOS_LAUNCH_AGENT_LABEL)
+        self.assertEqual(payload["ProgramArguments"], ["/X/Mouser"])
+        self.assertTrue(payload["RunAtLoad"])
+        # Relaunch after crash/kill, but NOT after a clean quit (tray Quit,
+        # `--ctl stop`) so installers can stop it without a resurrection race.
+        self.assertEqual(payload["KeepAlive"], {"SuccessfulExit": False})
+        self.assertEqual(payload["ProcessType"], "Interactive")
+        self.assertEqual(
+            payload["AssociatedBundleIdentifiers"], ["io.github.hughesyadaddy.mouser"]
+        )
+        self.assertEqual(payload["StandardOutPath"], "/Users/test/Library/Logs/Mouser/launchd.out.log")
+        self.assertEqual(payload["StandardErrorPath"], "/Users/test/Library/Logs/Mouser/launchd.err.log")
+        self.assertEqual(payload["ThrottleInterval"], 5)
+        # Everything must be plist-serialisable.
+        plistlib.dumps(payload)
+
+    def test_macos_enable_persists_supervision_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plist = os.path.join(tmp, "LaunchAgents", "x.plist")
+            with (
+                patch.object(sys, "platform", "darwin"),
+                patch("core.startup.os.getuid", return_value=501, create=True),
+                patch.object(st, "_macos_plist_path", return_value=plist),
+                patch.object(st, "_macos_log_dir", return_value=os.path.join(tmp, "Logs")),
+                patch.object(st, "_program_arguments", return_value=["/X/Mouser"]),
+                patch.object(st, "_launchctl_run") as m_lc,
+            ):
+                m_lc.return_value = MagicMock(returncode=0)
+                st.apply_login_startup(True)
+            with open(plist, "rb") as f:
+                payload = plistlib.load(f)
+            self.assertEqual(payload["KeepAlive"], {"SuccessfulExit": False})
+            self.assertEqual(payload["ProcessType"], "Interactive")
+            self.assertTrue(os.path.isdir(os.path.join(tmp, "Logs")))
+
     def test_macos_enable_raises_and_removes_plist_when_bootstrap_fails(self):
         domain = "gui/501"
 
@@ -388,6 +426,25 @@ class ApplyLoginStartupMacTests(unittest.TestCase):
                 st.MACOS_LAUNCH_AGENT_LABEL,
             ]
         )
+
+
+class RemoveStaleScheduledTasksTests(unittest.TestCase):
+    def test_noop_off_windows(self):
+        with patch.object(sys, "platform", "darwin"), patch.object(st.subprocess, "run") as run:
+            self.assertEqual(st.remove_stale_scheduled_tasks(), [])
+        run.assert_not_called()
+
+    def test_unregisters_each_known_task_name(self):
+        with patch.object(sys, "platform", "win32"), patch.object(st.subprocess, "run") as run:
+            run.return_value = MagicMock(returncode=0, stdout="MouserStart\nMouserProbe\n")
+            removed = st.remove_stale_scheduled_tasks()
+        self.assertEqual(removed, ["MouserStart", "MouserProbe"])
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[0], "powershell")
+        script = argv[-1]
+        self.assertIn("Unregister-ScheduledTask", script)
+        for name in ("MouserStart", "MouserDist", "MouserExe", "MouserSrc", "MouserProbe"):
+            self.assertIn(f"'{name}'", script)
 
 
 class SyncFromConfigTests(unittest.TestCase):

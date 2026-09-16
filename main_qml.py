@@ -12,9 +12,6 @@ _t0 = _time.perf_counter()          # ◄ startup clock
 import sys
 import os
 import signal
-import hashlib
-import getpass
-import time
 import weakref
 from collections import OrderedDict
 from urllib.parse import parse_qs, unquote
@@ -40,6 +37,14 @@ def _resolve_root_dir():
 ROOT = _resolve_root_dir()
 sys.path.insert(0, ROOT)
 
+from core import single_instance
+
+# `Mouser --ctl <verb>` is a lifecycle CLI (status/stop/start/restart/
+# assert-single).  Dispatch it before logging redirection and before any
+# Qt import so it stays cheap, keeps stdout, and never touches the lock.
+if len(sys.argv) >= 2 and sys.argv[1] == "--ctl":
+    raise SystemExit(single_instance.ctl_main(sys.argv[2:]))
+
 from core.log_setup import setup_logging
 setup_logging()
 
@@ -54,7 +59,7 @@ from PySide6.QtCore import QObject, Property, QCoreApplication, QRectF, Qt, QUrl
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuick import QQuickImageProvider
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtNetwork import QLocalServer, QLocalSocket, QAbstractSocket
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 _t2 = _time.perf_counter()
 
 # Ensure PySide6 QML plugins are found
@@ -120,55 +125,38 @@ def _parse_cli_args(argv):
     return qt_argv, hid_backend, start_hidden, force_show
 
 
-_SINGLE_INSTANCE_ACTIVATE_MSG = b"show"
+_INSTANCE_LOCK: "single_instance.Lock | None" = None  # held for the process lifetime
 
 
 def _single_instance_server_name() -> str:
-    raw = f"{getpass.getuser()}\0{sys.platform}"
-    digest = hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:16]
-    return f"mouser_instance_{digest}"
+    return single_instance.server_address()
 
 
-def _try_activate_existing_instance(server_name: str, timeout_ms: int = 500) -> bool:
-    sock = QLocalSocket()
-    sock.connectToServer(server_name)
-    if not sock.waitForConnected(timeout_ms):
-        return False
-    sock.write(_SINGLE_INSTANCE_ACTIVATE_MSG)
-    sock.waitForBytesWritten(timeout_ms)
-    sock.disconnectFromServer()
-    return True
-
-
-def _drain_local_activate_socket(sock: QLocalSocket | None) -> None:
+def _read_raise_message(sock: QLocalSocket | None) -> str:
+    """Drain one raise-channel connection and classify it ("show" | "quit")."""
     if not sock:
-        return
+        return "show"
     sock.waitForReadyRead(300)
-    sock.readAll()
+    data = bytes(sock.readAll())
     sock.deleteLater()
+    return single_instance.parse_raise_message(data)
 
 
-def _single_instance_acquire(app: QApplication, server_name: str):
-    """Return (QLocalServer, None) if this process owns the instance, or (None, exit_code)."""
-    if _try_activate_existing_instance(server_name):
-        return None, 0
-    server = QLocalServer(app)
+def _start_raise_server(app: QApplication, server_name: str) -> "QLocalServer | None":
+    """Listen on the raise channel.  Only valid once the process holds the lock.
+
+    The lock (``core.single_instance.acquire``) is what guarantees a single
+    instance; this server is just the "raise me" / "quit" mailbox, so a stale
+    socket file left by a crashed run is safe to remove here and a listen
+    failure is logged rather than fatal.
+    """
+    assert _INSTANCE_LOCK is not None and _INSTANCE_LOCK.held, "lock must be held first"
     QLocalServer.removeServer(server_name)
+    server = QLocalServer(app)
     if server.listen(server_name):
-        return server, None
-    if server.serverError() != QAbstractSocket.SocketError.AddressInUseError:
-        print(f"[Mouser] single-instance server: {server.errorString()}")
-        return None, 1
-    for _ in range(3):
-        time.sleep(0.05)
-        if _try_activate_existing_instance(server_name):
-            return None, 0
-        QLocalServer.removeServer(server_name)
-        server.close()
-        if server.listen(server_name):
-            return server, None
-    print("[Mouser] Could not claim single-instance lock or reach running instance.")
-    return None, 1
+        return server
+    print(f"[Mouser] raise channel unavailable: {server.errorString()}")
+    return None
 
 
 def _app_icon() -> QIcon:
@@ -1407,6 +1395,11 @@ def main():
         from core.update_installer import apply_windows_update_from_state
 
         raise SystemExit(apply_windows_update_from_state(sys.argv[2]))
+
+    # Single-instance gate BEFORE QApplication: an OS-level lock decides the
+    # race synchronously.  A loser pings the winner's raise channel and exits.
+    global _INSTANCE_LOCK
+    _INSTANCE_LOCK = single_instance.acquire_or_exit()
     argv, hid_backend, start_hidden, force_show = _parse_cli_args(sys.argv)
     cfg = load_config()
     cfg_settings = cfg.get("settings", {})
@@ -1462,10 +1455,7 @@ def main():
                     traceback.print_stack(sys._current_frames().get(t.ident))
         signal.signal(signal.SIGUSR1, _dump_threads)
 
-    server_name = _single_instance_server_name()
-    single_server, single_exit = _single_instance_acquire(app, server_name)
-    if single_exit is not None:
-        sys.exit(single_exit)
+    single_server = _start_raise_server(app, _single_instance_server_name())
 
     _t6 = _time.perf_counter()
     # ── Engine (created but started AFTER UI is visible) ───────
@@ -1607,12 +1597,6 @@ def main():
             lambda *_: _allow_macos_session_quit_if_requested(_MACOS_QUIT_FILTER)
         )
 
-    def _on_second_instance_activate():
-        _drain_local_activate_socket(single_server.nextPendingConnection())
-        show_main_window()
-
-    single_server.newConnection.connect(_on_second_instance_activate)
-
     print(f"[Startup] QApp create:      {(_t6-_t5)*1000:7.1f} ms")
     print(f"[Startup] Engine create:    {(_t7-_t6)*1000:7.1f} ms")
     print(f"[Startup] QML load:         {(_t8-_t7)*1000:7.1f} ms")
@@ -1688,6 +1672,21 @@ def main():
     quit_action.triggered.connect(quit_app)
     tray_menu.addAction(quit_action)
 
+    def _on_raise_connection():
+        # Raise channel: a losing second launch sends "show"; `--ctl stop`
+        # sends {"cmd":"quit"}, which must really quit (bypassing the macOS
+        # quit-to-tray filter) so installers never have to fall back to pkill.
+        while single_server.hasPendingConnections():
+            message = _read_raise_message(single_server.nextPendingConnection())
+            if message == "quit":
+                print("[Mouser] quit requested over raise channel")
+                quit_app()
+                return
+            show_main_window()
+
+    if single_server is not None:
+        single_server.newConnection.connect(_on_raise_connection)
+
     def _update_tray_texts():
         """Refresh tray menu labels after a language change."""
         open_action.setText(locale_mgr.tr("tray.open_settings"))
@@ -1750,6 +1749,11 @@ def main():
         engine.stop()
         if sys.platform == "darwin":
             _teardown_native_macos_status_item()
+        if single_server is not None:
+            single_server.close()
+            QLocalServer.removeServer(_single_instance_server_name())
+        if _INSTANCE_LOCK is not None:
+            _INSTANCE_LOCK.release()
         print("[Mouser] Shut down cleanly")
 
 
