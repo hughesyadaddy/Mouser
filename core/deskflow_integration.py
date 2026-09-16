@@ -3,6 +3,12 @@
 Reads Deskflow's ``mouser-sink.json`` manifest (preferred) or ``deskflow.conf``
 so Mouser can start the loopback sink without manual ``remote_device`` /
 ``remote_forward`` configuration.
+
+With the proto-2 bridge this only supplies the *legacy* token/port hints:
+Mouser always owns ``127.0.0.1:19795`` (``core/bridge_server.py``) and
+proto-2 peers authenticate with ``bridge.token`` instead. The manifest path
+has not matched a shipped Deskflow build, so in practice the hints come
+from ``Deskflow.conf`` when present.
 """
 
 from __future__ import annotations

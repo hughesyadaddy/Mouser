@@ -477,33 +477,70 @@ class EngineReplayPhaseOneTests(unittest.TestCase):
 
 
 class EngineDeskflowIntegrationTests(unittest.TestCase):
-    def test_client_sink_auto_enables_remote_device_server(self):
+    def _engine(self, cfg, deskflow, status_messages):
         from core.engine import Engine
 
-        cfg = copy.deepcopy(DEFAULT_CONFIG)
-        cfg["settings"]["remote_device"]["enabled"] = False
-        status_messages = []
-        deskflow = {
-            "client_sink": True,
-            "token": "deskflow-token",
-            "port": 19795,
-        }
         with (
             patch("core.engine.MouseHook", _FakeMouseHook),
             patch("core.engine.AppDetector", _FakeAppDetector),
             patch("core.engine.load_config", return_value=cfg),
             patch("core.deskflow_integration.resolve_integration", return_value=deskflow),
-            patch("core.remote_device.RemoteDeviceServer") as server_cls,
+            patch("core.bridge_server.BridgeServer") as server_cls,
         ):
             server_cls.return_value.start.return_value = True
             engine = Engine()
             engine.set_status_callback(status_messages.append)
             engine._start_remote_device_server()
+        return engine, server_cls
+
+    def test_client_sink_auto_enables_bridge_with_legacy_token(self):
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["remote_device"]["enabled"] = False
+        deskflow = {"client_sink": True, "token": "deskflow-token", "port": 19795}
+        engine, server_cls = self._engine(cfg, deskflow, [])
 
         server_cls.assert_called_once()
-        self.assertTrue(
-            any("Deskflow HID sink auto-enabled" in msg for msg in status_messages)
-        )
+        kwargs = server_cls.call_args.kwargs
+        self.assertEqual(kwargs["legacy_token"], "deskflow-token")
+        self.assertEqual(kwargs["port"], 19795)
+        self.assertTrue(kwargs["transparent_transport"])
+        self.assertIs(engine._remote_device_server, server_cls.return_value)
+
+    def test_bridge_starts_without_deskflow_conf_when_auto(self):
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        _engine, server_cls = self._engine(cfg, None, [])
+        server_cls.assert_called_once()
+        self.assertEqual(server_cls.call_args.kwargs["legacy_token"], "")
+
+    def test_bridge_not_started_when_deskflow_auto_off(self):
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["deskflow"]["auto"] = False
+        _engine, server_cls = self._engine(cfg, None, [])
+        server_cls.assert_not_called()
+
+    def test_legacy_dial_gated_by_marker_and_token_file(self):
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        engine, _server_cls = self._engine(cfg, None, [])
+        with patch("os.path.isfile", return_value=True):
+            self.assertTrue(engine._legacy_dial_enabled())
+            engine.cfg["settings"]["bridge_proto"] = 2
+            self.assertFalse(engine._legacy_dial_enabled())
+        with patch("os.path.isfile", return_value=False):
+            self.assertTrue(engine._legacy_dial_enabled())
+        engine.cfg["settings"]["deskflow"]["legacy_dial"] = True
+        self.assertTrue(engine._legacy_dial_enabled())
+
+    def test_proto2_seen_persists_marker_and_stops_forwarder(self):
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        engine, _server_cls = self._engine(cfg, None, [])
+        forwarder = Mock()
+        engine._remote_forwarder = forwarder
+        with patch("core.engine.save_config") as save:
+            engine._on_bridge_proto2_seen()
+        save.assert_called_once()
+        self.assertEqual(engine.cfg["settings"]["bridge_proto"], 2)
+        forwarder.stop.assert_called_once()
+        self.assertIsNone(engine._remote_forwarder)
 
 
 if __name__ == "__main__":

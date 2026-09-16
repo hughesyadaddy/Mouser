@@ -919,6 +919,12 @@ class Engine:
                     self._remote_forwarder.notify_decode_changed()
                 except Exception as exc:  # noqa: BLE001 - relay boundary
                     print(f"[Engine] remote forwarder decode notify failed: {exc!r}")
+            bridge = self._remote_device_server
+            if bridge is not None and hasattr(bridge, "notify_decode_changed"):
+                try:
+                    bridge.notify_decode_changed()
+                except Exception as exc:  # noqa: BLE001 - relay boundary
+                    print(f"[Engine] bridge decode notify failed: {exc!r}")
 
     def _retire_battery_poller(self):
         """Signal the current poller to exit; never block on it.
@@ -1120,52 +1126,88 @@ class Engine:
         return resolve_integration(self.cfg) or {}
 
     def _start_remote_device_server(self):
-        """Start the loopback virtual-device server when configured.
+        """Start the loopback bridge (``core/bridge_server.py``).
 
-        Off by default; requires both the enabled flag and a non-empty token
-        in ``settings.remote_device`` so it can never be reached by accident.
-        Deskflow auto mode can supply token/port from the Deskflow manifest.
+        Mouser owns ``127.0.0.1:19795`` for both directions of the Deskflow
+        integration; Deskflow dials it (proto 2, ``bridge.token``). Runs
+        whenever Deskflow integration is on (the default) or the legacy
+        ``settings.remote_device.enabled`` flag is set. Protocol-1 peers are
+        still accepted on the same port when a legacy token is known
+        (``settings.remote_device.token`` or Deskflow.conf/manifest).
         """
-        remote_cfg = self.cfg.get("settings", {}).get("remote_device", {}) or {}
+        settings = self.cfg.get("settings", {}) or {}
+        remote_cfg = settings.get("remote_device", {}) or {}
+        deskflow_cfg = settings.get("deskflow", {}) or {}
+        from core.bridge_server import BridgeServer
         from core.deskflow_integration import use_transparent_transport
-        from core.remote_device import DEFAULT_PORT, RemoteDeviceServer
+        from core.remote_device import DEFAULT_PORT
 
         deskflow = self._resolve_deskflow_integration()
-        enabled = bool(remote_cfg.get("enabled", False))
-        token = str(remote_cfg.get("token") or "")
-        port = DEFAULT_PORT
-        if deskflow and deskflow.get("client_sink"):
-            if not enabled:
-                enabled = True
-            if not token:
-                token = str(deskflow.get("token") or "")
-            try:
-                port = int(remote_cfg.get("port", deskflow.get("port", DEFAULT_PORT)))
-            except (TypeError, ValueError):
-                port = int(deskflow.get("port", DEFAULT_PORT))
-        else:
-            if not enabled:
-                return
-            try:
-                port = int(remote_cfg.get("port", DEFAULT_PORT))
-            except (TypeError, ValueError):
-                port = DEFAULT_PORT
-
-        if not token:
+        auto = deskflow_cfg.get("auto") is not False
+        enabled = auto or bool(remote_cfg.get("enabled", False))
+        if not enabled:
             return
 
-        server = RemoteDeviceServer(
+        legacy_token = str(remote_cfg.get("token") or "")
+        if not legacy_token and deskflow and deskflow.get("client_sink"):
+            legacy_token = str(deskflow.get("token") or "")
+        port = DEFAULT_PORT
+        for candidate in (remote_cfg.get("port"), (deskflow or {}).get("port")):
+            try:
+                if candidate not in (None, ""):
+                    port = int(candidate)
+                    break
+            except (TypeError, ValueError):
+                continue
+
+        transparent = use_transparent_transport(self.cfg) or (
+            auto and deskflow_cfg.get("transparent_transport") is not False
+        )
+        server = BridgeServer(
             self.hook,
-            token=token,
             port=port,
+            legacy_token=legacy_token,
             status_cb=self._emit_status,
             decode_override=remote_cfg.get("decode"),
-            transparent_transport=use_transparent_transport(self.cfg),
+            transparent_transport=transparent,
+            decode_supplier=lambda: self.hook.gesture_decode_context(),
+            on_proto2_seen=self._on_bridge_proto2_seen,
         )
         if server.start():
             self._remote_device_server = server
-            if deskflow and deskflow.get("client_sink") and not remote_cfg.get("enabled", False):
-                self._emit_status("Deskflow HID sink auto-enabled")
+
+    def _on_bridge_proto2_seen(self):
+        """First proto-2 hello: persist the marker and retire the legacy
+        dial-out (Deskflow now dials Mouser). Runs on a bridge thread."""
+        with self._lock:
+            settings = self.cfg.setdefault("settings", {})
+            if settings.get("bridge_proto") != 2:
+                settings["bridge_proto"] = 2
+                try:
+                    save_config(self.cfg)
+                except Exception as exc:  # noqa: BLE001 - persist boundary
+                    print(f"[Engine] could not persist bridge_proto: {exc!r}")
+            if self._remote_forwarder is not None:
+                print("[Engine] proto-2 bridge peer seen; stopping legacy dial-out")
+                self._stop_remote_forwarder()
+
+    def _legacy_dial_enabled(self) -> bool:
+        """Legacy ``RemoteForwarder`` dial-out to Deskflow:19796 stays on
+        until the bridge token file exists AND a proto-2 hello has been seen
+        once (``settings.bridge_proto == 2``). ``settings.deskflow.legacy_dial``
+        forces it either way."""
+        settings = self.cfg.get("settings", {}) or {}
+        explicit = (settings.get("deskflow", {}) or {}).get("legacy_dial")
+        if isinstance(explicit, bool):
+            return explicit
+        import os
+        from core.bridge_server import token_path
+
+        try:
+            proto = int(settings.get("bridge_proto") or 0)
+        except (TypeError, ValueError):
+            proto = 0
+        return not (proto >= 2 and os.path.isfile(token_path()))
 
     def _stop_remote_device_server(self):
         if self._remote_device_server is None:
@@ -1177,7 +1219,13 @@ class Engine:
         self._remote_device_server = None
 
     def _start_remote_forwarder(self):
-        """Start the KVM-bridge forwarder when configured (off by default)."""
+        """Start the legacy KVM-bridge dial-out when still needed.
+
+        Deskflow (proto 2) dials Mouser's bridge instead; this loop is only
+        kept for un-upgraded Deskflow builds (see ``_legacy_dial_enabled``).
+        """
+        if not self._legacy_dial_enabled():
+            return
         fwd_cfg = self.cfg.get("settings", {}).get("remote_forward", {}) or {}
         from core.remote_forward import DEFAULT_BRIDGE_PORT, RemoteForwarder
 

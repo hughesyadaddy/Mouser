@@ -1306,6 +1306,9 @@ class Backend(QObject):
         if not enabled:
             settings.setdefault("remote_forward", {})["enabled"] = False
             settings.setdefault("remote_device", {})["enabled"] = False
+            # Re-enabling starts back in compatibility mode (legacy dial-out
+            # on) until a proto-2 Deskflow hello is seen again.
+            settings.pop("bridge_proto", None)
         save_config(self._cfg)
         if self._engine:
             self._engine.reload_kvm_integration()
