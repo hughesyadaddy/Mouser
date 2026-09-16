@@ -16,7 +16,16 @@ what was created (``IOHIDManagerClose`` only if the open succeeded, a
 ``CFRelease`` for the manager and the matching dictionary). A failed
 ``IOHIDManagerOpen`` that reports a permission error (Input Monitoring
 denied) is negative-cached for ``PERMISSION_RETRY_S`` so the next few
-thousand wheel ticks do not each build and leak a manager.
+thousand wheel ticks do not each build and leak a manager; every other
+failure is negative-cached for the much shorter ``FAILURE_RETRY_S`` so the
+consumer's retry-while-not-running does not become a retry per wheel tick.
+
+The matching dictionaries and array are created with the ``kCFType*``
+callbacks. IOHIDDeviceClass looks the element-matching keys up with
+``CFDictionaryGetValue(matching, CFSTR("UsagePage"))``; with NULL key
+callbacks that lookup is pointer equality against *our* CFString and never
+matches, so the filter would silently match nothing. Typed containers also
+retain their contents, so each key/value is released right after insertion.
 """
 
 from __future__ import annotations
@@ -46,6 +55,8 @@ _PERMISSION_ERRORS = frozenset({_K_IO_RETURN_NOT_PERMITTED, _K_IO_RETURN_NOT_PRI
 
 #: Seconds to wait before retrying IOHIDManagerOpen after a permission error.
 PERMISSION_RETRY_S = 60.0
+#: Seconds to wait before retrying ``start()`` after any other failure.
+FAILURE_RETRY_S = 5.0
 
 SCROLL_MONITOR_AVAILABLE = False
 
@@ -109,6 +120,16 @@ if sys.platform == "darwin":
         _K_CF_NUMBER_SINT32 = 3
         _K_CF_STRING_ENCODING_UTF8 = 0x08000100
         _K_CF_RUN_LOOP_DEFAULT_MODE = c_void_p.in_dll(_cf, "kCFRunLoopDefaultMode")
+        # Exported structs, not pointers: take their addresses.
+        _K_CF_TYPE_DICT_KEY_CALLBACKS = ctypes.addressof(
+            ctypes.c_char.in_dll(_cf, "kCFTypeDictionaryKeyCallBacks")
+        )
+        _K_CF_TYPE_DICT_VALUE_CALLBACKS = ctypes.addressof(
+            ctypes.c_char.in_dll(_cf, "kCFTypeDictionaryValueCallBacks")
+        )
+        _K_CF_TYPE_ARRAY_CALLBACKS = ctypes.addressof(
+            ctypes.c_char.in_dll(_cf, "kCFTypeArrayCallBacks")
+        )
         SCROLL_MONITOR_AVAILABLE = True
     except Exception as exc:  # noqa: BLE001 - optional macOS HID monitor
         print(f"[macos_iokit_scroll] IOHID monitor unavailable: {exc}")
@@ -137,36 +158,72 @@ def _cfnumber(number: int):
 def _cfdict(pairs):
     """Create a CFDictionary from ``[(key_cf, value_cf), ...]``.
 
-    The dictionary is created with NULL callbacks (matches ``hid_gesture``),
-    so it does *not* retain its keys/values; the caller owns and must keep
-    them alive for as long as the dictionary lives. Returns
-    ``(dictionary, refs)`` where ``refs`` are the owned key/value objects.
+    The dictionary uses ``kCFTypeDictionary{Key,Value}CallBacks`` so IOKit's
+    ``CFDictionaryGetValue(matching, CFSTR(...))`` lookups match by string
+    equality, and so the dictionary retains its contents. Ownership of every
+    key/value passed in is consumed here: they are released right after
+    insertion (or on failure), so the caller keeps only the dictionary.
     """
     keys = [k for k, _ in pairs]
     values = [v for _, v in pairs]
-    key_array = (c_void_p * len(keys))(*keys)
-    val_array = (c_void_p * len(values))(*values)
-    dictionary = _cf.CFDictionaryCreate(
-        None, key_array, val_array, len(keys), None, None
-    )
-    return dictionary, keys + values
+    try:
+        if not all(keys) or not all(values):
+            raise OSError("CFString/CFNumber creation failed")
+        key_array = (c_void_p * len(keys))(*keys)
+        val_array = (c_void_p * len(values))(*values)
+        dictionary = _cf.CFDictionaryCreate(
+            None,
+            key_array,
+            val_array,
+            len(keys),
+            _K_CF_TYPE_DICT_KEY_CALLBACKS,
+            _K_CF_TYPE_DICT_VALUE_CALLBACKS,
+        )
+        if not dictionary:
+            raise OSError("CFDictionaryCreate failed")
+        return dictionary
+    finally:
+        for obj in keys + values:
+            _release_cf(obj)
+
+
+def _cfarray(items):
+    """Create a retaining CFArray from CF objects, consuming the caller's
+    reference to each item (released after insertion or on failure)."""
+    try:
+        buf = (c_void_p * len(items))(*items)
+        array = _cf.CFArrayCreate(None, buf, len(items), _K_CF_TYPE_ARRAY_CALLBACKS)
+        if not array:
+            raise OSError("CFArrayCreate failed")
+        return array
+    finally:
+        for obj in items:
+            _release_cf(obj)
 
 
 class LogitechScrollMonitor:
     """IOHID wheel tap: marks when a Logitech mouse wheel actually moved."""
 
-    def __init__(self, *, retry_after_s: float = PERMISSION_RETRY_S, clock=time.monotonic):
+    def __init__(
+        self,
+        *,
+        retry_after_s: float = PERMISSION_RETRY_S,
+        failure_retry_s: float = FAILURE_RETRY_S,
+        clock=time.monotonic,
+    ):
         self._last_wheel_monotonic = 0.0
         self._manager = None
         self._matching = None
-        self._matching_refs: list = []
+        self._element_matching = None
         self._callback_ref = None
         self._opened = False
         self._scheduled = False
         self._retry_after_s = float(retry_after_s)
+        self._failure_retry_s = float(failure_retry_s)
         self._clock = clock
         self._last_error: Exception | None = None
         self._permission_denied_until: float | None = None
+        self._failed_until: float | None = None
 
     # ------------------------------------------------------------------ state
     @property
@@ -189,6 +246,27 @@ class LogitechScrollMonitor:
         self._permission_denied_until = None
         return False
 
+    @property
+    def retry_after(self) -> float:
+        """Seconds until ``start()`` will attempt IOKit again (0.0 = now).
+
+        Non-zero while either negative cache (permission: 60 s, any other
+        failure: 5 s) is live; ``start()`` is a cheap no-op in that window.
+        """
+        now = self._clock()
+        until = max(
+            (t for t in (self._permission_denied_until, self._failed_until) if t is not None),
+            default=None,
+        )
+        if until is None:
+            return 0.0
+        remaining = until - now
+        if remaining <= 0.0:
+            self._permission_denied_until = None
+            self._failed_until = None
+            return 0.0
+        return remaining
+
     def mark_wheel(self) -> None:
         self._last_wheel_monotonic = time.monotonic()
 
@@ -199,19 +277,17 @@ class LogitechScrollMonitor:
     def start(self) -> None:
         if not SCROLL_MONITOR_AVAILABLE or self._manager is not None:
             return
-        if self.permission_denied:
+        if self.retry_after > 0.0:
             return
         try:
             # Device matching: Logitech pointing devices only.
-            self._matching, self._matching_refs = _cfdict(
+            self._matching = _cfdict(
                 [
                     (_cfstring("VendorID"), _cfnumber(LOGI_VENDOR_ID)),
                     (_cfstring("PrimaryUsagePage"), _cfnumber(_HID_PAGE_GENERIC_DESKTOP)),
                     (_cfstring("PrimaryUsage"), _cfnumber(_HID_USAGE_MOUSE)),
                 ]
             )
-            if not self._matching:
-                raise OSError("CFDictionaryCreate failed")
 
             manager = _iokit.IOHIDManagerCreate(None, 0)
             if not manager:
@@ -255,50 +331,50 @@ class LogitechScrollMonitor:
                 manager, self._callback_ref, None
             )
             self._last_error = None
+            self._failed_until = None
         except Exception as exc:  # noqa: BLE001 - optional monitor
             self._last_error = exc
+            if not isinstance(exc, PermissionError):
+                self._failed_until = self._clock() + self._failure_retry_s
             print(f"[macos_iokit_scroll] monitor start failed: {exc}")
             self._teardown()
 
     def _apply_element_matching(self, manager) -> None:
         """Restrict input-value callbacks to wheel / AC Pan elements.
 
-        The CFArray and CFDictionaries are created with NULL callbacks (same
-        convention as the device-matching dictionary), so they do not retain
-        their contents; the manager walks the array lazily when the callback
-        is registered, so every object here must stay alive until teardown.
-        They are parked in ``_matching_refs`` and released by ``_teardown``.
+        Each dictionary retains its key/value CFObjects and the array retains
+        the dictionaries (``kCFType*`` callbacks), so the only reference kept
+        past this call is the array itself, parked in ``_element_matching``
+        and released by ``_teardown``.
         """
         dicts = []
-        for page, usage in _SCROLL_ELEMENTS:
-            dictionary, owned = _cfdict(
-                [
-                    (_cfstring("UsagePage"), _cfnumber(page)),
-                    (_cfstring("Usage"), _cfnumber(usage)),
-                ]
-            )
-            self._matching_refs.extend(owned)
-            if not dictionary:
-                raise OSError("CFDictionaryCreate failed")
-            self._matching_refs.append(dictionary)
-            dicts.append(dictionary)
-        dict_array = (c_void_p * len(dicts))(*dicts)
-        array = _cf.CFArrayCreate(None, dict_array, len(dicts), None)
-        if not array:
-            raise OSError("CFArrayCreate failed")
-        self._matching_refs.append(array)
-        _iokit.IOHIDManagerSetInputValueMatchingMultiple(manager, array)
+        try:
+            for page, usage in _SCROLL_ELEMENTS:
+                dicts.append(
+                    _cfdict(
+                        [
+                            (_cfstring("UsagePage"), _cfnumber(page)),
+                            (_cfstring("Usage"), _cfnumber(usage)),
+                        ]
+                    )
+                )
+        except Exception:
+            for obj in dicts:
+                _release_cf(obj)
+            raise
+        self._element_matching = _cfarray(dicts)
+        _iokit.IOHIDManagerSetInputValueMatchingMultiple(manager, self._element_matching)
 
     def _teardown(self) -> None:
         """Release exactly what ``start()`` created, in reverse order."""
         manager = self._manager
         matching = self._matching
-        refs = self._matching_refs
+        element_matching = self._element_matching
         opened = self._opened
         scheduled = self._scheduled
         self._manager = None
         self._matching = None
-        self._matching_refs = []
+        self._element_matching = None
         self._callback_ref = None
         self._opened = False
         self._scheduled = False
@@ -318,9 +394,8 @@ class LogitechScrollMonitor:
             except Exception:
                 pass
             _release_cf(manager)
+        _release_cf(element_matching)
         _release_cf(matching)
-        for obj in refs:
-            _release_cf(obj)
 
     def stop(self) -> None:
         self._last_wheel_monotonic = 0.0

@@ -105,10 +105,52 @@ class PresentBackoffTests(unittest.TestCase):
         self.listener = hid_gesture.HidGestureListener()
         self.clock = _FakeClock()
 
+    def _mark_negative_cached(self):
+        # The whole candidate set is negative-cached: an IOKit arrival will
+        # wake the loop, so the full 30 s ladder is appropriate.
+        self.listener._last_failed_scan = {"digest": "x", "keys": (), "at": 0.0}
+
     def test_present_backoff_doubles_from_1s_to_30s_cap(self):
+        self._mark_negative_cached()
         delays = [self.listener._next_retry_delay(present=True) for _ in range(8)]
         self.assertEqual(delays, [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0, 30.0])
         self.assertGreaterEqual(min(delays), 1.0)
+
+    def test_present_backoff_capped_at_5s_while_uncached(self):
+        # A present device that merely failed to open is not negative-cached
+        # (_last_failed_scan is None) and nothing will announce when it
+        # becomes openable, so the ladder must not climb to 30 s.
+        self.assertIsNone(self.listener._last_failed_scan)
+        delays = [self.listener._next_retry_delay(present=True) for _ in range(6)]
+        self.assertEqual(delays, [1.0, 2.0, 4.0, 5.0, 5.0, 5.0])
+        self.assertEqual(max(delays), hid_gesture.PRESENT_BACKOFF_UNCACHED_MAX_S)
+        # Once the set becomes negative-cached the cap lifts again.
+        self._mark_negative_cached()
+        self.assertEqual(self.listener._next_retry_delay(present=True), 10.0)
+
+    def test_open_failure_in_main_loop_never_waits_30s(self):
+        listener = self.listener
+        listener._running = True
+        listener._last_scan_had_candidates = True
+        listener._last_failed_scan = None
+        listener._iokit_manager = None
+        attempts = []
+
+        def try_connect():
+            attempts.append(self.clock.now)
+            if len(attempts) >= 8:
+                listener._running = False
+            return False
+
+        with (
+            patch.object(hid_gesture, "time", self.clock),
+            patch.object(listener, "_try_connect", side_effect=try_connect),
+            patch("builtins.print"),
+        ):
+            listener._run_main_loop()
+
+        gaps = [round(b - a, 3) for a, b in zip(attempts, attempts[1:])]
+        self.assertEqual(gaps, [1.0, 2.0, 4.0, 5.0, 5.0, 5.0, 5.0])
 
     def test_absent_uses_slow_poll_when_notifications_exist(self):
         with patch.object(self.listener, "_has_arrival_notifications", return_value=True):
@@ -120,6 +162,7 @@ class PresentBackoffTests(unittest.TestCase):
         listener = self.listener
         listener._running = True
         listener._last_scan_had_candidates = True
+        self._mark_negative_cached()
         listener._iokit_manager = None
         attempts = []
 
@@ -164,6 +207,7 @@ class RetryLogRateLimitTests(unittest.TestCase):
         listener = hid_gesture.HidGestureListener()
         listener._running = True
         listener._last_scan_had_candidates = True
+        listener._last_failed_scan = {"digest": "x", "keys": (), "at": 0.0}
         listener._iokit_manager = None
         clock = _FakeClock()
         calls = {"n": 0}
@@ -249,6 +293,33 @@ class EnumerationSkipTests(unittest.TestCase):
             self.assertFalse(listener._try_connect())
             self.assertEqual(ctx.enumerate.call_count, 2)
 
+    def test_arrival_during_scan_is_not_masked_by_stale_digest(self):
+        # The arrival event fires while _try_connect is mid-scan (after
+        # enumeration, before _note_failed_scan). The digest of that scan
+        # predates the arrival, so it must not be recorded; otherwise the
+        # next attempt would skip enumeration for the whole TTL and never
+        # see the new device.
+        listener = self.listener
+        with _HidapiFailingConnect(listener, [self.info]) as ctx:
+            def enumerate_then_arrive(*_a, **_k):
+                listener._device_arrival.set()
+                return [self.info]
+
+            ctx.enumerate.side_effect = enumerate_then_arrive
+            self.assertFalse(listener._try_connect())
+            self.assertIsNone(listener._last_failed_scan)
+            self.assertTrue(listener._device_arrival.is_set())
+            # The reconnect wait consumes the arrival ...
+            listener._running = True
+            with patch.object(hid_gesture, "time", _FakeClock()):
+                listener._wait_reconnect(30.0)
+            self.assertFalse(listener._device_arrival.is_set())
+            # ... and the next attempt really enumerates again.
+            ctx.enumerate.side_effect = None
+            self.assertFalse(listener._try_connect())
+            self.assertEqual(ctx.enumerate.call_count, 2)
+            self.assertIsNotNone(listener._last_failed_scan)
+
     def test_removal_callback_invalidates_skip(self):
         listener = self.listener
         with _HidapiFailingConnect(listener, [self.info]) as ctx:
@@ -267,6 +338,50 @@ class EnumerationSkipTests(unittest.TestCase):
             self.assertIsNone(listener._last_failed_scan)
             self.assertFalse(listener._try_connect())
             self.assertEqual(ctx.enumerate.call_count, 2)
+
+
+# ── IOKit arrival hook: never throttle the wake-up ─────────────────
+
+
+class IOKitArrivalThrottleTests(unittest.TestCase):
+    def test_throttled_iokit_arrival_still_wakes_and_resets_digest(self):
+        listener = hid_gesture.HidGestureListener()
+        info = _candidate_info()
+        with _HidapiFailingConnect(listener, [info]):
+            # First arrival: clears the negative cache (rate-limit window
+            # opens now).
+            listener._on_iokit_device_arrival()
+            listener._device_arrival.clear()
+            self.assertFalse(listener._try_connect())
+            self.assertEqual(len(listener._reprog_negative_cache), 1)
+            self.assertIsNotNone(listener._last_failed_scan)
+
+            # Second arrival inside the 60 s window: the negative cache is
+            # kept, but the loop is woken and the enumeration skip is
+            # dropped unconditionally.
+            listener._on_iokit_device_arrival()
+            self.assertEqual(len(listener._reprog_negative_cache), 1)
+            self.assertTrue(listener._device_arrival.is_set())
+            self.assertIsNone(listener._last_failed_scan)
+
+            # Window elapsed: the negative cache is cleared too.
+            listener._last_arrival_clear = (
+                hid_gesture.time.time() - hid_gesture.ARRIVAL_CLEAR_MIN_INTERVAL_S - 1
+            )
+            listener._on_iokit_device_arrival()
+            self.assertEqual(len(listener._reprog_negative_cache), 0)
+
+    def test_windows_notify_keeps_full_throttle(self):
+        # WM_DEVICECHANGE storms are still fully rate-limited (see
+        # tests/test_hid_reconnect_backoff.py); the unconditional wake is
+        # IOKit-only.
+        listener = hid_gesture.HidGestureListener()
+        listener.notify_device_arrival()
+        listener._device_arrival.clear()
+        listener._last_failed_scan = {"digest": "x", "keys": (), "at": 0.0}
+        listener.notify_device_arrival()
+        self.assertFalse(listener._device_arrival.is_set())
+        self.assertIsNotNone(listener._last_failed_scan)
 
 
 # ── (5) bounded report queue ───────────────────────────────────────
@@ -329,6 +444,12 @@ class _FakeIOKit:
         self.manager_closes = 0
         self.copy_devices = 0
         self.device_opens = 0
+        self.device_creates = 0
+        self.created_devices = []
+        self.released = []
+        self.scheduled_devices = []
+        self.unscheduled_devices = []
+        self.retains = 0
         self.matching_cb = None
         self.removal_cb = None
         self.fire_arrival_on_pump = False
@@ -344,8 +465,8 @@ class _FakeIOKit:
             CFDictionaryCreate=lambda *a: 0x3000,
             CFSetGetCount=lambda s: 1,
             CFSetGetValues=self._set_values,
-            CFRelease=lambda ref: None,
-            CFRetain=lambda ref: ref,
+            CFRelease=self._release,
+            CFRetain=self._retain,
             CFRunLoopGetCurrent=lambda: 0x4000,
             CFRunLoopRunInMode=self._run_loop,
         )
@@ -360,10 +481,12 @@ class _FakeIOKit:
             IOHIDManagerRegisterDeviceMatchingCallback=self._reg_matching,
             IOHIDManagerRegisterDeviceRemovalCallback=self._reg_removal,
             IOHIDDeviceGetProperty=self._get_property,
+            IOHIDDeviceGetService=self._device_get_service,
+            IOHIDDeviceCreate=self._device_create,
             IOHIDDeviceOpen=self._device_open,
             IOHIDDeviceClose=lambda d, o: 0,
-            IOHIDDeviceScheduleWithRunLoop=lambda d, l, m: None,
-            IOHIDDeviceUnscheduleFromRunLoop=lambda d, l, m: None,
+            IOHIDDeviceScheduleWithRunLoop=lambda d, l, m: self.scheduled_devices.append(d),
+            IOHIDDeviceUnscheduleFromRunLoop=lambda d, l, m: self.unscheduled_devices.append(d),
             IOHIDDeviceRegisterInputReportCallback=lambda *a: None,
             IOHIDDeviceSetReport=lambda *a: 0,
         )
@@ -420,6 +543,26 @@ class _FakeIOKit:
     def _device_open(self, _d, _o):
         self.device_opens += 1
         return 0
+
+    SERVICE = 0x77
+
+    def _device_get_service(self, device):
+        assert device == self.DEVICE, hex(device)
+        return self.SERVICE
+
+    def _device_create(self, _alloc, service):
+        assert service == self.SERVICE
+        self.device_creates += 1
+        ref = 0x6000 + self.device_creates
+        self.created_devices.append(ref)
+        return ref
+
+    def _release(self, ref):
+        self.released.append(ref)
+
+    def _retain(self, ref):
+        self.retains += 1
+        return ref
 
     def _reg_matching(self, _m, cb, _ctx):
         self.matching_cb = cb
@@ -522,6 +665,34 @@ class SharedIOHIDManagerTests(unittest.TestCase):
         self.assertFalse(self.listener._try_connect())
         self.assertEqual(self.fake.manager_creates, 1)
         self.assertEqual(self.fake.device_opens, 1)
+
+    def test_find_device_returns_fresh_ref_released_on_close(self):
+        # The manager's own IOHIDDeviceRef (DEVICE) must never be handed to
+        # the device wrapper: it is scheduled/unscheduled by the manager
+        # and unscheduling it from the wrapper's close() would tear down
+        # the manager's removal notification.
+        for _ in range(3):
+            self.assertFalse(self.listener._try_connect())
+            self._reset_negative_cache()
+        self.assertEqual(self.fake.retains, 0)
+        self.assertEqual(self.fake.device_creates, 3)
+        self.assertEqual(len(set(self.fake.created_devices)), 3)
+        self.assertNotIn(self.fake.DEVICE, self.fake.scheduled_devices)
+        self.assertNotIn(self.fake.DEVICE, self.fake.unscheduled_devices)
+        self.assertEqual(self.fake.scheduled_devices, self.fake.created_devices)
+        self.assertEqual(self.fake.unscheduled_devices, self.fake.created_devices)
+        self.assertNotIn(self.fake.DEVICE, self.fake.released)
+        # Every fresh ref was released exactly once by close().
+        for ref in self.fake.created_devices:
+            self.assertEqual(self.fake.released.count(ref), 1, hex(ref))
+
+    def test_find_device_direct(self):
+        manager = self.listener._mac_manager()
+        ref = manager.find_device(0xC548, 0xFF00, 0x0002, "USB")
+        self.assertIn(ref, self.fake.created_devices)
+        self.assertNotEqual(ref, self.fake.DEVICE)
+        self.assertIsNone(manager.find_device(0xBEEF))
+        self.assertEqual(self.fake.device_creates, 1)
 
 
 if __name__ == "__main__":

@@ -319,8 +319,12 @@ class MouseHook(BaseMouseHook):
         if wanted:
             self._logitech_scroll_monitor.start()
             if not getattr(self._logitech_scroll_monitor, "running", True):
-                # start() failed (Input Monitoring denied): retry on the next
-                # wheel event; the monitor negative-caches denials itself.
+                # start() failed: keep re-applying on subsequent wheel events
+                # until it comes up. This is cheap by contract: the monitor
+                # negative-caches failures itself (permission denials for
+                # PERMISSION_RETRY_S, anything else for FAILURE_RETRY_S), so
+                # a start() inside that window is a no-op rather than a
+                # fresh IOKit attempt per wheel tick.
                 self._scroll_monitor_applied = None
         else:
             self._logitech_scroll_monitor.stop()

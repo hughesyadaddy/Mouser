@@ -1,8 +1,10 @@
 """Lifecycle tests for ``core.macos_iokit_scroll.LogitechScrollMonitor``.
 
 Real IOKit is never touched: the module-level ``_cf``/``_iokit`` bindings are
-replaced with a fake that hands out integer handles and records every
-create/open/close/release so leaks show up as unbalanced counts.
+replaced with a fake that hands out integer handles with reference counts
+and records every create/open/close/release so leaks show up as unbalanced
+counts. Containers created with the ``kCFType*`` callbacks retain their
+contents and release them when they die, as CoreFoundation does.
 """
 
 from __future__ import annotations
@@ -15,6 +17,9 @@ from unittest.mock import patch
 from core import macos_iokit_scroll as mod
 
 K_NOT_PERMITTED = 0xE00002E2
+DICT_KEY_CB = 0xD1C7_0001
+DICT_VALUE_CB = 0xD1C7_0002
+ARRAY_CB = 0xA88A_0001
 
 
 class FakeIOKit:
@@ -24,7 +29,10 @@ class FakeIOKit:
         self.open_result = open_result
         self.create_ok = create_ok
         self._next = 0x1000
-        self.live = set()  # handles that have been created and not released
+        self.refcount = {}  # handle -> retain count (created and not released)
+        self.contents = {}  # container handle -> retained members
+        self.dict_callbacks = []
+        self.array_callbacks = []
         self.managers = []
         self.opened = []
         self.closed = []
@@ -37,10 +45,36 @@ class FakeIOKit:
         self.iokit = self._make_iokit()
 
     # -- handles -----------------------------------------------------------
+    @property
+    def live(self):
+        """Handles that are still alive (retain count > 0)."""
+        return set(self.refcount)
+
     def _alloc(self):
         self._next += 8
-        self.live.add(self._next)
+        self.refcount[self._next] = 1
         return self._next
+
+    def _retain(self, obj):
+        assert obj in self.refcount, f"retain of dead/invalid {obj:#x}"
+        self.refcount[obj] += 1
+
+    def _release(self, obj):
+        assert obj in self.refcount, f"double/invalid CFRelease of {obj:#x}"
+        self.released.append(obj)
+        self.refcount[obj] -= 1
+        if self.refcount[obj] == 0:
+            del self.refcount[obj]
+            for member in self.contents.pop(obj, ()):
+                self._release(member)
+
+    def _container(self, members, retaining):
+        handle = self._alloc()
+        if retaining:
+            for member in members:
+                self._retain(member)
+            self.contents[handle] = list(members)
+        return handle
 
     # -- CoreFoundation ----------------------------------------------------
     def _make_cf(self):
@@ -53,16 +87,17 @@ class FakeIOKit:
             def CFNumberCreate(self, _alloc, _type, _ptr):
                 return fake._alloc()
 
-            def CFDictionaryCreate(self, _alloc, _keys, _vals, _n, _kcb, _vcb):
-                return fake._alloc()
+            def CFDictionaryCreate(self, _alloc, keys, vals, n, kcb, vcb):
+                fake.dict_callbacks.append((kcb, vcb))
+                retaining = kcb == DICT_KEY_CB and vcb == DICT_VALUE_CB
+                return fake._container(list(keys[:n]) + list(vals[:n]), retaining)
 
-            def CFArrayCreate(self, _alloc, _vals, _n, _cb):
-                return fake._alloc()
+            def CFArrayCreate(self, _alloc, vals, n, cb):
+                fake.array_callbacks.append(cb)
+                return fake._container(list(vals[:n]), cb == ARRAY_CB)
 
             def CFRelease(self, obj):
-                assert obj in fake.live, f"double/invalid CFRelease of {obj:#x}"
-                fake.live.discard(obj)
-                fake.released.append(obj)
+                fake._release(obj)
 
             def CFRunLoopGetCurrent(self):
                 return 0xBEEF
@@ -134,6 +169,9 @@ def _patched(fake: FakeIOKit):
     stack.enter_context(patch.object(mod, "_K_CF_NUMBER_SINT32", 3, create=True))
     stack.enter_context(patch.object(mod, "_K_CF_STRING_ENCODING_UTF8", 0, create=True))
     stack.enter_context(patch.object(mod, "_IOHID_VALUE_CALLBACK", lambda fn: fn, create=True))
+    stack.enter_context(patch.object(mod, "_K_CF_TYPE_DICT_KEY_CALLBACKS", DICT_KEY_CB, create=True))
+    stack.enter_context(patch.object(mod, "_K_CF_TYPE_DICT_VALUE_CALLBACKS", DICT_VALUE_CB, create=True))
+    stack.enter_context(patch.object(mod, "_K_CF_TYPE_ARRAY_CALLBACKS", ARRAY_CB, create=True))
     stack.enter_context(patch.object(mod, "c_void_p", ctypes.c_void_p, create=True))
     stack.enter_context(patch.object(mod, "c_int", ctypes.c_int, create=True))
     stack.enter_context(patch.object(mod, "byref", ctypes.byref, create=True))
@@ -154,15 +192,28 @@ class LogitechScrollMonitorLifecycleTests(unittest.TestCase):
             self.assertEqual(fake.scheduled, fake.managers)
             self.assertEqual(len(fake.callbacks), 1)
             self.assertEqual(fake.closed, [])
-            # Alive: manager, device-matching dict + 6 key/value refs, and
-            # the element-matching array + 2 dicts + 8 key/value refs (NULL
-            # CF callbacks -> containers do not retain their contents).
+            # Alive: manager, device-matching dict (+ 6 retained key/value
+            # refs) and the element-matching array (+ 2 retained dicts, each
+            # with 4 retained key/value refs). Every container was created
+            # with the kCFType* callbacks so the containers own their
+            # contents and the monitor holds no loose refs of its own.
             self.assertIn(fake.managers[0], fake.live)
             self.assertEqual(len(fake.live), 1 + (1 + 6) + (1 + 2 + 8))
+            self.assertEqual(fake.dict_callbacks, [(DICT_KEY_CB, DICT_VALUE_CB)] * 3)
+            self.assertEqual(fake.array_callbacks, [ARRAY_CB])
+            # Each key/value/dict is held exactly once -- by its container.
+            for handle in fake.live:
+                self.assertEqual(fake.refcount[handle], 1, hex(handle))
+            self.assertIsNone(getattr(monitor, "_matching_refs", None))
+            self.assertEqual(len(fake.contents[monitor._matching]), 6)
+            self.assertEqual(len(fake.contents[monitor._element_matching]), 2)
+            for element_dict in fake.contents[monitor._element_matching]:
+                self.assertEqual(len(fake.contents[element_dict]), 4)
 
             # Element matching was narrowed to the two scroll elements.
             self.assertEqual(len(fake.input_matching), 1)
             self.assertEqual(fake.input_matching[0][0], fake.managers[0])
+            self.assertEqual(fake.input_matching[0][1], monitor._element_matching)
 
             monitor.stop()
             self.assertFalse(monitor.running)
@@ -197,12 +248,73 @@ class LogitechScrollMonitorLifecycleTests(unittest.TestCase):
             self.assertEqual(fake.live, set(), f"leaked handles: {fake.live}")
             self.assertIsNone(monitor._manager)
             self.assertIsNone(monitor._matching)
-            self.assertEqual(monitor._matching_refs, [])
+            self.assertIsNone(monitor._element_matching)
 
-            # Non-permission failure: next tick retries (one more manager).
+            # Non-permission failure: short negative cache, so the next tick
+            # is a no-op; the retry happens once the 5 s TTL has elapsed.
+            self.assertGreater(monitor.retry_after, 0.0)
+            monitor.start()
+            self.assertEqual(len(fake.managers), 1)
+            monitor._failed_until = None
             monitor.start()
             self.assertEqual(len(fake.managers), 2)
             self.assertEqual(fake.live, set())
+
+    def test_non_permission_failure_is_negative_cached_briefly(self):
+        fake = FakeIOKit(open_result=0xE00002BD)  # kIOReturnError
+        clock = _Clock()
+        with _patched(fake):
+            monitor = mod.LogitechScrollMonitor(
+                retry_after_s=60.0, failure_retry_s=5.0, clock=clock
+            )
+            monitor.start()
+            self.assertFalse(monitor.running)
+            self.assertFalse(monitor.permission_denied)
+            self.assertAlmostEqual(monitor.retry_after, 5.0)
+            self.assertEqual(len(fake.managers), 1)
+
+            # Wheel ticks inside the 5 s TTL: cheap no-ops.
+            for _ in range(400):
+                clock.now += 0.01
+                monitor.start()
+            self.assertEqual(len(fake.managers), 1)
+            self.assertEqual(len(fake.opened), 1)
+            self.assertFalse(monitor.running)
+            self.assertIsInstance(monitor.last_error, OSError)
+
+            # TTL expiry: exactly one retry, which re-arms the cache.
+            clock.now += 1.1
+            self.assertEqual(monitor.retry_after, 0.0)
+            monitor.start()
+            self.assertEqual(len(fake.managers), 2)
+            self.assertAlmostEqual(monitor.retry_after, 5.0)
+            self.assertEqual(fake.live, set())
+
+            # Failure clears: the retry after the TTL succeeds and the cache
+            # is gone.
+            fake.open_result = 0
+            clock.now += 5.0
+            monitor.start()
+            self.assertTrue(monitor.running)
+            self.assertEqual(monitor.retry_after, 0.0)
+            self.assertIsNone(monitor.last_error)
+            monitor.stop()
+            self.assertEqual(fake.live, set())
+
+    def test_permission_ttl_is_longer_than_failure_ttl(self):
+        fake = FakeIOKit(open_result=K_NOT_PERMITTED)
+        clock = _Clock()
+        with _patched(fake):
+            monitor = mod.LogitechScrollMonitor(
+                retry_after_s=60.0, failure_retry_s=5.0, clock=clock
+            )
+            monitor.start()
+            self.assertTrue(monitor.permission_denied)
+            self.assertAlmostEqual(monitor.retry_after, 60.0)
+            clock.now += 6.0   # past the failure TTL, inside the permission TTL
+            monitor.start()
+            self.assertEqual(len(fake.managers), 1)
+            self.assertTrue(monitor.permission_denied)
 
     def test_create_failure_releases_matching_dict(self):
         fake = FakeIOKit(create_ok=False)
@@ -212,6 +324,25 @@ class LogitechScrollMonitorLifecycleTests(unittest.TestCase):
             self.assertFalse(monitor.running)
             self.assertEqual(fake.managers, [])
             self.assertEqual(fake.live, set())
+
+    def test_dict_creation_failure_releases_consumed_refs(self):
+        fake = FakeIOKit()
+        original = fake.cf.CFDictionaryCreate
+
+        def flaky(_alloc, keys, vals, n, kcb, vcb):
+            # First (device-matching) dict is fine; the element dicts fail.
+            if fake.dict_callbacks:
+                fake.dict_callbacks.append((kcb, vcb))
+                return None
+            return original(_alloc, keys, vals, n, kcb, vcb)
+
+        fake.cf.CFDictionaryCreate = flaky
+        with _patched(fake):
+            monitor = mod.LogitechScrollMonitor()
+            monitor.start()
+            self.assertFalse(monitor.running)
+            self.assertIsInstance(monitor.last_error, OSError)
+            self.assertEqual(fake.live, set(), f"leaked handles: {fake.live}")
 
     def test_failure_after_open_closes_and_releases(self):
         fake = FakeIOKit()
@@ -281,7 +412,8 @@ class LogitechScrollMonitorLifecycleTests(unittest.TestCase):
             monitor.stop()
             monitor.stop()
             self.assertEqual(fake.closed, [])
-            self.assertEqual(len(fake.released), len(set(fake.released)))
+            # Over-release is caught by the fake's CFRelease assertion; the
+            # only remaining question is whether everything was released.
             self.assertEqual(fake.live, set())
             # Cache survives stop(): still no re-create.
             monitor.start()

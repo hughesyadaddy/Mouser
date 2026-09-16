@@ -231,6 +231,10 @@ HEALTHY_SESSION_S = 30.0
 # IOHIDDevice opens per candidate, four times a second, forever).
 PRESENT_BACKOFF_MIN_S = 1.0
 PRESENT_BACKOFF_MAX_S = 30.0
+#: Cap while the present candidates are not negative-cached (transient
+#: open failure): nothing will wake the loop when the device becomes
+#: openable, so keep polling promptly.
+PRESENT_BACKOFF_UNCACHED_MAX_S = 5.0
 
 # Slow safety-net poll while nothing is enumerated at all, on platforms
 # where a device-arrival notification (IOKit matching callback on
@@ -501,6 +505,10 @@ if sys.platform == "darwin":
             c_void_p, _IOHID_DEVICE_CALLBACK, c_void_p,
         ]
 
+        _iokit.IOHIDDeviceGetService.argtypes = [c_void_p]
+        _iokit.IOHIDDeviceGetService.restype = ctypes.c_uint32   # io_service_t
+        _iokit.IOHIDDeviceCreate.argtypes = [c_void_p, ctypes.c_uint32]
+        _iokit.IOHIDDeviceCreate.restype = c_void_p
         _iokit.IOHIDDeviceOpen.argtypes = [c_void_p, c_int]
         _iokit.IOHIDDeviceOpen.restype = c_int
         _iokit.IOHIDDeviceClose.argtypes = [c_void_p, c_int]
@@ -784,7 +792,7 @@ if _MAC_NATIVE_OK:
                 )
                 if not device:
                     raise OSError(self._describe_match_failure())
-                self._device = device   # already retained by find_device
+                self._device = device   # fresh ref owned by us; released in close()
             else:
                 self._open_private_manager()
 
@@ -1152,8 +1160,17 @@ if _MAC_NATIVE_OK:
 
         @_pooled
         def find_device(self, product_id, usage_page=0, usage=0, transport=None):
-            """Return a *retained* IOHIDDeviceRef matching the tuple, or None.
-            The caller owns the retain and must CFRelease it."""
+            """Return a *fresh* IOHIDDeviceRef for the matching device, or None.
+
+            The refs the manager hands out are the manager's own: it has
+            scheduled them on its run loop and registered its removal
+            notification on them. Handing a CFRetain of that same object
+            to ``_MacNativeHidDevice`` would let ``_open`` re-schedule it
+            and ``close()`` unschedule it -- tearing down the manager's
+            removal notification, so the manager keeps a zombie entry and
+            leaks a report-callback thunk per unplug. Instead create a
+            distinct IOHIDDeviceRef from the same io_service_t (what hidapi
+            does), which the caller owns and must CFRelease."""
             get = _MacNativeHidDevice._get_property
             for device_ref in self._copy_device_refs():
                 if _MacNativeHidDevice._cfnumber_to_int(get(device_ref, "ProductID")) != int(product_id):
@@ -1168,7 +1185,10 @@ if _MAC_NATIVE_OK:
                     _MacNativeHidDevice._cfstring_to_str(get(device_ref, "Transport")) or ""
                 ) != transport:
                     continue
-                return _cf.CFRetain(device_ref)
+                service = _iokit.IOHIDDeviceGetService(device_ref)
+                if not service:
+                    return None
+                return _iokit.IOHIDDeviceCreate(None, service) or None
             return None
 
         def close(self):
@@ -1747,6 +1767,25 @@ class HidGestureListener:
         self._last_failed_scan = None
         self._device_arrival.set()
 
+    def _on_iokit_device_arrival(self):
+        """IOKit device-matching callback (macOS shared manager).
+
+        Unlike the Windows devnode-change storm, an IOKit matching callback
+        fires once per genuine arrival, so the reconnect wake-up and the
+        enumeration-skip reset must never be throttled -- otherwise a mouse
+        re-plugged within 60 s of the previous arrival waits out the full
+        backoff behind a stale scan digest. Only the REPROG_V4 negative
+        cache clear keeps the rate limit (it is what a sleeping mouse's
+        periodic re-announce would otherwise defeat).
+        """
+        self._last_failed_scan = None
+        self._device_arrival.set()
+        now = time.time()
+        if now - self._last_arrival_clear < ARRIVAL_CLEAR_MIN_INTERVAL_S:
+            return
+        self._last_arrival_clear = now
+        self._reprog_negative_cache.clear()
+
     def _on_candidate_set_changed(self):
         """IOKit removal callback: the enumerated set changed, so the
         enumeration-skip is no longer valid. Does not clear the negative
@@ -1764,7 +1803,7 @@ class HidGestureListener:
         ):
             return None
         self._iokit_manager = _MacHidManager(
-            on_arrival=self.notify_device_arrival,
+            on_arrival=self._on_iokit_device_arrival,
             on_removal=self._on_candidate_set_changed,
         )
         return self._iokit_manager
@@ -3272,6 +3311,13 @@ class HidGestureListener:
         whole candidate set is negative-cached; a candidate that merely
         failed to open is still worth re-enumerating at the next backoff
         step (it may become openable without any IOKit event)."""
+        if self._device_arrival.is_set():
+            # A device arrived while this scan was running: the candidate
+            # set we just probed is already stale, so recording it would
+            # let a digest from before the arrival mask the new device for
+            # the whole negative-cache TTL.
+            self._last_failed_scan = None
+            return
         keys = [_signature_key(_candidate_signature(info)) for info in infos]
         all_cached = bool(keys) and all(
             self._reprog_negative_cache.get(key) is not None for key in keys
@@ -3741,13 +3787,22 @@ class HidGestureListener:
         """Delay before the next connect attempt after a failed one.
 
         Present-but-not-connectable: exponential 1 s -> 30 s, reset on a
-        successful connect or a consumed device-arrival event. Absent: a
-        slow poll, since arrival notifications wake the loop early on
-        platforms that have them.
+        successful connect or a consumed device-arrival event. While the
+        candidate set is *not* negative-cached (``_last_failed_scan`` is
+        None: a device is present and merely failed to open, which no IOKit
+        event will announce when it clears) the ladder is capped at
+        ``PRESENT_BACKOFF_UNCACHED_MAX_S`` so a transient open failure
+        does not park the loop for 30 s. Absent: a slow poll, since arrival
+        notifications wake the loop early on platforms that have them.
         """
         if present:
+            cap = (
+                PRESENT_BACKOFF_UNCACHED_MAX_S
+                if self._last_failed_scan is None
+                else PRESENT_BACKOFF_MAX_S
+            )
             self._present_backoff_s = min(
-                PRESENT_BACKOFF_MAX_S,
+                cap,
                 max(PRESENT_BACKOFF_MIN_S, self._present_backoff_s * 2),
             )
             return self._present_backoff_s
