@@ -15,6 +15,8 @@ import signal
 import hashlib
 import getpass
 import time
+import weakref
+from collections import OrderedDict
 from urllib.parse import parse_qs, unquote
 
 # Ensure project root on path -- works for both normal Python and PyInstaller.
@@ -191,9 +193,67 @@ def _app_icon() -> QIcon:
     return QIcon(icon_path)
 
 
-def _render_svg_pixmap(path: str, color: QColor, size: int) -> QPixmap:
+class _LRUCache:
+    """Tiny bounded insertion-ordered cache (most-recently-used at the end).
+
+    Used for rendered icon pixmaps and parsed SVG renderers so repeated QML
+    ``image://`` requests (every Add-Profile open re-requests every known-app
+    icon; every theme/colour change re-requests every glyph) reuse one object
+    instead of allocating a fresh renderer + pixmap per request.
+    """
+
+    def __init__(self, capacity: int):
+        self.capacity = max(1, int(capacity))
+        self._items: "OrderedDict" = OrderedDict()
+        self.hits = 0
+        self.misses = 0
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __contains__(self, key) -> bool:
+        return key in self._items
+
+    def get(self, key, default=None):
+        try:
+            value = self._items[key]
+        except KeyError:
+            self.misses += 1
+            return default
+        self._items.move_to_end(key)
+        self.hits += 1
+        return value
+
+    def put(self, key, value) -> None:
+        self._items[key] = value
+        self._items.move_to_end(key)
+        while len(self._items) > self.capacity:
+            self._items.popitem(last=False)
+
+    def clear(self) -> None:
+        self._items.clear()
+
+
+# One QSvgRenderer per SVG source. The icon set is a few dozen files; parsing
+# the XML on every request was the dominant cost of ``AppIconProvider``.
+_SVG_RENDERERS = _LRUCache(64)
+
+
+def _svg_renderer(path: str):
+    """Return a cached, valid ``QSvgRenderer`` for ``path`` or ``None``."""
+    renderer = _SVG_RENDERERS.get(path)
+    if renderer is not None:
+        return renderer
     renderer = QSvgRenderer(path)
     if not renderer.isValid():
+        return None
+    _SVG_RENDERERS.put(path, renderer)
+    return renderer
+
+
+def _render_svg_pixmap(path: str, color: QColor, size: int) -> QPixmap:
+    renderer = _svg_renderer(path)
+    if renderer is None:
         return QPixmap()
 
     screen = QApplication.primaryScreen()
@@ -389,6 +449,12 @@ _MACOS_DOCK_ICON_NSIMAGE = None
 _MACOS_ACTIVATION_POLICY_REGULAR: "bool | None" = None
 _MACOS_NATIVE_STATUS_ITEM = None
 _MACOS_NATIVE_STATUS_TARGET = None
+# The rendered 22 px template NSImage for the status item. Built once per
+# process: re-rendering the SVG -> QPixmap -> PNG -> NSImage chain on every
+# activation-policy flip was the dominant allocation of the window-toggle
+# scenario, and AppKit never releases the images a button has displayed until
+# the button itself goes away.
+_MACOS_STATUS_ITEM_NSIMAGE = None
 # (qmenu, on_left_click) captured only after a successful native install, so
 # the status item can be re-created after an activation-policy flip detaches
 # it (see below) without later replacing the Qt fallback after a failed setup.
@@ -641,13 +707,46 @@ def _install_macos_dock_icon():
             f"size={size.width:.0f}x{size.height:.0f}"
         )
         _MACOS_DOCK_ICON_NSIMAGE = ns_image
+    if _macos_dock_icon_is_current(appkit, _MACOS_DOCK_ICON_NSIMAGE):
+        return
     try:
         appkit.NSApp.setApplicationIconImage_(_MACOS_DOCK_ICON_NSIMAGE)
     except Exception as exc:
         print(f"[Mouser] Failed to apply macOS Dock icon: {exc}")
 
 
+def _macos_dock_icon_is_current(appkit, ns_image) -> bool:
+    """True when ``NSApp`` already displays ``ns_image`` (pointer identity).
+
+    AppKit re-seeds the Dock tile from the bundle on a Regular promotion, so
+    the refresh callbacks cannot simply remember "already applied"; instead
+    they read the live value back and only issue ``setApplicationIconImage_``
+    when the Dock is showing something else. That makes the delayed refresh a
+    no-op in the common case instead of a fresh AppKit round-trip.
+    """
+    if ns_image is None:
+        return False
+    try:
+        current = appkit.NSApp.applicationIconImage()
+    except Exception:
+        return False
+    if current is None:
+        return False
+    if current is ns_image:
+        return True
+    try:
+        return bool(current.isEqual_(ns_image))
+    except Exception:
+        return False
+
+
 def _schedule_macos_dock_icon_refresh() -> None:
+    """Re-apply the Dock icon after AppKit has finished building the tile.
+
+    Both callbacks funnel through ``_install_macos_dock_icon``, which reads
+    the live Dock image back and skips the set when it already matches, so
+    the second (250 ms) retry costs one getter call when the first one took.
+    """
     if sys.platform != "darwin":
         return
     try:
@@ -789,9 +888,24 @@ def _install_native_macos_status_item(qmenu, on_left_click):
     appkit = _macos_appkit()
     if appkit is None:
         return None
-    # A prior item may still exist (re-install after an activation-policy flip
-    # detached the old one); drop it first so we never leave a duplicate.
+
+    # Idempotent fast path. The re-install callbacks fire on every
+    # activation-policy flip; when AppKit left the existing item in the menu
+    # bar there is nothing to rebuild -- just make sure the button still
+    # routes to the current handlers.
     if _MACOS_NATIVE_STATUS_ITEM is not None:
+        if not _macos_native_status_item_is_attached():
+            _macos_try_reattach_status_item(_MACOS_NATIVE_STATUS_ITEM)
+        if _macos_native_status_item_is_attached():
+            if _MACOS_NATIVE_STATUS_TARGET is not None:
+                _macos_bind_status_item_handlers(
+                    _MACOS_NATIVE_STATUS_TARGET, appkit, qmenu, on_left_click
+                )
+            _MACOS_STATUS_ITEM_PARAMS = (qmenu, on_left_click)
+            return _MACOS_NATIVE_STATUS_ITEM
+        # AppKit really dropped the slot: replace only the NSStatusItem.
+        # The target and NSImage below are reused, so a flip costs one
+        # AppKit object instead of a PyObjC target + rendered image graph.
         try:
             appkit.NSStatusBar.systemStatusBar().removeStatusItem_(
                 _MACOS_NATIVE_STATUS_ITEM
@@ -803,37 +917,13 @@ def _install_native_macos_status_item(qmenu, on_left_click):
             print(f"[Mouser] Failed to remove native status item: {exc}")
             return None
         _MACOS_NATIVE_STATUS_ITEM = None
-        _MACOS_NATIVE_STATUS_TARGET = None
     if _MacOSStatusItemTarget is None:
         print("[Mouser] Foundation.NSObject unavailable; using Qt tray icon")
         return None
-    try:
-        from PySide6.QtGui import QCursor
-        from PySide6.QtCore import QPoint
-    except Exception as exc:
-        print(f"[Mouser] Native status-item bootstrap failed: {exc}")
-        return None
 
-    icon_svg = os.path.join(ROOT, "images", "icons", "mouse-simple.svg")
-    if not os.path.isfile(icon_svg):
-        print(f"[Mouser] mouse-simple.svg not found at {icon_svg}")
+    ns_image = _macos_status_item_image(appkit)
+    if ns_image is None:
         return None
-
-    # Render the SVG into a 22 px square NSImage. 22 is the macOS-
-    # idiomatic menu-bar height (matches Apple's own SF Symbols).
-    # Drawing at 2x and letting AppKit downsample preserves crisp
-    # edges on both retina and non-retina displays.
-    icon_png = _render_svg_pixmap(icon_svg, _qcolor_white(), 22)
-    if icon_png.isNull():
-        print("[Mouser] could not render mouse-simple.svg for status item")
-        return None
-    icon_bytes = _qpixmap_to_png_bytes(icon_png)
-    ns_image = appkit.NSImage.alloc().initWithData_(icon_bytes)
-    if ns_image is None or ns_image.isValid() is False:
-        print("[Mouser] NSImage failed to decode status-item PNG")
-        return None
-    ns_image.setTemplate_(True)
-    ns_image.setSize_(appkit.NSMakeSize(22, 22))
 
     status_bar = appkit.NSStatusBar.systemStatusBar()
     # NSVariableStatusItemLength == -1.0; lets AppKit auto-position
@@ -847,26 +937,10 @@ def _install_native_macos_status_item(qmenu, on_left_click):
     button.setImage_(ns_image)
     button.setToolTip_("Mouser")
 
-    # Attach the existing QMenu as the right-click / control-click
-    # menu via a tiny NSMenu shim that pops the Qt menu at the
-    # status-item's screen position. Qt's QMenu carries all the
-    # localised labels, action wiring, and live-update bindings the
-    # rest of the app already depends on, so we don't duplicate it
-    # into a parallel NSMenu.
-    def _open_menu_at_cursor():
-        try:
-            cursor_pos = QCursor.pos()
-        except Exception:  # noqa: BLE001
-            cursor_pos = QPoint(0, 0)
-        try:
-            qmenu.popup(cursor_pos)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[Mouser] failed to popup tray menu: {exc}")
-
-    target = _MacOSStatusItemTarget.alloc().init()
-    target.setPyHandlers_(
-        {"primary": on_left_click, "menu": _open_menu_at_cursor, "appkit": appkit}
-    )
+    target = _MACOS_NATIVE_STATUS_TARGET
+    if target is None:
+        target = _MacOSStatusItemTarget.alloc().init()
+    _macos_bind_status_item_handlers(target, appkit, qmenu, on_left_click)
     button.setTarget_(target)
     button.setAction_(b"statusItemClicked:")
     try:
@@ -882,7 +956,9 @@ def _install_native_macos_status_item(qmenu, on_left_click):
         return None
 
     # Cache the item + target globally so PyObjC doesn't release them
-    # while the app keeps running.
+    # while the app keeps running. NSButton.target is a weak reference in
+    # AppKit, so this module-level slot is the one strong owner of the
+    # target; ``_teardown_native_macos_status_item`` drops it on exit.
     _MACOS_NATIVE_STATUS_ITEM = status_item
     _MACOS_NATIVE_STATUS_TARGET = target
     # Publish retry parameters only once this native item is fully installed.
@@ -890,6 +966,125 @@ def _install_native_macos_status_item(qmenu, on_left_click):
     # a later activation-policy change from creating a second icon beside it.
     _MACOS_STATUS_ITEM_PARAMS = (qmenu, on_left_click)
     return status_item
+
+
+def _macos_status_item_image(appkit):
+    """Return the process-wide 22 px template ``NSImage`` for the menu bar.
+
+    Rendered once: SVG -> QPixmap -> PNG bytes -> NSImage. 22 is the macOS-
+    idiomatic menu-bar height (matches Apple's own SF Symbols); drawing at 2x
+    and letting AppKit downsample preserves crisp edges on both retina and
+    non-retina displays. Returns ``None`` (and caches nothing) on failure so
+    a later attempt can retry.
+    """
+    global _MACOS_STATUS_ITEM_NSIMAGE
+    if _MACOS_STATUS_ITEM_NSIMAGE is not None:
+        return _MACOS_STATUS_ITEM_NSIMAGE
+
+    icon_svg = os.path.join(ROOT, "images", "icons", "mouse-simple.svg")
+    if not os.path.isfile(icon_svg):
+        print(f"[Mouser] mouse-simple.svg not found at {icon_svg}")
+        return None
+    icon_png = _render_svg_pixmap(icon_svg, _qcolor_white(), 22)
+    if icon_png.isNull():
+        print("[Mouser] could not render mouse-simple.svg for status item")
+        return None
+    icon_bytes = _qpixmap_to_png_bytes(icon_png)
+    ns_image = appkit.NSImage.alloc().initWithData_(icon_bytes)
+    if ns_image is None or ns_image.isValid() is False:
+        print("[Mouser] NSImage failed to decode status-item PNG")
+        return None
+    ns_image.setTemplate_(True)
+    ns_image.setSize_(appkit.NSMakeSize(22, 22))
+    _MACOS_STATUS_ITEM_NSIMAGE = ns_image
+    return ns_image
+
+
+def _macos_bind_status_item_handlers(target, appkit, qmenu, on_left_click) -> None:
+    """Point the (reused) ObjC target at the current Qt menu and callback.
+
+    The menu handler resolves ``qmenu`` through a weak reference at click
+    time so the long-lived target never keeps the ``QMenu`` (and, through
+    its actions, the whole tray wiring) alive. Objects that cannot be weakly
+    referenced (test doubles) fall back to a direct reference.
+    """
+    try:
+        menu_ref = weakref.ref(qmenu)
+    except TypeError:
+        def menu_ref(_m=qmenu):
+            return _m
+
+    def _open_menu_at_cursor():
+        menu = menu_ref()
+        if menu is None:
+            return
+        try:
+            from PySide6.QtGui import QCursor
+            cursor_pos = QCursor.pos()
+        except Exception:  # noqa: BLE001
+            from PySide6.QtCore import QPoint
+            cursor_pos = QPoint(0, 0)
+        try:
+            menu.popup(cursor_pos)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Mouser] failed to popup tray menu: {exc}")
+
+    target.setPyHandlers_(
+        {"primary": on_left_click, "menu": _open_menu_at_cursor, "appkit": appkit}
+    )
+
+
+def _macos_try_reattach_status_item(status_item) -> None:
+    """Ask AppKit to re-mount a detached item before we resort to rebuilding.
+
+    Toggling ``visible`` makes the status bar re-add the item's window on
+    every macOS release we ship on; if it does not, the caller's attached
+    check still fails and the item is replaced. Any exception is swallowed
+    because the fallback path is the pre-existing rebuild.
+    """
+    try:
+        status_item.setVisible_(False)
+        status_item.setVisible_(True)
+    except Exception:
+        pass
+
+
+def _teardown_native_macos_status_item() -> None:
+    """Release the native status item graph at shutdown.
+
+    Clears the handler dict on the target first so the ObjC object holds no
+    Python closures once the module globals go, then removes the item from
+    the status bar. Idempotent; safe when nothing was ever installed.
+    """
+    global _MACOS_NATIVE_STATUS_ITEM, _MACOS_NATIVE_STATUS_TARGET
+    global _MACOS_STATUS_ITEM_PARAMS, _MACOS_STATUS_ITEM_NSIMAGE
+    target = _MACOS_NATIVE_STATUS_TARGET
+    item = _MACOS_NATIVE_STATUS_ITEM
+    _MACOS_NATIVE_STATUS_TARGET = None
+    _MACOS_NATIVE_STATUS_ITEM = None
+    _MACOS_STATUS_ITEM_PARAMS = None
+    _MACOS_STATUS_ITEM_NSIMAGE = None
+    if target is not None:
+        try:
+            target.setPyHandlers_({})
+        except Exception:
+            pass
+    if item is None:
+        return
+    appkit = _MACOS_APPKIT
+    if appkit is None:
+        return
+    try:
+        button = item.button()
+        if button is not None:
+            button.setTarget_(None)
+            button.setImage_(None)
+    except Exception:
+        pass
+    try:
+        appkit.NSStatusBar.systemStatusBar().removeStatusItem_(item)
+    except Exception as exc:
+        print(f"[Mouser] Failed to remove native status item at exit: {exc}")
 
 
 def _qcolor_white():
@@ -976,56 +1171,135 @@ class UiState(QObject):
         return self._font_family
 
 
+def _icon_request_size(params, requested_size, default: int = 24) -> int:
+    """Logical pixel size for an ``image://`` request.
+
+    ``size=`` in the query wins (clamped to >= 12), then the requested
+    sourceSize width, then ``default``. Pure so the providers' cache keys
+    are testable without a QApplication.
+    """
+    try:
+        width = requested_size.width() if requested_size is not None else 0
+    except Exception:
+        width = 0
+    logical_size = width if width and width > 0 else default
+    if "size" in params:
+        try:
+            logical_size = max(12, int(params["size"][0]))
+        except (TypeError, ValueError):
+            logical_size = max(12, logical_size)
+    return int(logical_size)
+
+
+def _app_icon_request_key(icon_id, requested_size):
+    """Parse an ``appicons`` request into ``(icon_file, color, size)``."""
+    name, _, query_string = icon_id.partition("?")
+    params = parse_qs(query_string)
+    color = params.get("color", ["#000000"])[0]
+    logical_size = _icon_request_size(params, requested_size)
+    icon_name = name if name.endswith(".svg") else f"{name}.svg"
+    return icon_name, color, logical_size
+
+
+def _system_icon_request_key(icon_id, requested_size):
+    """Parse a ``systemicons`` request into ``(app_path, size)``."""
+    encoded_path, _, query_string = icon_id.partition("?")
+    params = parse_qs(query_string)
+    return unquote(encoded_path), _icon_request_size(params, requested_size)
+
+
+def _set_result_size(size, logical_size: int) -> None:
+    if size is not None:
+        size.setWidth(logical_size)
+        size.setHeight(logical_size)
+
+
 class AppIconProvider(QQuickImageProvider):
-    def __init__(self, root_dir: str):
+    """``image://appicons/<name>?color=#rrggbb&size=N`` -> tinted SVG glyph.
+
+    Rendered pixmaps are memoized by ``(file, color, size)`` in a bounded LRU
+    (``QPixmap`` is implicitly shared, so handing the cached instance back
+    to QML is a refcount bump, not a copy) and every render reuses the
+    process-wide ``QSvgRenderer`` for its source file.
+    """
+
+    CACHE_CAPACITY = 256
+
+    def __init__(self, root_dir: str, cache_capacity: int = CACHE_CAPACITY):
         super().__init__(QQuickImageProvider.ImageType.Pixmap)
         self._icon_dir = os.path.join(root_dir, "images", "icons")
+        self._cache = _LRUCache(cache_capacity)
+
+    @property
+    def cache(self) -> _LRUCache:
+        return self._cache
+
+    def invalidate(self) -> None:
+        self._cache.clear()
 
     def requestPixmap(self, icon_id, size, requested_size):
-        name, _, query_string = icon_id.partition("?")
-        params = parse_qs(query_string)
-        color = QColor(params.get("color", ["#000000"])[0])
-        logical_size = requested_size.width() if requested_size.width() > 0 else 24
-        if "size" in params:
-            try:
-                logical_size = max(12, int(params["size"][0]))
-            except ValueError:
-                logical_size = max(12, logical_size)
-
-        icon_name = name if name.endswith(".svg") else f"{name}.svg"
-        icon_path = os.path.join(self._icon_dir, icon_name)
-        pixmap = _render_svg_pixmap(icon_path, color, logical_size)
-        if size is not None:
-            size.setWidth(logical_size)
-            size.setHeight(logical_size)
+        icon_name, color_text, logical_size = _app_icon_request_key(
+            icon_id, requested_size
+        )
+        key = (icon_name, color_text, logical_size)
+        pixmap = self._cache.get(key)
+        if pixmap is None:
+            icon_path = os.path.join(self._icon_dir, icon_name)
+            pixmap = _render_svg_pixmap(icon_path, QColor(color_text), logical_size)
+            # Don't pin a failed render: the file may be added later.
+            if not pixmap.isNull():
+                self._cache.put(key, pixmap)
+        _set_result_size(size, logical_size)
         return pixmap
 
 
 class SystemIconProvider(QQuickImageProvider):
-    def __init__(self):
+    """``image://systemicons/<url-encoded path>?size=N`` -> the app's icon.
+
+    ``QFileIconProvider.icon`` walks NSWorkspace and decodes the bundle's
+    ``.icns`` on every call; the Add-Profile picker requests every known
+    app's icon each time it opens. Pixmaps are memoized by ``(path, size)``
+    in a bounded LRU. The cache is deliberately *not* wired to
+    ``Backend.knownAppsChanged``: that signal fires on every picker open
+    (``refreshKnownAppsSilently``) and evicting there would re-create the
+    entire icon set per open, which is the hotspot this fixes. Callers that
+    genuinely need fresh icons use ``invalidate()``.
+    """
+
+    CACHE_CAPACITY = 256
+
+    def __init__(self, cache_capacity: int = CACHE_CAPACITY, file_icon_provider=None):
         super().__init__(QQuickImageProvider.ImageType.Pixmap)
-        self._provider = QFileIconProvider()
+        # Created lazily: QFileIconProvider needs a live QApplication and the
+        # tests drive this provider without one.
+        self._provider = file_icon_provider
+        self._cache = _LRUCache(cache_capacity)
+
+    @property
+    def cache(self) -> _LRUCache:
+        return self._cache
+
+    def invalidate(self) -> None:
+        self._cache.clear()
+
+    def _file_icon_provider(self):
+        if self._provider is None:
+            self._provider = QFileIconProvider()
+        return self._provider
 
     def requestPixmap(self, icon_id, size, requested_size):
-        encoded_path, _, query_string = icon_id.partition("?")
-        app_path = unquote(encoded_path)
-        params = parse_qs(query_string)
-        logical_size = requested_size.width() if requested_size.width() > 0 else 24
-        if "size" in params:
-            try:
-                logical_size = max(12, int(params["size"][0]))
-            except ValueError:
-                logical_size = max(12, logical_size)
-
-        pixmap = QPixmap()
-        if app_path:
-            icon = self._provider.icon(QFileInfo(app_path))
-            if not icon.isNull():
-                pixmap = icon.pixmap(logical_size, logical_size)
-
-        if size is not None:
-            size.setWidth(logical_size)
-            size.setHeight(logical_size)
+        app_path, logical_size = _system_icon_request_key(icon_id, requested_size)
+        key = (app_path, logical_size)
+        pixmap = self._cache.get(key)
+        if pixmap is None:
+            pixmap = QPixmap()
+            if app_path:
+                icon = self._file_icon_provider().icon(QFileInfo(app_path))
+                if not icon.isNull():
+                    pixmap = icon.pixmap(logical_size, logical_size)
+            if not pixmap.isNull():
+                self._cache.put(key, pixmap)
+        _set_result_size(size, logical_size)
         return pixmap
 
 
@@ -1463,6 +1737,8 @@ def main():
         sys.exit(app.exec())
     finally:
         engine.stop()
+        if sys.platform == "darwin":
+            _teardown_native_macos_status_item()
         print("[Mouser] Shut down cleanly")
 
 
