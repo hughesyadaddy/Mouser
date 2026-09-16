@@ -309,7 +309,7 @@ class MouseHook(BaseMouseHook):
         Called on every ScrollWheel event, so start()/stop() only run when
         the wanted state changes (device bound / unbound). ``None`` in
         ``_scroll_monitor_applied`` forces one re-apply, which is how a
-        device arrival retries a monitor whose start() failed."""
+        device arrival -- or a failed start() -- retries the monitor."""
         if not SCROLL_MONITOR_AVAILABLE:
             return
         wanted = bool(self._physical_logitech_bound())
@@ -318,6 +318,10 @@ class MouseHook(BaseMouseHook):
         self._scroll_monitor_applied = wanted
         if wanted:
             self._logitech_scroll_monitor.start()
+            if not getattr(self._logitech_scroll_monitor, "running", True):
+                # start() failed (Input Monitoring denied): retry on the next
+                # wheel event; the monitor negative-caches denials itself.
+                self._scroll_monitor_applied = None
         else:
             self._logitech_scroll_monitor.stop()
 

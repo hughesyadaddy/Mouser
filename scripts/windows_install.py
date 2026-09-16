@@ -119,11 +119,10 @@ def sign_windows_dist(dist_root: Path) -> bool:
 
     script = windows_sign_script()
     if script is None:
-        print(
-            "[!] deskflow scripts/sign-windows.ps1 not found "
-            "(set DESKFLOW_ROOT); dist left unsigned."
+        raise RuntimeError(
+            "deskflow scripts/sign-windows.ps1 not found (set DESKFLOW_ROOT); "
+            "refusing to install an unsigned dist"
         )
-        return False
 
     args = [
         "powershell",

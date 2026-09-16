@@ -37,6 +37,16 @@ def install_macos_from_dist() -> None:
         raise SystemExit(f"Build output not found: {build_output}")
 
     print(f"Installing {build_output} -> {install_path}")
+    if shutil.which("codesign"):
+        info = subprocess.run(
+            ["codesign", "-dvv", str(build_output)],
+            capture_output=True, text=True, check=False,
+        )
+        if "Signature=adhoc" in info.stderr or info.returncode != 0:
+            raise SystemExit(
+                f"Refusing to install {build_output}: not signed with a real "
+                "identity (ad-hoc signatures reset TCC grants on every deploy)"
+            )
     print("[*] Stopping running Mouser instances...")
     stop_running_instances()
 
@@ -48,7 +58,7 @@ def install_macos_from_dist() -> None:
     if shutil.which("codesign"):
         subprocess.run(
             ["codesign", "--verify", "--deep", "--strict", str(install_path)],
-            check=False,
+            check=True,
         )
 
     print(f"Installed: {install_path}")

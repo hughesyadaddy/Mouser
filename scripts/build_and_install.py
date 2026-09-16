@@ -302,9 +302,6 @@ def build_and_install_macos(*, dry_run: bool = False) -> None:
         print_macos_plan(sign_identity, install_path)
         return
 
-    print("[*] Stopping running Mouser instances...")
-    stop_running_instances()
-
     env = os.environ.copy()
     env["MOUSER_SIGN_IDENTITY"] = sign_identity
 
@@ -320,6 +317,8 @@ def build_and_install_macos(*, dry_run: bool = False) -> None:
     # on, which breaks the signature on copy and prevents the app from launching
     # from /Applications ("code signature invalid"). ditto copies the bundle
     # byte-for-byte including signing metadata.
+    print("[*] Stopping running Mouser instances...")
+    stop_running_instances()
     if install_path.exists():
         shutil.rmtree(install_path)
     install_path.parent.mkdir(parents=True, exist_ok=True)
@@ -343,7 +342,7 @@ def print_windows_plan(install_path: Path, scope: str) -> None:
     print(f"  version:     {app_version()}")
     print(f"  build:       {ROOT / 'dist' / WINDOWS_APP_DIR}")
     print(f"  install to:  {install_path} ({scope} scope)")
-    print(f"  sign script: {sign_script or 'not found (dist would stay unsigned)'}")
+    print(f"  sign script: {sign_script or 'not found (install will FAIL on Windows)'}")
     print(f"  thumbprint:  {'set' if thumbprint_set else 'DESKFLOW_SIGN_THUMBPRINT unset'}")
 
 
