@@ -8,8 +8,11 @@ role it is playing:
   - ``role: client`` (mouse is elsewhere): Deskflow seizes the HID++
     interface on the host and relays raw reports here; Mouser attaches the
     in-process sink to the main HID listener (Tier 1.5 ingress).
-  - ``role: server`` (mouse is physically here): Mouser publishes the live
-    decode map so the far machine can interpret the raw reports.
+  - ``role: server`` (mouse is physically here): Mouser announces the
+    attached device (``{"type":"connect","device":{..,"decode":{..}}}``)
+    so Deskflow can cache it and relay it to whichever client gains
+    focus, and tracks the ``focus`` notices so local remaps stand down
+    while the cursor is on another screen (``should_forward``).
 
 Control plane (JSON lines, ``"t"`` key):
 
@@ -22,13 +25,16 @@ Control plane (JSON lines, ``"t"`` key):
     -> {"t":"focus","screen":..,"here":bool}
     -> {"t":"role","role":..}
     -> {"t":"detach"}
-    -> {"t":"bye","reason":..}
+    <-> {"t":"bye","reason":..}           Mouser sends it from stop()
     -> {"t":"status"}   (from anyone, no hello needed; fleet-health uses it)
     <- {"attached":bool,"peer":..,"role":..,"session_id":..,"proto":2,..}
 
 Data plane keeps the protocol-1 shapes byte-for-byte (``{"type":"report"}``,
-``{"type":"update_decode"}``, DFHR binary frames, ``{"type":"decode"}`` on
-the way out) so a Deskflow that has not been upgraded keeps working.
+``{"type":"update_decode"}``, DFHR binary frames, ``{"type":"connect"}`` /
+``{"type":"disconnect"}`` on the way out) so a Deskflow that has not been
+upgraded keeps working. Deskflow drops a standalone ``{"type":"decode"}``
+as unknown, so the decode map only ever travels inside ``connect`` -- a
+decode change re-sends the full ``connect`` line.
 
 State machine::
 
@@ -59,6 +65,7 @@ import time
 
 from core.config import CONFIG_DIR
 from core.remote_device import DEFAULT_PORT, RemoteDeviceServer, read_frames
+from core.remote_forward import _device_payload
 from core.remote_protocol import MAX_LINE_BYTES
 
 PROTO = 2
@@ -160,7 +167,10 @@ class _Peer:
         self.last_rx = clock()
         self.alive = True
         self.quiet = False          # bye seen: no error logs for this peer
-        self.last_decode = None
+        self.last_connect = None    # last {"type":"connect"} payload sent
+        self.last_focus_here = None  # last focus notice (role replay)
+        self.last_focus_screen = None
+        self.pending_focus_here = None  # focus seen before attach landed
         self.session_id = None      # last session this peer attached
 
     def send(self, payload) -> bool:
@@ -192,16 +202,18 @@ class BridgeServer:
                  token=None, token_file=None, legacy_token="",
                  status_cb=None, decode_override=None,
                  transparent_transport=True, decode_supplier=None,
-                 on_proto2_seen=None,
+                 device_supplier=None, on_proto2_seen=None,
                  hello_timeout_s=HELLO_TIMEOUT_S, heartbeat_s=HEARTBEAT_S,
                  heartbeat_misses=HEARTBEAT_MISSES, idle_pause_s=IDLE_PAUSE_S,
                  dead_link_s=DEAD_LINK_S, bye_quiet_s=BYE_QUIET_S,
                  clock=time.monotonic):
         """``token`` overrides the token file (tests); ``legacy_token`` is
         the protocol-1 shared secret for un-upgraded peers (empty = reject
-        legacy hellos). ``decode_supplier`` returns the live decode map to
-        publish to ``role: server`` peers. ``on_proto2_seen`` fires once,
-        after the first accepted proto-2 hello (persist ``bridge_proto``)."""
+        legacy hellos). ``decode_supplier`` returns the live decode map and
+        ``device_supplier`` the attached device; both feed the ``connect``
+        line announced to ``role: server`` peers. ``on_proto2_seen`` fires
+        once, after the first accepted proto-2 hello (persist
+        ``bridge_proto``)."""
         self._hook = hook
         self._host = host
         self._port = int(port)
@@ -209,7 +221,16 @@ class BridgeServer:
         self._token_file = token_file
         self._status_cb = status_cb
         self._decode_supplier = decode_supplier or (lambda: None)
+        self._device_supplier = device_supplier or (lambda: None)
         self._on_proto2_seen = on_proto2_seen
+        # Device announced to server peers (notify_device_connected) and
+        # KVM focus as seen from this seat (server-peer ``focus`` lines).
+        # ``on_focus_change`` is the hook's sync callback, same slot as
+        # core.remote_forward.RemoteForwarder so the hook needs no change.
+        self._device = None
+        self._remote_focus = False
+        self._focus_screen = None
+        self.on_focus_change = None
         self._hello_timeout_s = float(hello_timeout_s)
         self._heartbeat_s = float(heartbeat_s)
         self._heartbeat_misses = int(heartbeat_misses)
@@ -293,7 +314,18 @@ class BridgeServer:
         print(f"[Bridge] Listening on {self._host}:{self.port} (proto {PROTO})")
         return True
 
-    def stop(self):
+    def stop(self, reason="shutdown"):
+        """Tear the bridge down. Every peer gets ``{"t":"bye","reason":..}``
+        first: ``"shutdown"`` (default) lets Deskflow back off, ``"restart"``
+        tells it to reconnect immediately (in-process bridge restart)."""
+        # Bye goes out before the stop flag: the reader threads exit on that
+        # flag and unregister their peer, so snapshotting afterwards would
+        # miss them.
+        with self._state_lock:
+            peers = list(self._peers)
+        bye = {"t": "bye", "reason": str(reason or "shutdown")}
+        for peer in peers:
+            peer.send(bye)
         self._stopped.set()
         listener = self._listener
         self._listener = None
@@ -307,7 +339,7 @@ class BridgeServer:
             except OSError:
                 pass
         with self._state_lock:
-            peers = list(self._peers)
+            peers = list(set(peers) | set(self._peers))
         for peer in peers:
             peer.close()
         if self._thread is not None:
@@ -315,11 +347,12 @@ class BridgeServer:
             self._thread = None
         self._cancel_dead_link()
         self._clear("stop")
+        self._set_remote_focus(False, None)
         # Legacy sessions end via their own socket close; make sure no
         # ghost device survives the server.
         self._legacy._virtual_disconnect()
 
-    # ── status / decode publish (any thread) ──────────────────────
+    # ── status / device announce (any thread) ─────────────────────
 
     def status(self) -> dict:
         with self._state_lock:
@@ -334,27 +367,115 @@ class BridgeServer:
                 "proto": PROTO,
                 "peers": len(self._peers),
                 "legacy": self._legacy_active > 0,
+                "remote_focus": self._remote_focus,
+                "focus_screen": self._focus_screen,
             }
 
+    # RemoteForwarder-compatible surface: the hook gates local remaps on
+    # ``should_forward()`` and the engine reports device lifecycle here.
+
+    def should_forward(self) -> bool:
+        """True while a ``role: server`` Deskflow is linked AND its last
+        ``focus`` said the cursor is on another screen. Both drop to False
+        the moment that peer goes away, so a dead link never suppresses
+        local handling (same fail-safe as the legacy forwarder)."""
+        with self._state_lock:
+            return self._remote_focus and self._server_peer() is not None
+
+    @property
+    def focus_screen(self):
+        with self._state_lock:
+            return self._focus_screen
+
+    def send_event(self, name, **payload) -> bool:
+        """Legacy relay slot. Under proto 2 Deskflow seizes the HID++
+        interface and relays raw reports itself, so a decoded event that
+        still reaches the local hook while focus is remote is swallowed
+        rather than remapped locally."""
+        return True
+
+    def notify_device_connected(self, device):
+        """Announce (or re-announce) the attached device to server peers."""
+        with self._state_lock:
+            self._device = device
+        self._publish_connect_all()
+
+    def notify_device_disconnected(self):
+        """The device really went away: tell every server peer that had it."""
+        with self._state_lock:
+            self._device = None
+            peers = [p for p in self._peers if p.role == "server"]
+        for peer in peers:
+            if peer.last_connect is not None:
+                peer.last_connect = None
+                peer.send({"type": "disconnect"})
+
     def notify_decode_changed(self):
-        """Push the live decode map to every ``role: server`` peer."""
+        """Decode map changed: re-send the full ``connect`` where it differs
+        (Deskflow ignores a standalone ``{"type":"decode"}``)."""
+        self._publish_connect_all()
+
+    def _publish_connect_all(self):
         with self._state_lock:
             peers = [p for p in self._peers if p.role == "server"]
         for peer in peers:
-            self._publish_decode(peer)
+            self._publish_connect(peer)
 
-    def _publish_decode(self, peer):
+    def _connect_payload(self):
+        """The ``device`` object for ``{"type":"connect"}`` -- identity plus
+        the live decode map -- or None when nothing is attached."""
+        with self._state_lock:
+            device = self._device
+        if device is None:
+            try:
+                device = self._device_supplier()
+            except Exception as exc:  # noqa: BLE001 - supplier boundary
+                print(f"[Bridge] device supplier raised: {exc!r}")
+                device = None
+        if device is None:
+            return None
+        payload = dict(device) if isinstance(device, dict) else _device_payload(device)
+        if not payload.get("product_id") and not payload.get("product_name"):
+            return None
         try:
             decode = self._decode_supplier()
         except Exception as exc:  # noqa: BLE001 - supplier boundary
             print(f"[Bridge] decode supplier raised: {exc!r}")
+            decode = None
+        if isinstance(decode, dict) and decode.get("feat_idx") is not None:
+            payload["decode"] = dict(decode)
+        else:
+            payload.pop("decode", None)
+        return payload
+
+    def _publish_connect(self, peer):
+        payload = self._connect_payload()
+        if payload is None or payload == peer.last_connect:
             return
-        if not isinstance(decode, dict) or decode.get("feat_idx") is None:
+        peer.last_connect = payload
+        peer.send({"type": "connect", "device": payload})
+
+    def _server_peer(self):
+        for peer in self._peers:
+            if peer.role == "server" and peer.alive:
+                return peer
+        return None
+
+    def _set_remote_focus(self, remote, screen):
+        with self._state_lock:
+            changed = remote != self._remote_focus
+            self._remote_focus = bool(remote)
+            self._focus_screen = screen if remote else None
+        if not changed:
             return
-        if decode == peer.last_decode:
+        print(f"[Bridge] KVM focus -> {'remote' if remote else 'local'} (screen={screen})")
+        callback = self.on_focus_change
+        if callback is None:
             return
-        peer.last_decode = dict(decode)
-        peer.send({"type": "decode", "decode": decode})
+        try:
+            callback()
+        except Exception as exc:  # noqa: BLE001 - callback boundary
+            print(f"[Bridge] focus-change callback raised: {exc!r}")
 
     # ── accept loop ───────────────────────────────────────────────
 
@@ -454,6 +575,8 @@ class BridgeServer:
         peer = _Peer(conn, addr, self._clock)
         if not self._accept_hello(peer, hello):
             return
+        # Register before the ok goes out so a stop() racing the reply
+        # still reaches this peer with its bye.
         with self._state_lock:
             self._peers.append(peer)
             if self._state == IDLE:
@@ -461,8 +584,13 @@ class BridgeServer:
         hb = threading.Thread(
             target=self._heartbeat, args=(peer,), daemon=True, name="BridgeHB"
         )
-        hb.start()
         try:
+            self._before_hello_reply(peer)
+            if not peer.send({"ok": True, "proto": PROTO, "caps": list(CAPS)}):
+                return
+            if peer.role == "server":
+                self._publish_connect(peer)
+            hb.start()
             for kind, item in read_frames(conn, addr, buffer, self._stopped):
                 peer.last_rx = self._clock()
                 if kind == "report":
@@ -497,8 +625,9 @@ class BridgeServer:
         peer.role = hello.get("role")
         caps = hello.get("caps")
         peer.caps = tuple(caps) if isinstance(caps, list) else ()
-        if not peer.send({"ok": True, "proto": PROTO, "caps": list(CAPS)}):
-            return False
+        return True
+
+    def _before_hello_reply(self, peer):
         print(
             f"[Bridge] hello from {peer.app} ver={peer.ver} pid={peer.pid} "
             f"role={peer.role}"
@@ -511,9 +640,6 @@ class BridgeServer:
                     cb()
                 except Exception as exc:  # noqa: BLE001 - callback boundary
                     print(f"[Bridge] proto2-seen callback raised: {exc!r}")
-        if peer.role == "server":
-            self._publish_decode(peer)
-        return True
 
     def _on_peer_message(self, peer, msg):
         if not isinstance(msg, dict):
@@ -538,9 +664,18 @@ class BridgeServer:
         elif t == "focus":
             self._focus(peer, bool(msg.get("here", True)), msg.get("screen"))
         elif t == "role":
+            was_server = peer.role == "server"
             peer.role = msg.get("role")
             if peer.role == "server":
-                self._publish_decode(peer)
+                # Replay the cached connect on every role flip to server.
+                peer.last_connect = None
+                self._publish_connect(peer)
+                if peer.last_focus_here is not None:
+                    self._set_remote_focus(
+                        not peer.last_focus_here, peer.last_focus_screen
+                    )
+            elif was_server:
+                self._refresh_remote_focus()
         elif t == "detach":
             self._pause(peer, "detach")
             peer.send({"ok": True})
@@ -604,6 +739,7 @@ class BridgeServer:
                 if self._state == PAUSED:
                     self._resume(peer, "attach")
                 self._state = ATTACHED
+                self._apply_pending_focus(peer)
                 return {"ok": True, "session_id": session_id, "resumed": True}
 
             connect_msg = {"type": "connect", "device": dict(device)}
@@ -621,18 +757,47 @@ class BridgeServer:
             self._legacy.resume_ingress()
             self._state = ATTACHED
             print(f"[Bridge] attached session={session_id} ({reply.get('display_name')})")
+            self._apply_pending_focus(peer)
             reply = dict(reply)
             reply["session_id"] = session_id
             return reply
 
+    def _apply_pending_focus(self, peer):
+        """Honour a ``focus`` that arrived before the attach landed: a
+        ``here:false`` seen in HELLO state means the freshly attached
+        ingress must start paused, not accept reports for a screen that
+        does not have the cursor."""
+        pending, peer.pending_focus_here = peer.pending_focus_here, None
+        if pending is False:
+            self._pause(peer, "focus (pre-attach)")
+
     def _focus(self, peer, here, screen):
+        # Remembered regardless of state so a focus that lands before the
+        # attach (Deskflow replays hello -> attach -> focus, but the attach
+        # reply can still be in flight) is applied once the attach succeeds.
+        peer.last_focus_here = here
+        peer.last_focus_screen = screen
+        if peer.role == "server":
+            # This seat owns the mouse: ``here:false`` means the cursor is on
+            # another screen and local remaps must stand down.
+            self._set_remote_focus(not here, screen)
         with self._state_lock:
             if self._state not in (ATTACHED, PAUSED):
+                peer.pending_focus_here = here
                 return
+            peer.pending_focus_here = None
             if here:
                 self._resume(peer, f"focus {screen}")
             else:
                 self._pause(peer, f"focus {screen}")
+
+    def _refresh_remote_focus(self):
+        """A server peer left or changed role: fail-safe to local focus
+        unless another server peer is still linked."""
+        with self._state_lock:
+            if self._server_peer() is not None:
+                return
+        self._set_remote_focus(False, None)
 
     def _pause(self, peer, why):
         with self._state_lock:
@@ -685,12 +850,16 @@ class BridgeServer:
                 self._ingress_peer = None
             if self._state == HELLO and not self._peers:
                 self._state = IDLE
-            if not was_ingress:
-                return
-            if self._state == ATTACHED:
-                self._pause(peer, "link lost")
-            if self._state == PAUSED:
-                self._arm_dead_link()
+            if was_ingress:
+                if self._state == ATTACHED:
+                    self._pause(peer, "link lost")
+                if self._state == PAUSED:
+                    self._arm_dead_link()
+        if peer.role == "server":
+            # Fail-safe: never keep local remaps suppressed on a dead link.
+            self._refresh_remote_focus()
+        if not was_ingress:
+            return
         if not peer.quiet and self._clock() >= self._quiet_until and not self._stopped.is_set():
             print(f"[Bridge] peer {peer.app} link lost; ingress paused")
 
