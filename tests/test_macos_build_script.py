@@ -157,6 +157,7 @@ class MacOSBuildScriptTests(unittest.TestCase):
             "VIRTUAL_ENV",
         ):
             env.pop(key, None)
+        env["MOUSER_SIGN_IDENTITY"] = "IDENTITY"
         for key, value in overrides.items():
             if value is None:
                 env.pop(key, None)
@@ -269,13 +270,17 @@ class MacOSBuildScriptTests(unittest.TestCase):
         self.assertEqual(len(pyinstaller_lines), 1)
         self.assertIn("\t0\t", pyinstaller_lines[0])
 
-    def test_ad_hoc_signing_path(self):
-        result = self._run_script()
+    def test_missing_identity_is_fatal(self):
+        result = self._run_script(MOUSER_SIGN_IDENTITY="")
 
-        self.assertEqual(result.returncode, 0, result.stderr)
-        codesign = self._codesign_lines()
-        self.assertEqual(len(codesign), 1)
-        self.assertIn("--force --deep --sign -", codesign[0])
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(self._codesign_lines(), [])
+
+    def test_ad_hoc_identity_is_fatal(self):
+        result = self._run_script(MOUSER_SIGN_IDENTITY="-")
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(self._codesign_lines(), [])
 
     def test_identity_signing_order_and_verify_failure(self):
         result = self._run_script(MOUSER_SIGN_IDENTITY="IDENTITY")
