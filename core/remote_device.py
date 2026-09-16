@@ -73,6 +73,60 @@ _EVENT_HANDLERS = {
 }
 
 
+def read_frames(conn, addr, buffer=b"", stopped=None):
+    """Yield ``("json", msg_or_None)`` / ``("report", payload)`` frames.
+
+    Shared wire framing for the legacy listener and the bridge: JSON
+    lines and DFHR binary report frames interleave on one socket. A
+    malformed JSON line yields ``("json", None)`` so the caller can
+    answer it; oversized lines and unknown bytes end the session.
+    """
+    while stopped is None or not stopped.is_set():
+        if not buffer:
+            chunk = conn.recv(8192)
+            if not chunk:
+                return
+            buffer += chunk
+        if is_json_line_start(buffer[0]):
+            newline = buffer.find(b"\n")
+            if newline < 0:
+                if len(buffer) > MAX_LINE_BYTES:
+                    return
+                chunk = conn.recv(8192)
+                if not chunk:
+                    return
+                buffer += chunk
+                continue
+            line = buffer[:newline]
+            buffer = buffer[newline + 1:]
+            if len(line) > MAX_LINE_BYTES:
+                return
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                msg = None
+            yield "json", msg
+        elif buffer.startswith(SINK_MAGIC):
+            try:
+                decoded = try_decode_report_frame(buffer)
+            except ValueError:
+                print(f"[RemoteDevice] malformed DFHR frame from {addr}")
+                buffer = buffer[1:]
+                continue
+            if decoded is None:
+                chunk = conn.recv(8192)
+                if not chunk:
+                    return
+                buffer += chunk
+                continue
+            _device_id, payload, consumed = decoded
+            buffer = buffer[consumed:]
+            yield "report", payload
+        else:
+            print(f"[RemoteDevice] unknown wire data from {addr}")
+            return
+
+
 def _coerce_product_id(value):
     """Accept int or "0xB042"-style string; None for absent/garbage."""
     if value in (None, ""):
@@ -109,6 +163,7 @@ class RemoteDeviceServer:
         self._transparent_transport = bool(transparent_transport)
         self._raw_decoder = None
         self._listener_ingress = False
+        self._paused = False
 
     # ── lifecycle ─────────────────────────────────────────────────
 
@@ -181,9 +236,11 @@ class RemoteDeviceServer:
             with self._client_lock:
                 self._client = conn
             try:
-                self._handle_client(conn, addr)
-            except Exception as exc:  # noqa: BLE001 - session boundary
-                print(f"[RemoteDevice] client session error: {exc!r}")
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                # A vanished client must never leave a ghost device
+                # connected -- that would hold the intercept gate open;
+                # serve_connection() runs _virtual_disconnect on exit.
+                self.serve_connection(conn, addr)
             finally:
                 with self._client_lock:
                     self._client = None
@@ -191,61 +248,43 @@ class RemoteDeviceServer:
                     conn.close()
                 except OSError:
                     pass
-                # A vanished client must never leave a ghost device
-                # connected -- that would hold the intercept gate open.
-                self._virtual_disconnect()
 
-    def _handle_client(self, conn, addr):
-        conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        buffer = b""
-        buffer, ok = self._read_hello(conn, buffer)
+    def _handle_client(self, conn, addr, initial=b""):
+        buffer, ok = self._read_hello(conn, initial)
         if not ok:
             return
-        while not self._stopped.is_set():
-            if not buffer:
-                chunk = conn.recv(8192)
-                if not chunk:
-                    return
-                buffer += chunk
-            if is_json_line_start(buffer[0]):
-                newline = buffer.find(b"\n")
-                if newline < 0:
-                    if len(buffer) > MAX_LINE_BYTES:
-                        return
-                    chunk = conn.recv(8192)
-                    if not chunk:
-                        return
-                    buffer += chunk
-                    continue
-                line = buffer[:newline]
-                buffer = buffer[newline + 1:]
-                if len(line) > MAX_LINE_BYTES:
-                    return
-                try:
-                    msg = json.loads(line)
-                except ValueError:
+        self.serve_frames(conn, addr, buffer)
+
+    def serve_connection(self, conn, addr, initial=b""):
+        """Run one legacy (protocol v1) session on an accepted socket.
+
+        Used by :class:`core.bridge_server.BridgeServer` for peers that
+        never sent a proto-2 hello. ``initial`` is whatever the caller
+        already read off the socket (typically the legacy hello line).
+        Ends with the same ghost-device cleanup as the built-in listener.
+        """
+        try:
+            self._handle_client(conn, addr, initial)
+        except Exception as exc:  # noqa: BLE001 - session boundary
+            print(f"[RemoteDevice] client session error: {exc!r}")
+        finally:
+            self._virtual_disconnect()
+
+    def serve_frames(self, conn, addr, buffer=b"", on_json=None):
+        """Pump JSON lines and DFHR frames until the socket closes.
+
+        ``on_json(msg)`` overrides the per-message handler (the bridge's
+        proto-2 control plane); the default is :meth:`_handle_message`.
+        """
+        handler = on_json or (lambda msg: self._handle_message(conn, msg))
+        for kind, item in read_frames(conn, addr, buffer, self._stopped):
+            if kind == "json":
+                if item is None:
                     self._send(conn, {"ok": False, "error": "malformed_json"})
                     continue
-                self._handle_message(conn, msg)
-            elif buffer.startswith(SINK_MAGIC):
-                try:
-                    decoded = try_decode_report_frame(buffer)
-                except ValueError:
-                    print(f"[RemoteDevice] malformed DFHR frame from {addr}")
-                    buffer = buffer[1:]
-                    continue
-                if decoded is None:
-                    chunk = conn.recv(8192)
-                    if not chunk:
-                        return
-                    buffer += chunk
-                    continue
-                _device_id, payload, consumed = decoded
-                buffer = buffer[consumed:]
-                self._handle_binary_report(payload)
+                handler(item)
             else:
-                print(f"[RemoteDevice] unknown wire data from {addr}")
-                return
+                self._handle_binary_report(item)
 
     def _read_hello(self, conn, buffer):
         while b"\n" not in buffer:
@@ -277,8 +316,47 @@ class RemoteDeviceServer:
         )
         return buffer, True
 
+    # ── pause / resume (proto-2 focus flips) ──────────────────────
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    @property
+    def ingress_attached(self) -> bool:
+        """True while a Deskflow ingress (or virtual device) is attached."""
+        return self._listener_ingress or self._virtual_device is not None
+
+    def pause_ingress(self):
+        """Mouse left this screen: drop queued/incoming reports, keep the
+        HID listener session (no rebuild)."""
+        if self._paused:
+            return
+        self._paused = True
+        listener = getattr(self._hook, "_hid_gesture", None)
+        pause = getattr(listener, "pause_deskflow_ingress", None)
+        if pause is not None:
+            try:
+                pause()
+            except Exception as exc:  # noqa: BLE001 - listener boundary
+                print(f"[RemoteDevice] pause raised: {exc!r}")
+        elif self._listener_ingress:
+            get_deskflow_sink().flush()
+
+    def resume_ingress(self):
+        if not self._paused:
+            return
+        self._paused = False
+        listener = getattr(self._hook, "_hid_gesture", None)
+        resume = getattr(listener, "resume_deskflow_ingress", None)
+        if resume is not None:
+            try:
+                resume()
+            except Exception as exc:  # noqa: BLE001 - listener boundary
+                print(f"[RemoteDevice] resume raised: {exc!r}")
+
     def _handle_binary_report(self, payload):
-        if not self._owns_connection():
+        if self._paused or not self._owns_connection():
             return
         if self._listener_ingress:
             get_deskflow_sink().feed_report(payload)
@@ -514,6 +592,8 @@ class RemoteDeviceServer:
         return listener
 
     def _handle_report(self, msg):
+        if self._paused:
+            return {"ok": True, "paused": True}
         if not self._owns_connection():
             return {"ok": False, "error": "not_connected"}
         data = msg.get("data")
@@ -536,6 +616,7 @@ class RemoteDeviceServer:
         return {"ok": True}
 
     def _virtual_disconnect(self):
+        self._paused = False
         if self._listener_ingress:
             self._listener_ingress = False
             if hasattr(self._hook, "detach_deskflow_ingress"):

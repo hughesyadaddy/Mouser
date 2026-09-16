@@ -1622,16 +1622,56 @@ class HidGestureListener:
         return ready.wait(timeout=5.0)
 
     def clear_deskflow_attach(self):
-        """Drop Deskflow ingress and reconnect (USB if present)."""
+        """Drop Deskflow ingress and reconnect (USB if present).
+
+        This is the *teardown* path: the sink session is closed and the
+        listener rebuilds (USB probe, feature discovery, diverts). Only
+        take it when the peer is really gone -- an orderly ``bye`` on
+        shutdown or a link dead for a minute. Screen switches must use
+        :meth:`pause_deskflow_ingress` / :meth:`resume_deskflow_ingress`
+        instead: Deskflow flips focus on every switch, and rebuilding the
+        session each time cost thousands of reconnects per day.
+        """
         with self._deskflow_control_lock:
             self._deskflow_attach = None
             self._deskflow_attach_ready = None
             self._pending_decode_update = None
         self._deskflow_readonly = False
+        self._deskflow_paused = False
         from core.hid_deskflow_backend import flush_deskflow_sink
 
         flush_deskflow_sink()
         self._reconnect_requested = True
+
+    @property
+    def deskflow_paused(self) -> bool:
+        return bool(getattr(self, "_deskflow_paused", False))
+
+    def pause_deskflow_ingress(self):
+        """Mouse left this screen: flush queued reports and release any
+        held buttons, but keep the sink session and decode context alive
+        so the next focus-in resumes without a listener rebuild."""
+        if getattr(self, "_deskflow_paused", False):
+            return
+        self._deskflow_paused = True
+        from core.hid_deskflow_backend import flush_deskflow_sink
+
+        flush_deskflow_sink()
+        # A gesture held across the switch would otherwise stay "down"
+        # until the stale-hold timer fires (~3 s of phantom drag).
+        try:
+            self._force_release_stale_holds()
+        except Exception as exc:  # noqa: BLE001 - callback boundary
+            print(f"[HidGesture] pause force-release raised: {exc!r}")
+
+    def resume_deskflow_ingress(self):
+        """Mouse is back on this screen: start consuming reports again."""
+        if not getattr(self, "_deskflow_paused", False):
+            return
+        from core.hid_deskflow_backend import flush_deskflow_sink
+
+        flush_deskflow_sink()
+        self._deskflow_paused = False
 
     def queue_decode_update(self, decode):
         """Apply decode context on the listener thread (thread-safe)."""
@@ -1703,6 +1743,7 @@ class HidGestureListener:
         sink.set_nonblocking(False)
         self._dev = sink
         self._deskflow_readonly = True
+        self._deskflow_paused = False
 
         product_id = attach.get("product_id")
         product_name = attach.get("product_name") or "Logitech Mouse"

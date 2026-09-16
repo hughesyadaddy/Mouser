@@ -1,6 +1,11 @@
 """
 Remote event forwarder (the machine the mouse is physically attached to).
 
+LEGACY (protocol 1). With the proto-2 bridge (``core/bridge_server.py``)
+Deskflow dials Mouser and the decode map is published on that connection,
+so this dial-out loop only runs while ``Engine._legacy_dial_enabled()`` is
+true: until ``bridge.token`` exists and a proto-2 hello has been seen once.
+
 Counterpart of ``core/remote_device.py``. Connects to a local "bridge"
 listener (e.g. a Deskflow-fork server) over loopback TCP and:
 
