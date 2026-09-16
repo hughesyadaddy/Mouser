@@ -220,6 +220,32 @@ RECONNECT_BACKOFF_MAX_S = 60.0
 # healthy: reset the backoff.
 HEALTHY_SESSION_S = 30.0
 
+# Backoff for the *present-but-not-connectable* state: the receiver is
+# enumerated but every candidate either failed to open or exposed no
+# REPROG_V4 (mouse asleep, or owned by the other KVM host). This is the
+# steady state on a KVM secondary for hours at a time, so the retry
+# cadence is what decides how much IOKit/hidapi churn the process pays.
+# 1 s -> 30 s (doubling), reset on a successful connect or a
+# device-arrival notification. Never below 1 s (the old 0.25 s fast
+# retry drove a full IOHIDManager create/open/close plus two
+# IOHIDDevice opens per candidate, four times a second, forever).
+PRESENT_BACKOFF_MIN_S = 1.0
+PRESENT_BACKOFF_MAX_S = 30.0
+
+# Slow safety-net poll while nothing is enumerated at all, on platforms
+# where a device-arrival notification (IOKit matching callback on
+# macOS, WM_DEVICECHANGE on Windows) wakes the loop early. Platforms
+# without a notification source keep the historical 5 s poll.
+ABSENT_POLL_NOTIFIED_S = 30.0
+ABSENT_POLL_UNNOTIFIED_S = 5.0
+
+# Bound on the native (IOKit) input-report queue. Reports are produced
+# by the IOHIDDevice callback while the listener thread pumps the run
+# loop inside ``read()``, so in normal operation the queue holds at most
+# one run-loop batch. The bound is a guard against a stalled consumer,
+# not a tuning knob: any drop is logged as a ``mitigation:`` counter.
+REPORT_QUEUE_MAXSIZE = 4096
+
 # Minimum spacing between device-arrival cache clears. DBT_DEVNODES_CHANGED
 # is noisy -- a sleeping mouse's receiver re-announces every few seconds --
 # and an unthrottled clear would wipe the negative cache right after each
@@ -323,6 +349,83 @@ def _format_linux_device_access(path):
     )
 
 
+def _scan_digest(infos) -> str:
+    """Stable identity of an enumerated candidate set (paths + identity
+    tuple), used to notice when the set changed between attempts."""
+    import hashlib
+    keys = sorted(
+        (
+            int(info.get("product_id", 0) or 0),
+            int(info.get("usage_page", 0) or 0),
+            int(info.get("usage", 0) or 0),
+            str(info.get("transport") or ""),
+            _device_path_display(info.get("path")) or "",
+            str(info.get("product_string") or ""),
+        )
+        for info in infos
+    )
+    return hashlib.sha1(repr(keys).encode("utf-8")).hexdigest()[:12]
+
+
+class _BoundedReportQueue:
+    """Drop-oldest bounded queue for HID input reports.
+
+    Producer: the IOKit input-report callback. Consumer: ``read()`` on the
+    listener thread. ``put()`` never blocks; on overflow the oldest report
+    is discarded and ``dropped`` is incremented. Drops are a *mitigation*
+    (they mean the consumer stalled) and are logged as such, rate-limited
+    so a stall does not itself flood the log.
+    """
+
+    _LOG_INTERVAL_S = 5.0
+
+    def __init__(self, maxsize=REPORT_QUEUE_MAXSIZE, label="HidGesture"):
+        self._q = queue.Queue(maxsize=maxsize)
+        self.maxsize = int(maxsize)
+        self.dropped = 0
+        self._label = label
+        self._last_drop_log = 0.0
+        self._logged_dropped = 0
+
+    def put(self, item):
+        try:
+            self._q.put_nowait(item)
+            return
+        except queue.Full:
+            pass
+        try:
+            self._q.get_nowait()
+        except queue.Empty:
+            pass
+        self.dropped += 1
+        try:
+            self._q.put_nowait(item)
+        except queue.Full:
+            self.dropped += 1
+        now = time.monotonic()
+        if now - self._last_drop_log >= self._LOG_INTERVAL_S:
+            self._last_drop_log = now
+            fresh = self.dropped - self._logged_dropped
+            self._logged_dropped = self.dropped
+            print(
+                f"[{self._label}] mitigation: dropped {fresh} reports "
+                f"(total={self.dropped} queue={self.maxsize})"
+            )
+
+    def get_nowait(self):
+        return self._q.get_nowait()
+
+    def qsize(self):
+        return self._q.qsize()
+
+    def clear(self):
+        while True:
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                return
+
+
 class _HidDeviceCompat:
     """Wraps the ``hid`` package Device to match the ``hidapi`` interface."""
 
@@ -387,6 +490,16 @@ if sys.platform == "darwin":
         _iokit.IOHIDManagerClose.restype = c_int
         _iokit.IOHIDManagerCopyDevices.argtypes = [c_void_p]
         _iokit.IOHIDManagerCopyDevices.restype = c_void_p
+        _iokit.IOHIDManagerScheduleWithRunLoop.argtypes = [c_void_p, c_void_p, c_void_p]
+        _iokit.IOHIDManagerUnscheduleFromRunLoop.argtypes = [c_void_p, c_void_p, c_void_p]
+        # IOHIDDeviceCallback: (context, IOReturn result, sender, IOHIDDeviceRef)
+        _IOHID_DEVICE_CALLBACK = ctypes.CFUNCTYPE(None, c_void_p, c_int, c_void_p, c_void_p)
+        _iokit.IOHIDManagerRegisterDeviceMatchingCallback.argtypes = [
+            c_void_p, _IOHID_DEVICE_CALLBACK, c_void_p,
+        ]
+        _iokit.IOHIDManagerRegisterDeviceRemovalCallback.argtypes = [
+            c_void_p, _IOHID_DEVICE_CALLBACK, c_void_p,
+        ]
 
         _iokit.IOHIDDeviceOpen.argtypes = [c_void_p, c_int]
         _iokit.IOHIDDeviceOpen.restype = c_int
@@ -507,11 +620,16 @@ if _MAC_NATIVE_OK:
     class _MacNativeHidDevice:
         """Minimal IOHIDDevice wrapper for Logitech BLE HID++ on macOS."""
 
-        def __init__(self, product_id, usage_page=0, usage=0, transport=None):
+        def __init__(self, product_id, usage_page=0, usage=0, transport=None,
+                     shared_manager=None):
             self._product_id = int(product_id)
             self._usage_page = int(usage_page or 0)
             self._usage = int(usage or 0)
             self._transport = transport or None
+            # When a long-lived ``_MacHidManager`` is supplied, ``open()``
+            # borrows a device ref from it instead of creating (and then
+            # opening/closing) a private IOHIDManager per open attempt.
+            self._shared_manager = shared_manager
             self._manager = None
             self._matching = None
             self._device = None
@@ -519,7 +637,11 @@ if _MAC_NATIVE_OK:
             self._run_loop = None
             self._input_buffer = None
             self._report_callback = None
-            self._report_queue = queue.Queue()
+            self._report_queue = _BoundedReportQueue()
+
+        @property
+        def dropped_reports(self):
+            return self._report_queue.dropped
 
         @staticmethod
         def _cfstring(text):
@@ -655,6 +777,38 @@ if _MAC_NATIVE_OK:
                 raise
 
         def _open(self):
+            if self._shared_manager is not None and self._shared_manager._ensure():
+                device = self._shared_manager.find_device(
+                    self._product_id, self._usage_page, self._usage,
+                    self._transport,
+                )
+                if not device:
+                    raise OSError(self._describe_match_failure())
+                self._device = device   # already retained by find_device
+            else:
+                self._open_private_manager()
+
+            res = _iokit.IOHIDDeviceOpen(self._device, 0)
+            if res != 0:
+                raise OSError(f"IOHIDDeviceOpen failed: 0x{res:08X}")
+            self._run_loop = _cf.CFRunLoopGetCurrent()
+            self._input_buffer = (c_uint8 * 64)()
+            self._report_callback = _IOHID_REPORT_CALLBACK(self._on_input_report)
+            _iokit.IOHIDDeviceScheduleWithRunLoop(
+                self._device,
+                self._run_loop,
+                _K_CF_RUN_LOOP_DEFAULT_MODE,
+            )
+            _iokit.IOHIDDeviceRegisterInputReportCallback(
+                self._device,
+                self._input_buffer,
+                len(self._input_buffer),
+                self._report_callback,
+                None,
+            )
+
+        def _open_private_manager(self):
+            """Legacy path (no shared manager): one IOHIDManager per open."""
             keys = [
                 self._cfstring("VendorID"),
                 self._cfstring("ProductID"),
@@ -700,25 +854,6 @@ if _MAC_NATIVE_OK:
             finally:
                 _cf.CFRelease(devices)
 
-            res = _iokit.IOHIDDeviceOpen(self._device, 0)
-            if res != 0:
-                raise OSError(f"IOHIDDeviceOpen failed: 0x{res:08X}")
-            self._run_loop = _cf.CFRunLoopGetCurrent()
-            self._input_buffer = (c_uint8 * 64)()
-            self._report_callback = _IOHID_REPORT_CALLBACK(self._on_input_report)
-            _iokit.IOHIDDeviceScheduleWithRunLoop(
-                self._device,
-                self._run_loop,
-                _K_CF_RUN_LOOP_DEFAULT_MODE,
-            )
-            _iokit.IOHIDDeviceRegisterInputReportCallback(
-                self._device,
-                self._input_buffer,
-                len(self._input_buffer),
-                self._report_callback,
-                None,
-            )
-
         def _describe_match_failure(self):
             parts = [f"PID 0x{self._product_id:04X}"]
             if self._usage_page > 0:
@@ -760,7 +895,7 @@ if _MAC_NATIVE_OK:
             self._run_loop = None
             self._input_buffer = None
             self._report_callback = None
-            self._report_queue = queue.Queue()
+            self._report_queue.clear()
 
         def set_nonblocking(self, _enabled):
             return None
@@ -784,7 +919,7 @@ if _MAC_NATIVE_OK:
             if result != 0 or report_length <= 0:
                 return
             try:
-                self._report_queue.put_nowait(
+                self._report_queue.put(
                     ctypes.string_at(report, int(report_length))
                 )
             except Exception:
@@ -813,11 +948,16 @@ if _MAC_NATIVE_OK:
                 # this call, and their per-report temporaries must not outlive
                 # the slice.
                 with _AutoreleasePool():
-                    _cf.CFRunLoopRunInMode(
+                    rc = _cf.CFRunLoopRunInMode(
                         _K_CF_RUN_LOOP_DEFAULT_MODE,
                         slice_seconds,
                         True,
                     )
+                if rc == 1:   # kCFRunLoopRunFinished: no sources left
+                    # The device was unscheduled under us (close() from
+                    # another thread); without this the loop spins at full
+                    # speed until the deadline.
+                    time.sleep(slice_seconds)
                 try:
                     return self._report_queue.get_nowait()
                 except queue.Empty:
@@ -833,6 +973,231 @@ if _MAC_NATIVE_OK:
                 self.close()
             except Exception:
                 pass
+
+    class _MacHidManager:
+        """One long-lived IOHIDManager per listener for enumeration and
+        device-arrival notification.
+
+        The previous design built a fresh IOHIDManager (create / set
+        matching / open / copy devices / close / release) on *every*
+        reconnect attempt, plus one more inside each ``_MacNativeHidDevice``
+        open attempt -- at 4 Hz while the mouse was asleep on the other KVM
+        host. This object is created once, scheduled on the listener
+        thread's run loop, never opened (enumeration and
+        ``IOHIDDeviceOpen`` do not need the manager open; this mirrors
+        hidapi's own ``hid_init``), and closed on listener shutdown.
+
+        ``IOHIDManagerRegisterDeviceMatchingCallback`` fires from the run
+        loop when a matching device arrives, so the reconnect loop pumps
+        this run loop while it waits instead of polling.
+
+        Thread affinity: the run loop is the one current at ``_ensure()``
+        time, i.e. the listener thread. ``close()`` from another thread is
+        tolerated (best effort) but the owner should close it.
+        """
+
+        def __init__(self, on_arrival=None, on_removal=None):
+            self._on_arrival = on_arrival
+            self._on_removal = on_removal
+            self._manager = None
+            self._matching = None
+            self._matching_refs = []
+            self._run_loop = None
+            self._matching_cb = None
+            self._removal_cb = None
+            self._armed = False
+            self._disabled = False
+            self.create_count = 0
+            self.arrival_count = 0
+
+        @property
+        def active(self):
+            return bool(self._manager)
+
+        @_pooled
+        def _ensure(self):
+            if self._manager:
+                return True
+            if self._disabled:
+                return False
+            keys = [_MacNativeHidDevice._cfstring("VendorID")]
+            values = [_MacNativeHidDevice._cfnumber(LOGI_VID)]
+            try:
+                key_array = (c_void_p * len(keys))(*keys)
+                value_array = (c_void_p * len(values))(*values)
+                self._matching = _cf.CFDictionaryCreate(
+                    None, key_array, value_array, len(keys), None, None
+                )
+                self._matching_refs = keys + values
+                manager = _iokit.IOHIDManagerCreate(None, 0)
+                if not manager:
+                    raise OSError("IOHIDManagerCreate failed")
+                self.create_count += 1
+                self._manager = manager
+                _iokit.IOHIDManagerSetDeviceMatching(manager, self._matching)
+                self._run_loop = _cf.CFRunLoopGetCurrent()
+                self._matching_cb = _IOHID_DEVICE_CALLBACK(self._on_matching)
+                self._removal_cb = _IOHID_DEVICE_CALLBACK(self._on_removed)
+                _iokit.IOHIDManagerRegisterDeviceMatchingCallback(
+                    manager, self._matching_cb, None
+                )
+                _iokit.IOHIDManagerRegisterDeviceRemovalCallback(
+                    manager, self._removal_cb, None
+                )
+                _iokit.IOHIDManagerScheduleWithRunLoop(
+                    manager, self._run_loop, _K_CF_RUN_LOOP_DEFAULT_MODE
+                )
+                # Scheduling replays a matching callback for every device
+                # already present; drain that initial burst unarmed so it
+                # is not mistaken for a hot-plug arrival.
+                self._armed = False
+                for _ in range(4):
+                    _cf.CFRunLoopRunInMode(_K_CF_RUN_LOOP_DEFAULT_MODE, 0.001, False)
+                self._armed = True
+                return True
+            except Exception as exc:
+                print(
+                    f"[HidGesture] shared IOHIDManager unavailable: {exc} "
+                    "(falling back to per-attempt enumeration)"
+                )
+                self.close()
+                self._disabled = True
+                return False
+
+        def _on_matching(self, _context, _result, _sender, _device):
+            if not self._armed:
+                return
+            self.arrival_count += 1
+            cb = self._on_arrival
+            if cb is not None:
+                try:
+                    cb()
+                except Exception:
+                    pass
+
+        def _on_removed(self, _context, _result, _sender, _device):
+            if not self._armed:
+                return
+            cb = self._on_removal
+            if cb is not None:
+                try:
+                    cb()
+                except Exception:
+                    pass
+
+        def pump(self, seconds):
+            """Run the scheduled run loop for up to ``seconds`` so matching
+            and removal callbacks can fire. Falls back to sleep when the
+            manager could not be created."""
+            if not self._manager:
+                time.sleep(seconds)
+                return
+            with _AutoreleasePool():
+                _cf.CFRunLoopRunInMode(
+                    _K_CF_RUN_LOOP_DEFAULT_MODE, float(seconds), True
+                )
+
+        def _copy_device_refs(self):
+            """Return the current matched IOHIDDeviceRefs (borrowed; valid
+            until the next run-loop pump)."""
+            if not self._ensure():
+                return []
+            # hidapi does the same: let pending add/remove events settle so
+            # the copy reflects the current registry.
+            _cf.CFRunLoopRunInMode(_K_CF_RUN_LOOP_DEFAULT_MODE, 0.001, False)
+            devices = _iokit.IOHIDManagerCopyDevices(self._manager)
+            if not devices:
+                return []
+            try:
+                count = _cf.CFSetGetCount(devices)
+                if count <= 0:
+                    return []
+                values_buf = (c_void_p * count)()
+                _cf.CFSetGetValues(devices, values_buf)
+                return [ref for ref in values_buf if ref]
+            finally:
+                _cf.CFRelease(devices)
+
+        @_pooled
+        def enumerate_infos(self):
+            if not self._ensure():
+                return _MacNativeHidDevice.enumerate_infos()
+            infos = []
+            seen = set()
+            try:
+                for device_ref in self._copy_device_refs():
+                    get = _MacNativeHidDevice._get_property
+                    pid = _MacNativeHidDevice._cfnumber_to_int(get(device_ref, "ProductID"))
+                    up = _MacNativeHidDevice._cfnumber_to_int(get(device_ref, "PrimaryUsagePage"))
+                    usage = _MacNativeHidDevice._cfnumber_to_int(get(device_ref, "PrimaryUsage"))
+                    transport = _MacNativeHidDevice._cfstring_to_str(get(device_ref, "Transport"))
+                    product = _MacNativeHidDevice._cfstring_to_str(get(device_ref, "Product"))
+                    if not pid:
+                        continue
+                    key = (pid, up, usage, transport or "", product or "")
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    infos.append({
+                        "product_id": pid,
+                        "usage_page": up,
+                        "usage": usage,
+                        "transport": transport,
+                        "product_string": product,
+                        "source": "iokit-enumerate",
+                    })
+            except Exception as exc:
+                print(f"[HidGesture] native enumerate error: {exc}")
+            return infos
+
+        @_pooled
+        def find_device(self, product_id, usage_page=0, usage=0, transport=None):
+            """Return a *retained* IOHIDDeviceRef matching the tuple, or None.
+            The caller owns the retain and must CFRelease it."""
+            get = _MacNativeHidDevice._get_property
+            for device_ref in self._copy_device_refs():
+                if _MacNativeHidDevice._cfnumber_to_int(get(device_ref, "ProductID")) != int(product_id):
+                    continue
+                if usage_page and _MacNativeHidDevice._cfnumber_to_int(
+                        get(device_ref, "PrimaryUsagePage")) != int(usage_page):
+                    continue
+                if usage and _MacNativeHidDevice._cfnumber_to_int(
+                        get(device_ref, "PrimaryUsage")) != int(usage):
+                    continue
+                if transport and (
+                    _MacNativeHidDevice._cfstring_to_str(get(device_ref, "Transport")) or ""
+                ) != transport:
+                    continue
+                return _cf.CFRetain(device_ref)
+            return None
+
+        def close(self):
+            manager, self._manager = self._manager, None
+            self._armed = False
+            if manager:
+                try:
+                    if self._run_loop:
+                        _iokit.IOHIDManagerUnscheduleFromRunLoop(
+                            manager, self._run_loop, _K_CF_RUN_LOOP_DEFAULT_MODE
+                        )
+                except Exception:
+                    pass
+                try:
+                    # Never opened, but Close is harmless and balances any
+                    # implicit open IOKit may have performed.
+                    _iokit.IOHIDManagerClose(manager, 0)
+                except Exception:
+                    pass
+                _cf.CFRelease(manager)
+            if self._matching:
+                _cf.CFRelease(self._matching)
+                self._matching = None
+            for item in self._matching_refs:
+                _cf.CFRelease(item)
+            self._matching_refs = []
+            self._run_loop = None
+            self._matching_cb = None
+            self._removal_cb = None
 
 # ── Constants ─────────────────────────────────────────────────────
 LOGI_VID       = 0x046D
@@ -1177,6 +1542,22 @@ class HidGestureListener:
         self._device_arrival = threading.Event()
         self._last_scan_had_candidates = False
         self._last_arrival_clear = 0.0
+        # Present-but-not-connectable backoff (see PRESENT_BACKOFF_*).
+        self._present_backoff_s = 0.0
+        # Last enumeration that ended with every candidate negative-cached:
+        # {"digest": str, "at": float}. While inside the negative-cache TTL
+        # and no arrival/removal has fired, the loop skips enumeration
+        # entirely (the set cannot have changed without a callback).
+        self._last_failed_scan = None
+        self._enumeration_skips = 0
+        # Candidate block ("Candidate HID interfaces: N", one line per
+        # candidate) is printed once per distinct candidate set, not once
+        # per attempt.
+        self._last_logged_scan_digest = None
+        self._last_retry_log_delay = None
+        # Long-lived IOKit manager (macOS only; created lazily on the
+        # listener thread so it schedules on that thread's run loop).
+        self._iokit_manager = None
 
     # ── Deskflow ingress (Tier 1.5 hidapi shim) ─────────────────────
 
@@ -1363,7 +1744,47 @@ class HidGestureListener:
             return
         self._last_arrival_clear = now
         self._reprog_negative_cache.clear()
+        self._last_failed_scan = None
         self._device_arrival.set()
+
+    def _on_candidate_set_changed(self):
+        """IOKit removal callback: the enumerated set changed, so the
+        enumeration-skip is no longer valid. Does not clear the negative
+        cache (a removal brings nothing new to probe)."""
+        self._last_failed_scan = None
+
+    def _mac_manager(self):
+        """Lazily create the long-lived IOKit manager (listener thread)."""
+        if self._iokit_manager is not None:
+            return self._iokit_manager
+        if (
+            sys.platform != "darwin"
+            or not _MAC_NATIVE_OK
+            or _BACKEND_PREFERENCE not in ("auto", "iokit")
+        ):
+            return None
+        self._iokit_manager = _MacHidManager(
+            on_arrival=self.notify_device_arrival,
+            on_removal=self._on_candidate_set_changed,
+        )
+        return self._iokit_manager
+
+    def _close_mac_manager(self):
+        manager, self._iokit_manager = self._iokit_manager, None
+        if manager is not None:
+            try:
+                manager.close()
+            except Exception as exc:  # noqa: BLE001 - teardown must complete
+                print(f"[HidGesture] shared IOHIDManager close failed: {exc}")
+
+    def _has_arrival_notifications(self):
+        """True when some platform source wakes the loop on device arrival
+        (IOKit matching callback / WM_DEVICECHANGE); otherwise the absent
+        poll must stay short enough to notice a plug on its own."""
+        if sys.platform == "win32":
+            return True
+        manager = self._iokit_manager
+        return bool(manager is not None and manager.active)
 
     def start(self):
         if not HIDAPI_OK and not _MAC_NATIVE_OK:
@@ -1422,6 +1843,9 @@ class HidGestureListener:
         self._connected_device_info = None
         if self._thread:
             self._thread.join(timeout=3)
+        # The listener thread closes it on exit; this covers a listener
+        # that never started, or a join timeout.
+        self._close_mac_manager()
 
     @property
     def connected_device(self):
@@ -1538,8 +1962,12 @@ class HidGestureListener:
     # ── device discovery ──────────────────────────────────────────
 
     @staticmethod
-    def _vendor_hid_infos():
-        """Return candidate Logitech HID interfaces from hidapi and macOS IOKit."""
+    def _vendor_hid_infos(mac_manager=None):
+        """Return candidate Logitech HID interfaces from hidapi and macOS IOKit.
+
+        ``mac_manager`` is the listener's long-lived ``_MacHidManager``;
+        without one (diagnostics, tests) the legacy per-call manager path
+        in ``_MacNativeHidDevice.enumerate_infos`` is used."""
         out = []
         seen = set()
 
@@ -1621,7 +2049,12 @@ class HidGestureListener:
             and _MAC_NATIVE_OK
             and _BACKEND_PREFERENCE in ("auto", "iokit")
         ):
-            for info in _MacNativeHidDevice.enumerate_infos():
+            native_infos = (
+                mac_manager.enumerate_infos()
+                if mac_manager is not None
+                else _MacNativeHidDevice.enumerate_infos()
+            )
+            for info in native_infos:
                 add_info(info)
 
         return out
@@ -2804,10 +3237,53 @@ class HidGestureListener:
         if self._deskflow_attach is not None:
             if self._try_connect_deskflow(self._deskflow_attach):
                 return True
-        infos = self._vendor_hid_infos()
+        if self._should_skip_enumeration():
+            self._enumeration_skips += 1
+            # Still "present": the last real scan saw candidates and no
+            # removal callback has fired since.
+            self._last_scan_had_candidates = True
+            return False
+        infos = self._vendor_hid_infos(self._mac_manager())
         if infos:
-            return self._try_connect_usb(infos)
+            if self._try_connect_usb(infos):
+                return True
+            self._note_failed_scan(infos)
         return False
+
+    def _should_skip_enumeration(self):
+        """Inside the negative-cache TTL after a scan where every candidate
+        was negative-cached, and with no arrival/removal since, enumerating
+        again can only reproduce the same set -- skip it."""
+        last = self._last_failed_scan
+        if last is None:
+            return False
+        if self._device_arrival.is_set():
+            return False
+        now = time.time()
+        for key in last.get("keys", ()):
+            failed_at = self._reprog_negative_cache.get(key)
+            if failed_at is None or now - failed_at >= REPROG_NEGATIVE_CACHE_TTL_S:
+                self._last_failed_scan = None
+                return False
+        return True
+
+    def _note_failed_scan(self, infos):
+        """Record a failed attempt. Enumeration is skipped only when the
+        whole candidate set is negative-cached; a candidate that merely
+        failed to open is still worth re-enumerating at the next backoff
+        step (it may become openable without any IOKit event)."""
+        keys = [_signature_key(_candidate_signature(info)) for info in infos]
+        all_cached = bool(keys) and all(
+            self._reprog_negative_cache.get(key) is not None for key in keys
+        )
+        if not all_cached:
+            self._last_failed_scan = None
+            return
+        self._last_failed_scan = {
+            "digest": _scan_digest(infos),
+            "keys": tuple(keys),
+            "at": time.time(),
+        }
 
     def _try_connect_usb(self, infos):
         """Probe local USB/BLE Logitech interfaces."""
@@ -2836,32 +3312,39 @@ class HidGestureListener:
 
         infos.sort(key=_priority)
 
-        print(f"[HidGesture] Backend preference: {_BACKEND_PREFERENCE}")
-        print(f"[HidGesture] Candidate HID interfaces: {len(infos)}")
         # A present-but-unopenable device (the KVM handoff case: the receiver
-        # never unplugs, so no WM_DEVICECHANGE fires) must be retried fast --
-        # the flat 5s wait below is for a genuinely absent device.
+        # never unplugs, so no WM_DEVICECHANGE fires) is retried on the
+        # present-backoff schedule; the slow poll is for an absent device.
         self._last_scan_had_candidates = bool(infos)
-        if cached_candidate:
-            print(
-                f"[HidGesture] Cached last-known device: "
-                f"PID=0x{int(cached_candidate.get('pid', 0)):04X} "
-                f"devIdx=0x{int((cached_device or {}).get('dev_idx', 0)):02X} "
-                f"name='{(cached_device or {}).get('name', '?')}' "
-                f"(warm-path probe will run first)"
-            )
-        for info in infos:
-            pid = int(info.get("product_id", 0) or 0)
-            up = int(info.get("usage_page", 0) or 0)
-            usage = int(info.get("usage", 0) or 0)
-            transport = info.get("transport")
-            source = info.get("source", "unknown")
-            product = info.get("product_string") or "?"
-            path = _device_path_display(info.get("path"))
-            print(f"[HidGesture] Candidate PID=0x{pid:04X} UP=0x{up:04X} "
-                  f"usage=0x{usage:04X} transport={transport or '-'} "
-                  f"source={source} product={product} path={path or '-'}")
+        # The candidate block is printed once per distinct candidate set --
+        # not once per attempt. At the old 4 Hz retry this was ~30 log
+        # lines per second for hours while the mouse sat on the other host.
+        digest = _scan_digest(infos)
+        if digest != self._last_logged_scan_digest:
+            self._last_logged_scan_digest = digest
+            print(f"[HidGesture] Backend preference: {_BACKEND_PREFERENCE}")
+            print(f"[HidGesture] Candidate HID interfaces: {len(infos)} (set {digest})")
+            if cached_candidate:
+                print(
+                    f"[HidGesture] Cached last-known device: "
+                    f"PID=0x{int(cached_candidate.get('pid', 0)):04X} "
+                    f"devIdx=0x{int((cached_device or {}).get('dev_idx', 0)):02X} "
+                    f"name='{(cached_device or {}).get('name', '?')}' "
+                    f"(warm-path probe will run first)"
+                )
+            for info in infos:
+                pid = int(info.get("product_id", 0) or 0)
+                up = int(info.get("usage_page", 0) or 0)
+                usage = int(info.get("usage", 0) or 0)
+                transport = info.get("transport")
+                source = info.get("source", "unknown")
+                product = info.get("product_string") or "?"
+                path = _device_path_display(info.get("path"))
+                print(f"[HidGesture] Candidate PID=0x{pid:04X} UP=0x{up:04X} "
+                      f"usage=0x{usage:04X} transport={transport or '-'} "
+                      f"source={source} product={product} path={path or '-'}")
 
+        shared_manager = self._mac_manager()
         for info in infos:
             if self._deskflow_attach is not None:
                 return False
@@ -2939,6 +3422,7 @@ class HidGestureListener:
                             usage_page=open_info.get("usage_page", 0),
                             usage=open_info.get("usage", 0),
                             transport=open_info.get("transport"),
+                            shared_manager=shared_manager,
                         )
                         d.open()
                     else:
@@ -3236,36 +3720,86 @@ class HidGestureListener:
         Consuming an arrival also resets the backoff.
         """
         deadline = time.time() + delay_s
+        manager = self._iokit_manager
         while self._running and time.time() < deadline:
             if self._deskflow_attach is not None:
                 return
             if self._device_arrival.is_set():
                 self._device_arrival.clear()
                 self._reconnect_backoff_s = 0.0
+                self._present_backoff_s = 0.0
                 return
-            time.sleep(0.1)
+            # Pumping the listener run loop is what lets the IOKit
+            # device-matching callback fire (it sets _device_arrival).
+            step = max(0.0, min(0.1, deadline - time.time()))
+            if manager is not None:
+                manager.pump(step)
+            else:
+                time.sleep(step)
+
+    def _next_retry_delay(self, present):
+        """Delay before the next connect attempt after a failed one.
+
+        Present-but-not-connectable: exponential 1 s -> 30 s, reset on a
+        successful connect or a consumed device-arrival event. Absent: a
+        slow poll, since arrival notifications wake the loop early on
+        platforms that have them.
+        """
+        if present:
+            self._present_backoff_s = min(
+                PRESENT_BACKOFF_MAX_S,
+                max(PRESENT_BACKOFF_MIN_S, self._present_backoff_s * 2),
+            )
+            return self._present_backoff_s
+        return (
+            ABSENT_POLL_NOTIFIED_S
+            if self._has_arrival_notifications()
+            else ABSENT_POLL_UNNOTIFIED_S
+        )
+
+    def _log_retry(self, present, delay):
+        """Once per backoff step, not once per attempt."""
+        key = (bool(present), float(delay))
+        if key == self._last_retry_log_delay:
+            return
+        self._last_retry_log_delay = key
+        if present:
+            skipped = (
+                f" (enumeration skipped x{self._enumeration_skips})"
+                if self._enumeration_skips else ""
+            )
+            print(
+                "[HidGesture] device present but not connectable; "
+                f"retrying in {delay:.0f} s{skipped}"
+            )
+        else:
+            print(f"[HidGesture] No compatible device; retrying in {delay:.0f} s")
 
     def _main_loop(self):
         """Outer loop: connect → listen → reconnect on error/disconnect."""
-        retry_logged = False
+        try:
+            self._run_main_loop()
+        finally:
+            # The shared IOHIDManager is scheduled on this thread's run
+            # loop, so this thread releases it.
+            self._close_mac_manager()
+
+    def _run_main_loop(self):
         while self._running:
             if not self._try_connect():
                 # The device is enumerated but could not be opened (owned by
-                # the other machine mid-KVM-handoff, or still settling): poll
-                # back quickly so gestures come alive as soon as it is free.
-                # Nothing enumerated at all means no receiver is attached --
-                # that deserves the patient interval.
+                # the other machine mid-KVM-handoff, or still settling), or
+                # opened but exposed no REPROG_V4 (asleep). Back off; an
+                # IOKit arrival / WM_DEVICECHANGE cuts the wait short.
                 present = getattr(self, "_last_scan_had_candidates", False)
-                if not retry_logged:
-                    print(
-                        "[HidGesture] device present but not connectable; retrying fast…"
-                        if present
-                        else "[HidGesture] No compatible device; retrying in 5 s…"
-                    )
-                    retry_logged = True
-                self._wait_reconnect(0.25 if present else 5.0)
+                delay = self._next_retry_delay(present)
+                self._log_retry(present, delay)
+                self._wait_reconnect(delay)
                 continue
-            retry_logged = False
+            self._present_backoff_s = 0.0
+            self._enumeration_skips = 0
+            self._last_retry_log_delay = None
+            self._last_logged_scan_digest = None
             self._reconnect_requested = False
 
             self._connected = True
