@@ -67,7 +67,20 @@ class Engine:
         self._replay_inflight = False
         self._replay_pending_rerun = False
         self._replay_lock = threading.Lock()
-        self._mouse_release_timers = {}   # action_id → Timer for safety auto-release
+        # Safety auto-release: one monotonic deadline per held action, serviced
+        # by a single reusable "SafetyRelease" thread (created on first press)
+        # instead of a threading.Timer -- a real OS thread -- per button press.
+        self._clock = time.monotonic
+        self._release_cv = threading.Condition()
+        self._mouse_release_deadlines = {}   # action_id -> monotonic deadline
+        self._release_thread = None
+        # Device writes triggered from HID callbacks (SmartShift/DPI) run on
+        # one FIFO worker so ordering is preserved and no thread is spawned
+        # per press. `_workers_stop` retires both helper threads in stop().
+        self._workers_stop = threading.Event()
+        self._device_write_cv = threading.Condition()
+        self._device_write_queue = []   # (name, callable) in submit order
+        self._device_write_thread = None
         self._remote_device_server = None  # core/remote_device.py listener
         self._remote_forwarder = None      # core/remote_forward.py bridge client
         self._lock = threading.Lock()
@@ -222,17 +235,71 @@ class Engine:
                     self._report_gesture_outcome(event.event_type, label, "failed", str(exc))
         return handler
 
-    def _make_mouse_down_handler(self, action_id):
-        def _safety_release():
-            """Auto-release if the UP event never fires."""
+    # ------------------------------------------------------------------
+    # Safety auto-release (one thread, many deadlines)
+    # ------------------------------------------------------------------
+    SAFETY_RELEASE_S = 20.0
+
+    def _arm_safety_release(self, action_id):
+        """(Re)arm the auto-release deadline for ``action_id``.
+
+        Replaces the per-press ``threading.Timer``: the deadline lives in a
+        dict and a single long-lived thread sleeps until the earliest one.
+        Re-pressing the same action simply moves its deadline, which is what
+        cancelling the old timer and starting a new one used to do.
+        """
+        with self._release_cv:
+            self._mouse_release_deadlines[action_id] = (
+                self._clock() + self.SAFETY_RELEASE_S
+            )
+            thread = self._release_thread
+            if thread is None or not getattr(thread, "is_alive", lambda: False)():
+                self._release_thread = threading.Thread(
+                    target=self._safety_release_loop,
+                    daemon=True,
+                    name="SafetyRelease",
+                )
+                self._release_thread.start()
+            self._release_cv.notify()
+
+    def _disarm_safety_release(self, action_id):
+        with self._release_cv:
+            self._mouse_release_deadlines.pop(action_id, None)
+
+    def _safety_release_loop(self):
+        while True:
+            with self._release_cv:
+                # Exit when retired by stop(); also refuse to linger when
+                # this loop is not the engine's live release thread (a
+                # replaced worker, or a test running the target inline).
+                while not self._workers_stop.is_set():
+                    owner = self._release_thread is threading.current_thread()
+                    if not self._mouse_release_deadlines:
+                        if not owner:
+                            return
+                        self._release_cv.wait()
+                        continue
+                    action_id, deadline = min(
+                        self._mouse_release_deadlines.items(), key=lambda kv: kv[1]
+                    )
+                    now = self._clock()
+                    if deadline <= now:
+                        self._mouse_release_deadlines.pop(action_id, None)
+                        break
+                    if not owner:
+                        return
+                    self._release_cv.wait(deadline - now)
+                else:
+                    return
+            # Fire outside the lock: inject_mouse_up may take a while.
             try:
                 print(f"[Engine] SAFETY RELEASE fired for {action_id} (UP never received)")
-                self._mouse_release_timers.pop(action_id, None)
                 inject_mouse_up(action_id)
             except Exception as exc:
                 print(f"[Engine] _safety_release EXCEPTION for {action_id}: {exc}")
                 import traceback; traceback.print_exc()
 
+    def _make_mouse_down_handler(self, action_id):
         def handler(event):
             try:
                 if self._enabled:
@@ -241,13 +308,7 @@ class Engine:
                     )
                     inject_mouse_down(action_id)
                     # Safety: auto-release after 20s if UP event is never received
-                    old = self._mouse_release_timers.pop(action_id, None)
-                    if old is not None:
-                        old.cancel()
-                    t = threading.Timer(20.0, _safety_release)
-                    t.daemon = True
-                    self._mouse_release_timers[action_id] = t
-                    t.start()
+                    self._arm_safety_release(action_id)
             except Exception as exc:
                 print(f"[Engine] mouse_down_handler EXCEPTION for {action_id}: {exc}")
                 import traceback; traceback.print_exc()
@@ -260,15 +321,56 @@ class Engine:
                     self._emit_debug(
                         f"Mapped {event.event_type} -> {action_id} (mouse up)"
                     )
-                    # Cancel safety timer
-                    old = self._mouse_release_timers.pop(action_id, None)
-                    if old is not None:
-                        old.cancel()
+                    # Cancel safety deadline
+                    self._disarm_safety_release(action_id)
                     inject_mouse_up(action_id)
             except Exception as exc:
                 print(f"[Engine] mouse_up_handler EXCEPTION for {action_id}: {exc}")
                 import traceback; traceback.print_exc()
         return handler
+
+    # ------------------------------------------------------------------
+    # Device-write worker (one FIFO thread for HID-callback-triggered writes)
+    # ------------------------------------------------------------------
+    def _submit_device_write(self, name, fn):
+        """Queue ``fn`` for the single ``DeviceWrite`` thread.
+
+        Called from HID callbacks, where a synchronous ``hg.set_*`` would
+        deadlock on the HID loop. One FIFO worker replaces the
+        thread-per-press ``ToggleSmartShift``/``SwitchScrollMode``/``CycleDPI``
+        threads while keeping submit order, so nothing is dropped or
+        reordered.
+        """
+        with self._device_write_cv:
+            self._device_write_queue.append((name, fn))
+            thread = self._device_write_thread
+            if thread is None or not getattr(thread, "is_alive", lambda: False)():
+                self._device_write_thread = threading.Thread(
+                    target=self._device_write_loop,
+                    daemon=True,
+                    name="DeviceWrite",
+                )
+                self._device_write_thread.start()
+            self._device_write_cv.notify()
+
+    def _device_write_loop(self):
+        while True:
+            with self._device_write_cv:
+                while not self._device_write_queue:
+                    if self._workers_stop.is_set():
+                        return
+                    if self._device_write_thread is not threading.current_thread():
+                        # Replaced worker or inline (test) runner: drain, then leave.
+                        return
+                    self._device_write_cv.wait()
+                if self._workers_stop.is_set():
+                    return
+                name, fn = self._device_write_queue.pop(0)
+            try:
+                fn()
+            except Exception as exc:  # noqa: BLE001 - worker must survive
+                print(f"[Engine] {name} device write EXCEPTION: {exc}")
+                import traceback; traceback.print_exc()
 
     def _toggle_smart_shift(self):
         """Toggle SmartShift auto-switching on/off.
@@ -296,7 +398,7 @@ class Engine:
             def _write():
                 ok = hg.set_smart_shift(mode, new_enabled, threshold)
                 print(f"[Engine] toggle_smart_shift device write -> {'OK' if ok else 'FAILED'}")
-            threading.Thread(target=_write, daemon=True, name="ToggleSmartShift").start()
+            self._submit_device_write("toggle_smart_shift", _write)
 
     def _switch_scroll_mode(self):
         """Switch between ratchet and free-spin (Logi Options+ physical button behaviour).
@@ -322,7 +424,7 @@ class Engine:
             def _write():
                 ok = hg.set_smart_shift(new_mode, False, threshold)
                 print(f"[Engine] switch_scroll_mode device write -> {'OK' if ok else 'FAILED'}")
-            threading.Thread(target=_write, daemon=True, name="SwitchScrollMode").start()
+            self._submit_device_write("switch_scroll_mode", _write)
 
     _DEFAULT_DPI_PRESETS = [800, 1200, 1600, 2400]
 
@@ -356,7 +458,7 @@ class Engine:
         if hg:
             def _write():
                 hg.set_dpi(new_dpi)
-            threading.Thread(target=_write, daemon=True, name="CycleDPI").start()
+            self._submit_device_write("cycle_dpi", _write)
 
     def _apply_wheel_invert_setting(self, *, force: bool = False) -> None:
         """Drive HID++ firmware wheel-invert from settings + device
@@ -801,10 +903,7 @@ class Engine:
                 print(f"[Engine] remote forwarder notify failed: {exc!r}")
         if connection_changed:
             self._last_connection_state = connected
-            self._battery_poll_stop.set()
-            if self._battery_poll_thread is not None:
-                self._battery_poll_thread.join(timeout=5)
-                self._battery_poll_thread = None
+            self._retire_battery_poller()
         self._last_hid_features_ready = hid_features_ready
         if self._connection_change_cb:
             try:
@@ -812,14 +911,7 @@ class Engine:
             except Exception:
                 pass
         if connected and connection_changed:
-            self._battery_poll_stop = threading.Event()
-            self._battery_poll_thread = threading.Thread(
-                target=self._battery_poll_loop,
-                args=(self._battery_poll_stop,),
-                daemon=True,
-                name="BatteryPoll",
-            )
-            self._battery_poll_thread.start()
+            self._start_battery_poller()
         if hid_features_ready and hid_features_changed:
             self._request_saved_settings_replay()
             if self._remote_forwarder is not None:
@@ -828,8 +920,41 @@ class Engine:
                 except Exception as exc:  # noqa: BLE001 - relay boundary
                     print(f"[Engine] remote forwarder decode notify failed: {exc!r}")
 
+    def _retire_battery_poller(self):
+        """Signal the current poller to exit; never block on it.
+
+        This runs on the HID loop thread. The poller may be inside
+        ``hg.read_battery()`` waiting on that very thread, so a ``join`` here
+        (even with a timeout) either deadlocks for the timeout or returns
+        with the old poller still running. Every poller owns its stop Event
+        and all its waits are Event-based, so setting the flag is enough for
+        it to exit as soon as its current HID round-trip returns.
+        """
+        self._battery_poll_stop.set()
+        self._battery_poll_thread = None
+
+    def _start_battery_poller(self):
+        """Start exactly one BatteryPoll thread for the connected device."""
+        previous = self._battery_poll_thread
+        if previous is not None:
+            # Should not happen: connect without a disconnect in between.
+            # Retire it so there is never more than one live poller.
+            print("[Engine] battery poller already running; replacing it")
+            self._retire_battery_poller()
+        self._battery_poll_stop = threading.Event()
+        self._battery_poll_thread = threading.Thread(
+            target=self._battery_poll_loop,
+            args=(self._battery_poll_stop,),
+            daemon=True,
+            name="BatteryPoll",
+        )
+        self._battery_poll_thread.start()
+
     def _battery_poll_loop(self, stop_event):
-        """Read battery and smart shift mode periodically until disconnected."""
+        """Read battery and smart shift mode periodically until disconnected.
+
+        Every wait is ``stop_event``-based so a retire is honored promptly.
+        """
         _battery_poll_interval = 300   # seconds between battery reads
         _ss_poll_interval = 15         # seconds between scroll-mode reads
         _last_battery = time.time() - _battery_poll_interval  # fire immediately
@@ -1177,21 +1302,25 @@ class Engine:
     def stop(self):
         self._stop_remote_forwarder()
         self._stop_remote_device_server()
-        self._battery_poll_stop.set()
-        if self._battery_poll_thread is not None:
-            self._battery_poll_thread.join(timeout=5)
-            self._battery_poll_thread = None
+        poller = self._battery_poll_thread
+        self._retire_battery_poller()
+        # Retire the helper threads before the hook goes away. Clearing the
+        # deadlines first means a pending safety auto-release can no longer
+        # fire ``inject_mouse_up`` against a torn-down hook (a phantom
+        # release on every quit during a long press).
+        self._workers_stop.set()
+        with self._release_cv:
+            self._mouse_release_deadlines.clear()
+            self._release_cv.notify_all()
+        with self._device_write_cv:
+            self._device_write_cv.notify_all()
+        # stop() runs on the main thread, not the HID thread, so a bounded
+        # join is safe here; the pollers' waits are Event-based, so this
+        # returns as soon as any in-flight HID round-trip completes.
+        for thread in (poller, self._release_thread, self._device_write_thread):
+            if thread is not None and getattr(thread, "is_alive", lambda: False)():
+                thread.join(timeout=5)
+        self._release_thread = None
+        self._device_write_thread = None
         self._app_detector.stop()
         self.hook.stop()
-        # Cancel any pending safety auto-release timers. Without this the
-        # threading.Timer scheduled by execute_action can still fire after
-        # ``stop()`` returns and call ``inject_mouse_up`` against a hook
-        # that has already been torn down -- one of the timers fires a
-        # phantom release every time Mouser quits during a long press.
-        timers = list(self._mouse_release_timers.values())
-        self._mouse_release_timers.clear()
-        for timer in timers:
-            try:
-                timer.cancel()
-            except Exception as exc:  # noqa: BLE001 - shutdown must complete
-                print(f"[Engine] stop: failed to cancel release timer: {exc!r}")
