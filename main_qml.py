@@ -1421,6 +1421,20 @@ def main():
 
     QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     app = QApplication(argv)
+
+    # Start the raise-channel listener the instant QApplication exists --
+    # QLocalServer needs a QCoreApplication to construct, but nothing else
+    # below it (app metadata, icons, dock/tray setup) is a prerequisite for
+    # `listen()`. This closes the window where a second launch loses the
+    # lock race (correctly) but finds no one listening on the raise
+    # channel yet and silently does nothing instead of raising this
+    # window. The `newConnection` signal is wired up later, once
+    # `quit_app`/`show_main_window` exist; any connection that lands in the
+    # meantime is drained from the pending-connection queue at that point
+    # (see the `hasPendingConnections()` check right after the `connect()`
+    # below), so a connection made this early is never dropped.
+    single_server = _start_raise_server(app, _single_instance_server_name())
+
     app.setApplicationName("Mouser")
     app.setApplicationVersion(APP_VERSION)
     app.setOrganizationName("Mouser")
@@ -1454,8 +1468,6 @@ def main():
                 if t.ident:
                     traceback.print_stack(sys._current_frames().get(t.ident))
         signal.signal(signal.SIGUSR1, _dump_threads)
-
-    single_server = _start_raise_server(app, _single_instance_server_name())
 
     _t6 = _time.perf_counter()
     # ── Engine (created but started AFTER UI is visible) ───────
@@ -1686,6 +1698,15 @@ def main():
 
     if single_server is not None:
         single_server.newConnection.connect(_on_raise_connection)
+        # The server has been listening since right after QApplication was
+        # constructed (see above), well before this handler existed. Drain
+        # any connection that arrived in between -- Qt queues accepted
+        # connections on the server regardless of whether `newConnection`
+        # had a slot connected yet, so nothing here was silently dropped by
+        # that earlier gap. It only ran, so process it now instead of
+        # waiting for a *second* connection to trigger this signal.
+        if single_server.hasPendingConnections():
+            _on_raise_connection()
 
     def _update_tray_texts():
         """Refresh tray menu labels after a language change."""
