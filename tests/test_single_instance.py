@@ -219,12 +219,12 @@ class RaiseMessageTests(unittest.TestCase):
 
 
 PS_OUTPUT = """\
-    1     900 /sbin/launchd
-  411    3600 /Applications/Mouser.app/Contents/MacOS/Mouser
-  512      42 /Applications/Mouser.app/Contents/MacOS/Mouser --start-hidden
-  600      10 /Applications/Mouser.app/Contents/MacOS/MouserHelper
-  777       5 /Users/x/Desktop/Mouser/dist/Mouser.app/Contents/MacOS/Mouser
-  999       1 grep Mouser
+    1 2-03:00:00 /sbin/launchd
+  411 01:00:00 /Applications/Mouser.app/Contents/MacOS/Mouser
+  512    00:42 /Applications/Mouser.app/Contents/MacOS/Mouser --start-hidden
+  600    00:10 /Applications/Mouser.app/Contents/MacOS/MouserHelper
+  777    00:05 /Users/x/Desktop/Mouser/dist/Mouser.app/Contents/MacOS/Mouser
+  999    00:01 grep Mouser
 """
 
 
@@ -269,12 +269,18 @@ class StatusParsingTests(unittest.TestCase):
         with patch.object(si, "list_instances", return_value=[(1, 1), (2, 2)]):
             self.assertEqual(si.ctl_status(self.EXE), si.EXIT_MANY)
 
-    def test_list_instances_runs_ps_with_etimes(self):
+    def test_parse_etime_forms(self):
+        self.assertEqual(si.parse_etime("42"), 42)
+        self.assertEqual(si.parse_etime("00:42"), 42)
+        self.assertEqual(si.parse_etime("01:00:00"), 3600)
+        self.assertEqual(si.parse_etime("2-03:00:00"), 2 * 86400 + 3 * 3600)
+
+    def test_list_instances_runs_ps_with_etime(self):
         with patch.object(si.sys, "platform", "darwin"):
             with patch.object(si.subprocess, "run") as run:
                 run.return_value = MagicMock(stdout=PS_OUTPUT)
                 rows = si.list_instances(self.EXE)
-        self.assertEqual(run.call_args[0][0], ["ps", "-axo", "pid=,etimes=,command="])
+        self.assertEqual(run.call_args[0][0], ["ps", "-axo", "pid=,etime=,command="])
         self.assertEqual([pid for pid, _ in rows], [512, 411])
 
 

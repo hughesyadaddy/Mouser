@@ -367,8 +367,10 @@ def default_executable() -> str:
 
 
 def parse_ps_output(text: str, exe_path: str, own_pid: int | None = None) -> list[tuple[int, int]]:
-    """Parse ``ps -axo pid=,etimes=,command=`` into ``[(pid, elapsed_s), ...]``
-    for rows whose command starts with ``exe_path``.  Newest first."""
+    """Parse ``ps -axo pid=,etime=,command=`` into ``[(pid, elapsed_s), ...]``
+    for rows whose command starts with ``exe_path``.  Newest first.
+
+    ``etime`` is ``[[dd-]hh:]mm:ss`` (Darwin ``ps`` has no ``etimes``)."""
     exe_norm = os.path.normcase(exe_path)
     rows: list[tuple[int, int]] = []
     for line in text.splitlines():
@@ -377,7 +379,7 @@ def parse_ps_output(text: str, exe_path: str, own_pid: int | None = None) -> lis
             continue
         try:
             pid = int(parts[0])
-            elapsed = int(parts[1])
+            elapsed = parse_etime(parts[1])
         except ValueError:
             continue
         if own_pid is not None and pid == own_pid:
@@ -388,6 +390,24 @@ def parse_ps_output(text: str, exe_path: str, own_pid: int | None = None) -> lis
             rows.append((pid, elapsed))
     rows.sort(key=lambda item: item[1])
     return rows
+
+
+def parse_etime(text: str) -> int:
+    """``[[dd-]hh:]mm:ss`` (or a bare integer) -> seconds."""
+    if text.isdigit():
+        return int(text)
+    days = 0
+    if "-" in text:
+        day_part, text = text.split("-", 1)
+        days = int(day_part)
+    fields = [int(f) for f in text.split(":")]
+    if len(fields) == 2:
+        hours, (minutes, seconds) = 0, fields
+    elif len(fields) == 3:
+        hours, minutes, seconds = fields
+    else:
+        raise ValueError(text)
+    return ((days * 24 + hours) * 60 + minutes) * 60 + seconds
 
 
 def _windows_path_key(path: str) -> str:
@@ -445,7 +465,7 @@ def list_instances(exe_path: str | None = None) -> list[tuple[int, int]]:
         )
         return parse_cim_output(result.stdout, exe_path, own)
     result = subprocess.run(
-        ["ps", "-axo", "pid=,etimes=,command="],
+        ["ps", "-axo", "pid=,etime=,command="],
         capture_output=True,
         text=True,
         check=False,
