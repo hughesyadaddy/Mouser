@@ -127,7 +127,7 @@ class _Client:
     def __init__(self, port):
         self.sock = socket.create_connection(("127.0.0.1", port), timeout=3)
         self.sock.settimeout(3)
-        self.reader = self.sock.makefile("rb")
+        self._buffer = b""
 
     def send_raw(self, payload):
         self.sock.sendall(json.dumps(payload).encode() + b"\n")
@@ -136,8 +136,19 @@ class _Client:
         self.send_raw(payload)
         return self.recv()
 
+    def readline(self) -> bytes:
+        # Own line buffer (not makefile): a timed-out BufferedReader is
+        # poisoned for good, and _assert_silent relies on timing out.
+        while b"\n" not in self._buffer:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                return b""
+            self._buffer += chunk
+        line, _, self._buffer = self._buffer.partition(b"\n")
+        return line
+
     def recv(self) -> dict:
-        line = self.reader.readline()
+        line = self.readline()
         if not line:
             raise ConnectionError("peer closed")
         return json.loads(line)
@@ -163,11 +174,17 @@ class _Client:
 
     def close(self):
         for fn in (lambda: self.sock.shutdown(socket.SHUT_RDWR),
-                   self.reader.close, self.sock.close):
+                   self.sock.close):
             try:
                 fn()
             except OSError:
                 pass
+
+
+def _device(product_id=0xB042, name="MX Master 4"):
+    """What ``hook.connected_device`` looks like to the bridge."""
+    return SimpleNamespace(product_id=product_id, product_name=name,
+                           display_name=name)
 
 
 class _BridgeCase(unittest.TestCase):
@@ -182,6 +199,7 @@ class _BridgeCase(unittest.TestCase):
         self.statuses = []
         self.proto2_seen = Mock()
         self.decode = {"feat_idx": 7, "gesture_cid": "0x00C3", "rawxy": True}
+        self.device = None  # the physically attached mouse (server seat)
         self.server = BridgeServer(
             self.hook,
             port=0,
@@ -190,6 +208,7 @@ class _BridgeCase(unittest.TestCase):
             status_cb=self.statuses.append,
             transparent_transport=True,
             decode_supplier=lambda: self.decode,
+            device_supplier=lambda: self.device,
             on_proto2_seen=self.proto2_seen,
             heartbeat_s=self.heartbeat_s,
             dead_link_s=self.dead_link_s,
@@ -216,6 +235,15 @@ class _BridgeCase(unittest.TestCase):
         self.assertTrue(reply["ok"], reply)
         self.assertEqual(self.server.state, ATTACHED)
         return client
+
+    def _assert_silent(self, client, timeout=0.3):
+        """No line other than heartbeat pings within ``timeout``."""
+        client.sock.settimeout(timeout)
+        try:
+            with self.assertRaises((socket.timeout, ConnectionError)):
+                client.recv_skip_pings()
+        finally:
+            client.sock.settimeout(3)
 
 
 class HelloTests(_BridgeCase):
@@ -247,24 +275,33 @@ class HelloTests(_BridgeCase):
             self.client().hello()
         self.proto2_seen.assert_called_once()
 
-    def test_server_role_peer_receives_decode_on_hello(self):
+    def test_server_role_peer_gets_no_connect_without_a_device(self):
+        # Deskflow drops a standalone {"type":"decode"} as unknown, so the
+        # decode map only ever rides inside connect -- and there is nothing
+        # to announce until a device is attached.
         client = self.client()
         self.assertTrue(client.hello(role="server")["ok"])
-        msg = client.recv_skip_pings()
-        self.assertEqual(msg, {"type": "decode", "decode": self.decode})
+        self._assert_silent(client)
 
-    def test_notify_decode_changed_pushes_to_server_peers_only(self):
+    def test_notify_decode_changed_resends_connect_to_server_peers_only(self):
+        self.device = _device()
         server_peer = self.client()
         server_peer.hello(role="server")
-        server_peer.recv_skip_pings()  # initial publish
+        first = server_peer.recv_skip_pings()  # initial connect (hello replay)
+        self.assertEqual(first["type"], "connect")
+        self.assertEqual(first["device"]["decode"], self.decode)
         client_peer = self.client()
         client_peer.hello(role="client")
         self.decode = {"feat_idx": 9, "gesture_cid": "0x00C3", "rawxy": False}
         self.server.notify_decode_changed()
-        self.assertEqual(server_peer.recv_skip_pings()["decode"]["feat_idx"], 9)
-        client_peer.sock.settimeout(0.3)
-        with self.assertRaises((socket.timeout, ConnectionError)):
-            client_peer.recv()
+        msg = server_peer.recv_skip_pings()
+        self.assertEqual(msg["type"], "connect")
+        self.assertEqual(msg["device"]["decode"]["feat_idx"], 9)
+        self.assertEqual(msg["device"]["product_id"], "0xB042")
+        self._assert_silent(client_peer)
+        # Unchanged decode: no duplicate line.
+        self.server.notify_decode_changed()
+        self._assert_silent(server_peer)
 
 
 class StatusTests(_BridgeCase):
@@ -385,12 +422,146 @@ class FocusTests(_BridgeCase):
         self.assertEqual(self.server.state, PAUSED)
         self.assertEqual(self.listener.clears, 0)
 
-    def test_focus_before_attach_is_ignored(self):
+    def test_focus_before_attach_is_applied_after_attach(self):
         client = self.client()
         client.hello()
         client.send_raw({"t": "focus", "screen": "x", "here": False})
         client.send({"t": "status"})
-        self.assertEqual(self.server.state, HELLO)
+        self.assertEqual(self.server.state, HELLO)  # nothing to pause yet
+        reply = client.attach("s1")
+        self.assertTrue(reply["ok"], reply)
+        # The attach landed, then the remembered here:false paused it.
+        self.assertEqual(self.server.state, PAUSED)
+        self.assertEqual(self.listener.rebuilds, 1)
+        self.assertEqual(self.listener.pauses, 1)
+        # And a later here:true resumes as usual.
+        client.send_raw({"t": "focus", "screen": "here", "here": True})
+        self.assertTrue(_wait_until(lambda: self.server.state == ATTACHED))
+
+    def test_focus_here_before_attach_leaves_attach_live(self):
+        client = self.client()
+        client.hello()
+        client.send_raw({"t": "focus", "screen": "here", "here": True})
+        client.send({"t": "status"})
+        self.assertTrue(client.attach("s1")["ok"])
+        self.assertEqual(self.server.state, ATTACHED)
+        self.assertEqual(self.listener.pauses, 0)
+
+
+class ServerSeatTests(_BridgeCase):
+    """Mouser-A: the mouse is physically here, Deskflow is ``role: server``.
+
+    The bridge must announce the device (``connect``/``disconnect``, decode
+    inside the connect) and stand the local hook down while the cursor is
+    on another screen (``should_forward``)."""
+
+    def _server_peer(self):
+        client = self.client()
+        self.assertTrue(client.hello(role="server")["ok"])
+        return client
+
+    def test_device_connect_is_sent_to_server_peers_with_decode(self):
+        server_peer = self._server_peer()
+        client_peer = self.client()
+        client_peer.hello(role="client")
+        self.server.notify_device_connected(_device())
+        msg = server_peer.recv_skip_pings()
+        self.assertEqual(msg, {"type": "connect", "device": {
+            "product_name": "MX Master 4", "product_id": "0xB042",
+            "decode": self.decode,
+        }})
+        self._assert_silent(client_peer)
+        # No standalone decode line, ever.
+        self.server.notify_decode_changed()
+        self._assert_silent(server_peer)
+
+    def test_connect_omits_decode_until_feat_idx_known(self):
+        self.decode = None
+        server_peer = self._server_peer()
+        self.server.notify_device_connected(_device())
+        msg = server_peer.recv_skip_pings()
+        self.assertNotIn("decode", msg["device"])
+        # feat_idx lands later -> full connect again, now carrying decode.
+        self.decode = {"feat_idx": 3, "gesture_cid": "0x00C3", "rawxy": True}
+        self.server.notify_decode_changed()
+        msg = server_peer.recv_skip_pings()
+        self.assertEqual(msg["type"], "connect")
+        self.assertEqual(msg["device"]["decode"]["feat_idx"], 3)
+
+    def test_connect_replayed_on_reconnect_and_role_flip(self):
+        self.server.notify_device_connected(_device())
+        first = self._server_peer()
+        self.assertEqual(first.recv_skip_pings()["type"], "connect")
+        first.close()
+        # New server peer (Deskflow restarted): gets the cached connect.
+        second = self._server_peer()
+        msg = second.recv_skip_pings()
+        self.assertEqual(msg["type"], "connect")
+        self.assertEqual(msg["device"]["product_id"], "0xB042")
+        # A client-role peer that becomes the server mid-link also gets it.
+        third = self.client()
+        third.hello(role="client")
+        self._assert_silent(third)
+        third.send_raw({"t": "role", "role": "server"})
+        self.assertEqual(third.recv_skip_pings()["type"], "connect")
+        # ...and again on the next epoch, even if nothing changed.
+        third.send_raw({"t": "role", "role": "none"})
+        third.send_raw({"t": "role", "role": "server"})
+        self.assertEqual(third.recv_skip_pings()["type"], "connect")
+
+    def test_disconnect_sent_on_device_removal(self):
+        server_peer = self._server_peer()
+        self.server.notify_device_connected(_device())
+        server_peer.recv_skip_pings()
+        self.server.notify_device_disconnected()
+        self.assertEqual(server_peer.recv_skip_pings(), {"type": "disconnect"})
+        # Nothing announced -> nothing to retract; no duplicate disconnect.
+        self.server.notify_device_disconnected()
+        self._assert_silent(server_peer)
+        # A fresh peer after removal is told nothing until the mouse returns.
+        late = self._server_peer()
+        self._assert_silent(late)
+        self.server.notify_device_connected(_device())
+        self.assertEqual(late.recv_skip_pings()["type"], "connect")
+
+    def test_should_forward_follows_server_peer_focus(self):
+        flips = []
+        self.server.on_focus_change = lambda: flips.append(self.server.should_forward())
+        self.assertFalse(self.server.should_forward())
+        server_peer = self._server_peer()
+        server_peer.send_raw({"t": "focus", "screen": "office-pc", "here": False})
+        self.assertTrue(_wait_until(self.server.should_forward))
+        self.assertEqual(self.server.focus_screen, "office-pc")
+        self.assertEqual(self.server.status()["remote_focus"], True)
+        server_peer.send_raw({"t": "focus", "screen": "mac", "here": True})
+        self.assertTrue(_wait_until(lambda: not self.server.should_forward()))
+        self.assertIsNone(self.server.focus_screen)
+        self.assertEqual(flips, [True, False])
+        # send_event swallows: Deskflow relays the raw reports itself.
+        self.assertTrue(self.server.send_event("gesture_down"))
+
+    def test_client_peer_focus_does_not_flip_should_forward(self):
+        client = self.attached_client()
+        client.send_raw({"t": "focus", "screen": "other", "here": False})
+        self.assertTrue(_wait_until(lambda: self.server.state == PAUSED))
+        self.assertFalse(self.server.should_forward())
+
+    def test_should_forward_fails_safe_when_server_peer_drops(self):
+        server_peer = self._server_peer()
+        server_peer.send_raw({"t": "focus", "screen": "x", "here": False})
+        self.assertTrue(_wait_until(self.server.should_forward))
+        server_peer.close()
+        self.assertTrue(_wait_until(lambda: not self.server.should_forward()))
+
+    def test_should_forward_fails_safe_when_role_leaves_server(self):
+        server_peer = self._server_peer()
+        server_peer.send_raw({"t": "focus", "screen": "x", "here": False})
+        self.assertTrue(_wait_until(self.server.should_forward))
+        server_peer.send_raw({"t": "role", "role": "none"})
+        self.assertTrue(_wait_until(lambda: not self.server.should_forward()))
+        # Re-elected server: the last focus notice counts again.
+        server_peer.send_raw({"t": "role", "role": "server"})
+        self.assertTrue(_wait_until(self.server.should_forward))
 
 
 class HeartbeatTests(_BridgeCase):
@@ -456,6 +627,24 @@ class DeadLinkTests(_BridgeCase):
 
 
 class ByeTests(_BridgeCase):
+    def test_stop_sends_bye_shutdown_to_every_peer(self):
+        client = self.attached_client()
+        server_peer = self.client()
+        server_peer.hello(role="server")
+        self.server.stop()
+        self.assertEqual(client.recv_skip_pings(), {"t": "bye", "reason": "shutdown"})
+        self.assertEqual(server_peer.recv_skip_pings(), {"t": "bye", "reason": "shutdown"})
+        with self.assertRaises(ConnectionError):
+            client.recv_skip_pings()
+        self.assertEqual(self.server.state, IDLE)
+        self.assertFalse(self.server.should_forward())
+
+    def test_stop_restart_reason_is_relayed(self):
+        client = self.client()
+        client.hello()
+        self.server.stop(reason="restart")
+        self.assertEqual(client.recv_skip_pings(), {"t": "bye", "reason": "restart"})
+
     def test_bye_shutdown_clears(self):
         client = self.attached_client()
         client.send_raw({"t": "bye", "reason": "shutdown"})

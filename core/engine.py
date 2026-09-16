@@ -891,16 +891,23 @@ class Engine:
         connection_changed = connected != self._last_connection_state
         hid_features_ready = self.hid_features_ready
         hid_features_changed = hid_features_ready != self._last_hid_features_ready
-        if self._remote_forwarder is not None and connection_changed:
-            try:
-                if connected:
-                    self._remote_forwarder.notify_device_connected(
-                        self.hook.connected_device
-                    )
-                else:
-                    self._remote_forwarder.notify_device_disconnected()
-            except Exception as exc:  # noqa: BLE001 - relay boundary
-                print(f"[Engine] remote forwarder notify failed: {exc!r}")
+        if connection_changed:
+            # Device lifecycle goes to the proto-2 bridge (Deskflow dials
+            # us; ``role: server`` peers cache the connect line) and, while
+            # it is still running, the legacy dial-out forwarder.
+            for label, relay in (
+                ("bridge", self._remote_device_server),
+                ("remote forwarder", self._remote_forwarder),
+            ):
+                if relay is None or not hasattr(relay, "notify_device_connected"):
+                    continue
+                try:
+                    if connected:
+                        relay.notify_device_connected(self.hook.connected_device)
+                    else:
+                        relay.notify_device_disconnected()
+                except Exception as exc:  # noqa: BLE001 - relay boundary
+                    print(f"[Engine] {label} notify failed: {exc!r}")
         if connection_changed:
             self._last_connection_state = connected
             self._retire_battery_poller()
@@ -1100,7 +1107,8 @@ class Engine:
         with self._lock:
             self.cfg = load_config()
             self._stop_remote_forwarder()
-            self._stop_remote_device_server()
+            # "restart": Deskflow reconnects immediately instead of backing off.
+            self._stop_remote_device_server(reason="restart")
             self._start_remote_device_server()
             self._start_remote_forwarder()
 
@@ -1171,10 +1179,18 @@ class Engine:
             decode_override=remote_cfg.get("decode"),
             transparent_transport=transparent,
             decode_supplier=lambda: self.hook.gesture_decode_context(),
+            device_supplier=lambda: self.hook.connected_device,
             on_proto2_seen=self._on_bridge_proto2_seen,
         )
         if server.start():
             self._remote_device_server = server
+            # The bridge is the hook's focus gate (``should_forward``): local
+            # remaps stand down while a server-role Deskflow says the cursor
+            # is on another screen. A still-running legacy forwarder takes
+            # the slot over in _start_remote_forwarder and hands it back in
+            # _stop_remote_forwarder.
+            if self._remote_forwarder is None:
+                self.hook.set_remote_forwarder(server)
 
     def _on_bridge_proto2_seen(self):
         """First proto-2 hello: persist the marker and retire the legacy
@@ -1209,11 +1225,14 @@ class Engine:
             proto = 0
         return not (proto >= 2 and os.path.isfile(token_path()))
 
-    def _stop_remote_device_server(self):
-        if self._remote_device_server is None:
+    def _stop_remote_device_server(self, reason="shutdown"):
+        server = self._remote_device_server
+        if server is None:
             return
+        if getattr(self.hook, "_remote_forwarder", None) is server:
+            self.hook.set_remote_forwarder(None)
         try:
-            self._remote_device_server.stop()
+            server.stop(reason)
         except Exception as exc:  # noqa: BLE001 - shutdown must complete
             print(f"[Engine] stop: remote device server raised: {exc!r}")
         self._remote_device_server = None
@@ -1317,7 +1336,8 @@ class Engine:
     def _stop_remote_forwarder(self):
         if self._remote_forwarder is None:
             return
-        self.hook.set_remote_forwarder(None)
+        # Hand the focus gate back to the bridge (or clear it).
+        self.hook.set_remote_forwarder(self._remote_device_server)
         try:
             self._remote_forwarder.stop()
         except Exception as exc:  # noqa: BLE001 - shutdown must complete
@@ -1347,9 +1367,11 @@ class Engine:
         """Register a callback ``cb(state)`` invoked when Smart Shift is read."""
         self._smart_shift_read_cb = cb
 
-    def stop(self):
+    def stop(self, reason="shutdown"):
+        """``reason`` is relayed to bridge peers as ``{"t":"bye"}`` --
+        ``"shutdown"`` (default) or ``"restart"`` when the app relaunches."""
         self._stop_remote_forwarder()
-        self._stop_remote_device_server()
+        self._stop_remote_device_server(reason=reason)
         poller = self._battery_poll_thread
         self._retire_battery_poller()
         # Retire the helper threads before the hook goes away. Clearing the

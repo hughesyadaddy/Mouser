@@ -202,12 +202,14 @@ class BaseMouseHook:
         helper defensively before dispatching there as well so the
         contract stays platform-uniform.
 
-        When a remote forwarder reports active (KVM focus is on another
-        machine), the hook also stands down for button/gesture remaps:
-        Deskflow forwards pointer and scroll through untouched while the
-        DMSR bridge relays only decoded HID++ gesture/button events to
-        the focused client's Mouser. Scroll inversion is host-local and
-        is gated separately via :meth:`_apply_vscroll_invert_fallback`.
+        When the KVM link reports focus on another machine
+        (``should_forward()`` on the proto-2 ``core.bridge_server``
+        ``BridgeServer`` -- or the legacy ``RemoteForwarder`` while one is
+        still dialling out), the hook also stands down for button/gesture
+        remaps: Deskflow forwards pointer and scroll through untouched and
+        relays the HID++ reports to the focused client's Mouser. Scroll
+        inversion is host-local and is gated separately via
+        :meth:`_apply_vscroll_invert_fallback`.
         """
         if not self._logitech_device_bound():
             return False
@@ -276,7 +278,9 @@ class BaseMouseHook:
         return should_block and down_was_blocked
 
     def set_remote_forwarder(self, forwarder):
-        """Attach/detach a core.remote_forward.RemoteForwarder."""
+        """Attach/detach the KVM focus gate: a ``BridgeServer`` (proto 2)
+        or a legacy ``RemoteForwarder``. Either exposes ``should_forward()``,
+        ``send_event()`` and an ``on_focus_change`` slot."""
         self._remote_forwarder = forwarder
         if forwarder is not None:
             # Focus flips change _should_intercept_events; follow them.

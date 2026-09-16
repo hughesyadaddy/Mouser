@@ -530,6 +530,72 @@ class EngineDeskflowIntegrationTests(unittest.TestCase):
         engine.cfg["settings"]["deskflow"]["legacy_dial"] = True
         self.assertTrue(engine._legacy_dial_enabled())
 
+    def test_bridge_becomes_hook_focus_gate_and_gets_device_supplier(self):
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        engine, server_cls = self._engine(cfg, None, [])
+        server = server_cls.return_value
+        self.assertIs(engine.hook._remote_forwarder, server)
+        kwargs = server_cls.call_args.kwargs
+        engine.hook.connected_device = SimpleNamespace(product_id=0xB042)
+        self.assertIs(kwargs["device_supplier"](), engine.hook.connected_device)
+        # Stopping the bridge releases the gate and sends the bye reason.
+        engine._stop_remote_device_server()
+        server.stop.assert_called_once_with("shutdown")
+        self.assertIsNone(engine.hook._remote_forwarder)
+
+    def test_device_lifecycle_reaches_bridge_and_forwarder(self):
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        engine, server_cls = self._engine(cfg, None, [])
+        server = server_cls.return_value
+        forwarder = Mock()
+        engine._remote_forwarder = forwarder
+        device = SimpleNamespace(product_id=0xB042, product_name="MX Master 4")
+        engine.hook.connected_device = device
+        with patch("core.engine.threading.Thread", _RecordedThread):
+            engine._on_connection_change(True)
+            server.notify_device_connected.assert_called_once_with(device)
+            forwarder.notify_device_connected.assert_called_once_with(device)
+            # Same state again: no duplicate connect.
+            engine._on_connection_change(True)
+            server.notify_device_connected.assert_called_once()
+            engine._on_connection_change(False)
+        server.notify_device_disconnected.assert_called_once_with()
+        forwarder.notify_device_disconnected.assert_called_once_with()
+
+    def test_bridge_notify_failure_does_not_break_connection_change(self):
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        engine, server_cls = self._engine(cfg, None, [])
+        server_cls.return_value.notify_device_connected.side_effect = RuntimeError("boom")
+        seen = []
+        engine.set_connection_change_callback(seen.append)
+        with patch("core.engine.threading.Thread", _RecordedThread):
+            engine._on_connection_change(True)
+        self.assertEqual(seen[-1], True)
+
+    def test_stopping_forwarder_hands_focus_gate_back_to_bridge(self):
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        engine, server_cls = self._engine(cfg, None, [])
+        forwarder = Mock()
+        engine._remote_forwarder = forwarder
+        engine.hook.set_remote_forwarder(forwarder)
+        engine._stop_remote_forwarder()
+        self.assertIs(engine.hook._remote_forwarder, server_cls.return_value)
+
+    def test_reload_kvm_integration_stops_bridge_with_restart_reason(self):
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        engine, server_cls = self._engine(cfg, None, [])
+        server = server_cls.return_value
+        with (
+            patch("core.engine.load_config", return_value=cfg),
+            patch("core.deskflow_integration.resolve_integration", return_value=None),
+            patch("core.bridge_server.BridgeServer") as new_cls,
+        ):
+            new_cls.return_value.start.return_value = True
+            engine.reload_kvm_integration()
+        server.stop.assert_called_once_with("restart")
+        self.assertIs(engine._remote_device_server, new_cls.return_value)
+        self.assertIs(engine.hook._remote_forwarder, new_cls.return_value)
+
     def test_proto2_seen_persists_marker_and_stops_forwarder(self):
         cfg = copy.deepcopy(DEFAULT_CONFIG)
         engine, _server_cls = self._engine(cfg, None, [])
