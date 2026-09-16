@@ -894,9 +894,12 @@ def _install_native_macos_status_item(qmenu, on_left_click):
     # bar there is nothing to rebuild -- just make sure the button still
     # routes to the current handlers.
     if _MACOS_NATIVE_STATUS_ITEM is not None:
-        if not _macos_native_status_item_is_attached():
+        # An item the user dragged off the menu bar reports no window too;
+        # leave it hidden rather than force-showing it on every policy flip.
+        user_hidden = _macos_status_item_user_hidden(_MACOS_NATIVE_STATUS_ITEM)
+        if not user_hidden and not _macos_native_status_item_is_attached():
             _macos_try_reattach_status_item(_MACOS_NATIVE_STATUS_ITEM)
-        if _macos_native_status_item_is_attached():
+        if user_hidden or _macos_native_status_item_is_attached():
             if _MACOS_NATIVE_STATUS_TARGET is not None:
                 _macos_bind_status_item_handlers(
                     _MACOS_NATIVE_STATUS_TARGET, appkit, qmenu, on_left_click
@@ -1032,6 +1035,14 @@ def _macos_bind_status_item_handlers(target, appkit, qmenu, on_left_click) -> No
     target.setPyHandlers_(
         {"primary": on_left_click, "menu": _open_menu_at_cursor, "appkit": appkit}
     )
+
+
+def _macos_status_item_user_hidden(status_item) -> bool:
+    """True when the user removed the item from the menu bar (isVisible False)."""
+    try:
+        return not bool(status_item.isVisible())
+    except Exception:
+        return False
 
 
 def _macos_try_reattach_status_item(status_item) -> None:

@@ -386,11 +386,20 @@ class AppDetector:
         # One initial read so the profile matches the app that was already in
         # front when we started; everything after this is event-driven.
         self._deliver(self._read_foreground())
+        # Watchdog: if the observer installed but never fires (starved run
+        # loop, coalesced switches, background apps), fall back to one read
+        # every FALLBACK_POLL_INTERVAL of idle. 16x cheaper than the old poll.
+        idle = 0.0
         while not self._stop.is_set():
             try:
                 item = self._events.get(timeout=1.0)
             except queue.Empty:
+                idle += 1.0
+                if idle >= FALLBACK_POLL_INTERVAL:
+                    idle = 0.0
+                    self._deliver(self._read_foreground())
                 continue
+            idle = 0.0
             if item is _STOP_SENTINEL:
                 break
             self._deliver(item)
