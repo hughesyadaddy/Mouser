@@ -21,6 +21,18 @@ RUN_VALUE_NAME = "Mouser"
 # macOS
 MACOS_LAUNCH_AGENT_LABEL = "io.github.hughesyadaddy.mouser"
 MACOS_PLIST_NAME = f"{MACOS_LAUNCH_AGENT_LABEL}.plist"
+MACOS_BUNDLE_ID = MACOS_LAUNCH_AGENT_LABEL
+MACOS_LAUNCHD_THROTTLE_SECONDS = 5
+
+# Windows: scheduled tasks left behind by earlier launch experiments.  The
+# HKCU Run value is the only sanctioned launcher; these are removed on install.
+WINDOWS_STALE_SCHEDULED_TASKS = (
+    "MouserStart",
+    "MouserDist",
+    "MouserExe",
+    "MouserSrc",
+    "MouserProbe",
+)
 
 # Linux
 LINUX_APP_ID = "io.github.tombadash.mouser"
@@ -366,6 +378,66 @@ def _macos_plist_path() -> str:
     )
 
 
+def _macos_log_dir() -> str:
+    return os.path.expanduser(os.path.join("~", "Library", "Logs", "Mouser"))
+
+
+def macos_launch_agent_payload(program_arguments: list[str]) -> dict:
+    """LaunchAgent plist contents.
+
+    ``KeepAlive/SuccessfulExit=false`` makes launchd relaunch Mouser after a
+    crash or a kill but *not* after a clean quit (tray Quit, ``--ctl stop``),
+    so installers can stop it without a resurrection race.  ``ProcessType``
+    ``Interactive`` keeps it out of the background-QoS band, and
+    ``AssociatedBundleIdentifiers`` attributes it correctly in Login Items.
+    """
+    log_dir = _macos_log_dir()
+    return {
+        "Label": MACOS_LAUNCH_AGENT_LABEL,
+        "ProgramArguments": list(program_arguments),
+        "RunAtLoad": True,
+        "KeepAlive": {"SuccessfulExit": False},
+        "ProcessType": "Interactive",
+        "AssociatedBundleIdentifiers": [MACOS_BUNDLE_ID],
+        "StandardOutPath": os.path.join(log_dir, "launchd.out.log"),
+        "StandardErrorPath": os.path.join(log_dir, "launchd.err.log"),
+        "ThrottleInterval": MACOS_LAUNCHD_THROTTLE_SECONDS,
+    }
+
+
+def remove_stale_scheduled_tasks(
+    task_names: tuple[str, ...] = WINDOWS_STALE_SCHEDULED_TASKS,
+) -> list[str]:
+    """One-time Windows cleanup: unregister leftover Mouser scheduled tasks.
+
+    Returns the task names that were handed to ``Unregister-ScheduledTask``.
+    No-op on other platforms.
+    """
+    if sys.platform != "win32":
+        return []
+    names = ", ".join("'" + name.replace("'", "''") + "'" for name in task_names)
+    script = (
+        f"foreach ($n in @({names})) {{ "
+        "if (Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue) { "
+        "Unregister-ScheduledTask -TaskName $n -Confirm:$false; "
+        "Write-Output $n } }"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        print(f"[startup] scheduled-task cleanup skipped: {exc}", file=sys.stderr)
+        return []
+    removed = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    for name in removed:
+        print(f"[startup] removed stale scheduled task {name}")
+    return removed
+
+
 def _launchctl_run(args: list) -> subprocess.CompletedProcess:
     return subprocess.run(
         args,
@@ -459,11 +531,13 @@ def _apply_macos(enabled: bool, *, program_arguments: list[str] | None = None) -
                     f"failed to preserve existing launch agent: {exc}"
                 ) from exc
             _launchctl_run(["launchctl", "bootout", domain, plist_path])
-        payload = {
-            "Label": MACOS_LAUNCH_AGENT_LABEL,
-            "ProgramArguments": program_arguments or _program_arguments(),
-            "RunAtLoad": True,
-        }
+        payload = macos_launch_agent_payload(
+            program_arguments or _program_arguments()
+        )
+        try:
+            os.makedirs(_macos_log_dir(), exist_ok=True)
+        except OSError:
+            pass
         new_plist = plistlib.dumps(payload, fmt=plistlib.FMT_XML)
         try:
             _atomic_write_file(plist_path, new_plist)

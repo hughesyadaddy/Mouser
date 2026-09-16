@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
-import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,108 +82,56 @@ def iter_known_install_roots() -> list[Path]:
     return unique
 
 
-def _stop_macos_instances(install_roots: list[Path]) -> bool:
-    stopped = False
-    subprocess.run(
-        [
-            "osascript",
-            "-e",
-            'tell application "Mouser" to quit',
-        ],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    time.sleep(0.75)
-
-    for root in install_roots:
+def _install_root_executable(root: Path) -> Path | None:
+    """Image path Mouser runs from for a given install root, if it exists."""
+    if sys.platform == "darwin":
         if not root.name.endswith(".app"):
-            continue
-        executable = _macos_bundle_executable(root)
-        if not executable.is_file():
-            continue
-        result = subprocess.run(
-            ["pkill", "-f", str(executable)],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if result.returncode == 0:
-            stopped = True
-            print(f"[*] Stopped Mouser running from {root}")
-
-    result = subprocess.run(
-        ["pkill", "-x", MACOS_EXECUTABLE],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode == 0:
-        stopped = True
-        print("[*] Stopped running Mouser process(es)")
-    if stopped:
-        time.sleep(0.5)
-    return stopped
-
-
-def _stop_windows_instances(install_roots: list[Path]) -> bool:
-    stopped = False
-    result = subprocess.run(
-        ["taskkill", "/IM", WINDOWS_EXECUTABLE, "/F", "/T"],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode == 0:
-        stopped = True
-        print("[*] Stopped running Mouser.exe instance(s) before install")
-
-    for root in install_roots:
-        if not root.is_dir():
-            continue
+            return None
+        exe = _macos_bundle_executable(root)
+    elif sys.platform == "win32":
         exe = root / WINDOWS_EXECUTABLE
-        if not exe.is_file():
-            continue
-        ps = (
-            "$target = '"
-            + str(exe).replace("'", "''")
-            + "'; "
-            "$procs = Get-CimInstance Win32_Process -Filter "
-            f"\"Name = '{WINDOWS_EXECUTABLE}'\" | "
-            "Where-Object { $_.ExecutablePath -and "
-            "($_.ExecutablePath -eq $target -or $_.ExecutablePath -like ($target + '*')) }; "
-            "foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }"
-        )
-        probe = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                ps,
-            ],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if probe.returncode == 0 and probe.stdout.strip():
-            stopped = True
+    else:
+        return None
+    return exe if exe.is_file() else None
 
-    if stopped:
-        time.sleep(1)
-    return stopped
+
+def run_ctl(verb: str, install_root: Path | None = None, **kwargs) -> int:
+    """Dispatch a ``--ctl`` verb in-process (``core.single_instance``).
+
+    Installers call the verbs directly instead of exec'ing the installed
+    binary: ``stop`` runs while the old build may be half-broken, and ``start``
+    must never depend on ``open``/``Start-Process`` (both re-launch races).
+    """
+    from core import single_instance
+
+    if verb == "stop":
+        roots = [install_root] if install_root is not None else iter_known_install_roots()
+        exe_paths = [str(exe) for exe in (_install_root_executable(r) for r in roots) if exe]
+        if not exe_paths:
+            exe_paths = [single_instance.default_executable()]
+        return single_instance.ctl_stop(exe_paths, **kwargs)
+    exe = _install_root_executable(install_root) if install_root is not None else None
+    exe_path = str(exe) if exe else None
+    if verb == "start":
+        return single_instance.ctl_start(exe_path, **kwargs)
+    if verb == "status":
+        return single_instance.ctl_status(exe_path)
+    if verb == "assert-single":
+        return single_instance.ctl_assert_single(exe_path, **kwargs)
+    raise ValueError(f"unknown ctl verb: {verb}")
 
 
 def stop_running_instances() -> None:
-    """Quit/kill Mouser from every known install location before replacing files."""
+    """``ctl stop`` every known install location before replacing files.
+
+    One graceful ``{"cmd":"quit"}`` over the raise channel (which really quits,
+    bypassing the macOS quit-to-tray filter), then SIGKILL/taskkill by PID.
+    """
     if sys.platform not in {"darwin", "win32"}:
         return
-    roots = iter_known_install_roots()
-    if sys.platform == "darwin":
-        _stop_macos_instances(roots)
-        return
-    _stop_windows_instances(roots)
+    code = run_ctl("stop")
+    if code != 0:
+        print("[!] Some Mouser processes survived ctl stop", file=sys.stderr)
 
 
 def installed_program_arguments(install_root: Path) -> list[str]:
@@ -207,6 +153,12 @@ def sync_login_startup_after_install(install_root: Path) -> None:
 
     if not supports_login_startup():
         return
+    if sys.platform == "win32":
+        # The Run key is the only launcher; drop leftovers from earlier
+        # scheduled-task experiments (MouserStart/Dist/Exe/Src/Probe).
+        from core.startup import remove_stale_scheduled_tasks
+
+        remove_stale_scheduled_tasks()
     try:
         cfg = load_config()
     except Exception as exc:
@@ -232,24 +184,14 @@ def sync_login_startup_after_install(install_root: Path) -> None:
 
 
 def launch_installed_application(install_root: Path) -> None:
-    """Start the freshly installed build from its install directory."""
+    """``ctl start`` the freshly installed build -- exactly once, never ``open``."""
     install_root = install_root.resolve()
-    if sys.platform == "darwin":
-        if not install_root.is_dir():
-            raise FileNotFoundError(f"Install bundle not found: {install_root}")
-        executable = _macos_bundle_executable(install_root)
-        if not executable.is_file():
-            raise FileNotFoundError(f"Install executable not found: {executable}")
-        print(f"[*] Launching {install_root}")
-        subprocess.run(["open", str(install_root)], check=True)
-        return
-
-    if sys.platform == "win32":
-        exe = install_root / WINDOWS_EXECUTABLE
-        if not exe.is_file():
-            raise FileNotFoundError(f"Install executable not found: {exe}")
-        print(f"[*] Launching {exe}")
-        os.startfile(str(exe))  # noqa: S606 — intentional GUI relaunch
-        return
-
-    raise RuntimeError(f"launch_installed_application is unsupported on {sys.platform}")
+    if sys.platform not in {"darwin", "win32"}:
+        raise RuntimeError(f"launch_installed_application is unsupported on {sys.platform}")
+    exe = _install_root_executable(install_root)
+    if exe is None:
+        raise FileNotFoundError(f"Install executable not found under: {install_root}")
+    print(f"[*] Starting {exe} via ctl start")
+    code = run_ctl("start", install_root)
+    if code != 0:
+        raise RuntimeError(f"ctl start failed with exit code {code}")

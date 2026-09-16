@@ -317,7 +317,7 @@ def build_and_install_macos(*, dry_run: bool = False) -> None:
     # on, which breaks the signature on copy and prevents the app from launching
     # from /Applications ("code signature invalid"). ditto copies the bundle
     # byte-for-byte including signing metadata.
-    print("[*] Stopping running Mouser instances...")
+    print("[*] ctl stop: quitting running Mouser instances...")
     stop_running_instances()
     if install_path.exists():
         shutil.rmtree(install_path)

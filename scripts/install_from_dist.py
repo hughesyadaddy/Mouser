@@ -47,7 +47,7 @@ def install_macos_from_dist() -> None:
                 f"Refusing to install {build_output}: not signed with a real "
                 "identity (ad-hoc signatures reset TCC grants on every deploy)"
             )
-    print("[*] Stopping running Mouser instances...")
+    print("[*] ctl stop: quitting running Mouser instances...")
     stop_running_instances()
 
     if install_path.exists():
@@ -77,7 +77,7 @@ def install_windows_from_dist() -> None:
     )
 
     print(f"Installing {build_output} -> {install_path} ({scope} scope)")
-    print("[*] Stopping running Mouser instances...")
+    print("[*] ctl stop: quitting running Mouser instances...")
     stop_running_instances()
     replace_tree(build_output, install_path)
     shell = finalize_windows_install(install_path, scope=scope)
