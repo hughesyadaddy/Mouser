@@ -1,3 +1,21 @@
+# Target content for hughesyadaddy/Mouser:.github/workflows/release.yml
+# (staged here because this fix was authored from the deskflow worktree; copy
+# verbatim into the Mouser repo). Replaces the workflow that published an
+# unsigned Windows zip and whose macOS job exited 2 for lack of
+# MOUSER_SIGN_IDENTITY.
+#
+# Signing gates:
+#   build-macos   runs only when secrets.MOUSER_SIGN_IDENTITY is set (plus
+#                 MOUSER_SIGN_P12 / MOUSER_SIGN_P12_PASSWORD to import the
+#                 cert into a throwaway keychain); otherwise it is SKIPPED
+#                 with a warning annotation.
+#   build-windows runs only when secrets.FLEET_SIGN_PFX (base64 PFX, optional
+#                 FLEET_SIGN_PFX_PASSWORD) is set; signs dist\Mouser with
+#                 deskflow/scripts/sign-windows.ps1 (.exe/.dll/.pyd/.sys, RFC
+#                 3161 timestamp mandatory); otherwise SKIPPED with a warning.
+#   release       runs on tags only and FAILS (never publishes) unless every
+#                 platform build succeeded, so an unsigned artifact can never
+#                 reach a GitHub Release.
 name: Release
 
 on:
@@ -13,12 +31,48 @@ env:
   MOUSER_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
   MOUSER_GIT_COMMIT: ${{ github.sha }}
   MOUSER_GIT_DIRTY: "false"
+  # deskflow checkout that provides scripts/sign-windows.ps1.
+  DESKFLOW_REPO: hughesyadaddy/deskflow
+  DESKFLOW_REF: ${{ vars.DESKFLOW_REF || 'fleet/memory-program' }}
 
 jobs:
+  # `secrets` is not available in a job-level `if`, so resolve the signing
+  # gates once here and fan out via outputs.
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      mac_signing: ${{ steps.gate.outputs.mac_signing }}
+      win_signing: ${{ steps.gate.outputs.win_signing }}
+    steps:
+      - id: gate
+        env:
+          HAS_MAC_IDENTITY: ${{ secrets.MOUSER_SIGN_IDENTITY != '' }}
+          HAS_WIN_PFX: ${{ secrets.FLEET_SIGN_PFX != '' }}
+        run: |
+          echo "mac_signing=$HAS_MAC_IDENTITY" >> "$GITHUB_OUTPUT"
+          echo "win_signing=$HAS_WIN_PFX" >> "$GITHUB_OUTPUT"
+          if [ "$HAS_MAC_IDENTITY" != "true" ]; then
+            echo "::warning title=build-macos skipped::secrets.MOUSER_SIGN_IDENTITY is not set. Unsigned macOS builds are never produced or published; add MOUSER_SIGN_IDENTITY (SHA-1 of the codesigning identity), MOUSER_SIGN_P12 (base64 .p12) and MOUSER_SIGN_P12_PASSWORD to enable the job."
+          fi
+          if [ "$HAS_WIN_PFX" != "true" ]; then
+            echo "::warning title=build-windows skipped::secrets.FLEET_SIGN_PFX is not set. Unsigned Windows builds are never produced or published; add FLEET_SIGN_PFX (base64 .pfx) and FLEET_SIGN_PFX_PASSWORD to enable the job."
+          fi
+
   build-windows:
+    needs: preflight
+    if: needs.preflight.outputs.win_signing == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
+
+      - name: Check out deskflow (sign-windows.ps1)
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.DESKFLOW_REPO }}
+          ref: ${{ env.DESKFLOW_REF }}
+          path: deskflow
+          sparse-checkout: |
+            scripts/sign-windows.ps1
 
       - uses: actions/setup-python@v6
         with:
@@ -30,6 +84,37 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller Mouser.spec --noconfirm
 
+      - name: Import fleet signing certificate
+        shell: pwsh
+        env:
+          FLEET_SIGN_PFX: ${{ secrets.FLEET_SIGN_PFX }}
+          FLEET_SIGN_PFX_PASSWORD: ${{ secrets.FLEET_SIGN_PFX_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pfx = Join-Path $env:RUNNER_TEMP 'fleet-sign.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:FLEET_SIGN_PFX))
+          try {
+            $args = @{ FilePath = $pfx; CertStoreLocation = 'Cert:\CurrentUser\My' }
+            if ($env:FLEET_SIGN_PFX_PASSWORD) {
+              $args.Password = ConvertTo-SecureString $env:FLEET_SIGN_PFX_PASSWORD -AsPlainText -Force
+            }
+            $cert = Import-PfxCertificate @args
+          } finally {
+            Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
+          }
+          if (-not $cert -or -not $cert.Thumbprint) { throw 'FLEET_SIGN_PFX did not import a certificate.' }
+          "DESKFLOW_SIGN_THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Imported signing certificate $($cert.Thumbprint) ($($cert.Subject))"
+
+      - name: Sign dist (exe/dll/pyd/sys, timestamped) and verify
+        shell: pwsh
+        # sign-windows.ps1 throws on any unsigned/mismatched file and refuses
+        # to sign without a timestamp (no -AllowNoTimestamp here).
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & "$PWD\deskflow\scripts\sign-windows.ps1" -Root "$PWD\dist\Mouser" -EnvFile "$env:RUNNER_TEMP\no.env"
+          if ($LASTEXITCODE) { throw "sign-windows.ps1 exited $LASTEXITCODE" }
+
       - name: Create archive
         run: Compress-Archive -Path dist\Mouser -DestinationPath Mouser-Windows.zip
 
@@ -40,6 +125,8 @@ jobs:
 
   build-macos:
     name: build-macos (${{ matrix.name }})
+    needs: preflight
+    if: needs.preflight.outputs.mac_signing == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -68,12 +155,52 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Build macOS app
+      - name: Import signing certificate into a throwaway keychain
+        env:
+          MOUSER_SIGN_P12: ${{ secrets.MOUSER_SIGN_P12 }}
+          MOUSER_SIGN_P12_PASSWORD: ${{ secrets.MOUSER_SIGN_P12_PASSWORD }}
+          MOUSER_SIGN_IDENTITY: ${{ secrets.MOUSER_SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MOUSER_SIGN_P12:-}" ]; then
+            echo "::error::MOUSER_SIGN_IDENTITY is set but MOUSER_SIGN_P12 (base64 .p12) is not; cannot sign." >&2
+            exit 1
+          fi
+          KEYCHAIN="$RUNNER_TEMP/mouser-sign.keychain-db"
+          KEYCHAIN_PW="$(head -c 32 /dev/urandom | base64)"
+          P12="$RUNNER_TEMP/mouser-sign.p12"
+          echo "$MOUSER_SIGN_P12" | base64 --decode > "$P12"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security import "$P12" -P "${MOUSER_SIGN_P12_PASSWORD:-}" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          rm -f "$P12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          if ! security find-identity -v -p codesigning "$KEYCHAIN" | grep -q "$MOUSER_SIGN_IDENTITY"; then
+            echo "::error::identity $MOUSER_SIGN_IDENTITY not found in the imported .p12" >&2
+            security find-identity -v -p codesigning "$KEYCHAIN" || true
+            exit 1
+          fi
+
+      - name: Build macOS app (signed)
         env:
           PYINSTALLER_TARGET_ARCH: ${{ matrix.pyinstaller_target_arch }}
+          MOUSER_SIGN_IDENTITY: ${{ secrets.MOUSER_SIGN_IDENTITY }}
         run: |
           chmod +x build_macos_app.sh
           ./build_macos_app.sh
+
+      - name: Verify signature is not ad-hoc
+        run: |
+          set -euo pipefail
+          codesign --verify --deep --strict --verbose=2 dist/Mouser.app
+          info="$(codesign -dvv dist/Mouser.app 2>&1)"
+          if echo "$info" | grep -qE 'Signature=adhoc|flags=.*adhoc'; then
+            echo "::error::dist/Mouser.app is ad-hoc signed; refusing to publish." >&2
+            echo "$info"; exit 1
+          fi
+          echo "$info" | grep -E 'Identifier=|Authority=|TeamIdentifier=|flags='
 
       - name: Create archive
         run: cd dist && zip -r -y "../${{ matrix.archive_name }}" Mouser.app
@@ -220,10 +347,28 @@ jobs:
           path: Mouser-Linux.zip
 
   release:
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: [build-windows, build-macos, build-linux]
+    # always() so a skipped build reaches this job and fails it loudly instead
+    # of silently skipping the release (and instead of publishing a partial set).
+    if: always() && startsWith(github.ref, 'refs/tags/')
+    needs: [preflight, build-windows, build-macos, build-linux]
     runs-on: ubuntu-latest
     steps:
+      - name: Refuse to publish unless every platform built signed
+        env:
+          WIN: ${{ needs.build-windows.result }}
+          MAC: ${{ needs.build-macos.result }}
+          LNX: ${{ needs.build-linux.result }}
+        run: |
+          rc=0
+          for pair in "build-windows=$WIN" "build-macos=$MAC" "build-linux=$LNX"; do
+            job="${pair%%=*}"; res="${pair#*=}"
+            if [ "$res" != "success" ]; then
+              echo "::error title=release blocked::$job result is '$res' (skipped = signing secret missing). Nothing is published." >&2
+              rc=1
+            fi
+          done
+          exit $rc
+
       - uses: actions/checkout@v6
 
       - uses: actions/download-artifact@v8
