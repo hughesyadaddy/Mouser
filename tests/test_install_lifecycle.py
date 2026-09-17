@@ -50,8 +50,14 @@ class InstallLifecycleTests(unittest.TestCase):
         )
 
     def test_stop_never_uses_osascript_or_pkill(self):
+        # iter_known_install_roots is mocked too (not just list_instance_pids)
+        # so this never evaluates Path.is_file() against the real
+        # /Applications/Mouser.app, matching the pattern above -- fragile
+        # otherwise if a future refactor makes ctl_stop act on paths rather
+        # than only PIDs.
         with (
             mock.patch.object(install_lifecycle.sys, "platform", "darwin"),
+            mock.patch.object(install_lifecycle, "iter_known_install_roots", return_value=[]),
             mock.patch("core.single_instance.subprocess.run") as run,
             mock.patch("core.single_instance.request_quit", return_value=False),
             mock.patch("core.single_instance.list_instance_pids", return_value=[]),

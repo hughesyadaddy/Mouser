@@ -84,6 +84,10 @@ class BuildAndInstallTests(unittest.TestCase):
         )
 
     def test_build_and_install_macos_stops_before_install(self):
+        # MOUSER_INSTALL_DIR must be set to a tmp path: build_and_install_macos()
+        # resolves the real DEFAULT_MACOS_INSTALL_DIR (/Applications) and
+        # shutil.rmtree()s whatever's already there when it isn't overridden.
+        # Without this, this test deletes the real, installed /Applications/Mouser.app.
         with mock.patch.object(installer, "stop_running_instances") as stop:
             with mock.patch.object(installer, "resolve_macos_sign_identity", return_value="SIGN"):
                 with mock.patch.object(installer, "run_command"):
@@ -92,8 +96,13 @@ class BuildAndInstallTests(unittest.TestCase):
                             root = Path(tmp)
                             dist = root / "dist" / installer.MACOS_APP_NAME
                             dist.mkdir(parents=True)
+                            install_dir = root / "Applications"
+                            install_dir.mkdir()
                             with mock.patch.object(installer, "ROOT", root):
-                                installer.build_and_install_macos()
+                                with mock.patch.dict(
+                                    os.environ, {"MOUSER_INSTALL_DIR": str(install_dir)}, clear=False
+                                ):
+                                    installer.build_and_install_macos()
             stop.assert_called_once()
 
     def test_main_rejects_unsupported_platform(self):
