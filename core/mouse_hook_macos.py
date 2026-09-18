@@ -171,6 +171,10 @@ class MouseHook(BaseMouseHook):
         self._init_dispatch_queue(maxsize=512)
         self._dispatch_thread = None
         self._first_event_logged = False
+        # Lifetime count of kCGEventTapDisabledBy* re-enables; sampled by
+        # the self-check watchdog (macOS kills the tap when the callback
+        # stalls, so a climbing count means the main thread is starved).
+        self.tap_reenable_total = 0
         # Cursor anchoring for the event-tap gesture path (devices that can't
         # stream HID++ rawXY, e.g. the original MX Master). _last_cursor_pos
         # tracks the pre-gesture pointer location; on a gesture press we pin
@@ -361,9 +365,11 @@ class MouseHook(BaseMouseHook):
                 _kCGEventTapDisabledByTimeout,
                 _kCGEventTapDisabledByUserInput,
             ):
+                self.tap_reenable_total += 1
                 print(
                     f"[MouseHook] CGEventTap disabled by system "
-                    f"(type=0x{event_type:X}), re-enabling",
+                    f"(type=0x{event_type:X}), re-enabling "
+                    f"(total={self.tap_reenable_total})",
                     flush=True,
                 )
                 Quartz.CGEventTapEnable(self._tap, True)

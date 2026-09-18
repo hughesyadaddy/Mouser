@@ -44,6 +44,7 @@ from core.key_simulator import (
     valid_custom_key_names,
 )
 from core.mouse_hook_types import DEVICE_SOURCE_DESKFLOW_SHIM
+from core.self_watchdog import SelfWatchdog, TICK_S as WATCHDOG_TICK_S
 from core.startup import (
     apply_login_startup,
     supports_login_startup,
@@ -299,6 +300,21 @@ class Backend(QObject):
         self._update_timer.setInterval(DEFAULT_AUTO_CHECK_INTERVAL_SECONDS * 1000)
         self._update_timer.timeout.connect(lambda: self._startUpdateCheck(manual=False))
         self._wheel_divert_active = False
+        self._watchdog = None
+        self._watchdog_timer = None
+        if engine is not None:
+            self._watchdog = SelfWatchdog(
+                hid_listener=lambda: getattr(
+                    getattr(engine, "hook", None), "_hid_gesture", None
+                ),
+                mouse_hook=lambda: getattr(engine, "hook", None),
+                reconnect=self._watchdog_reconnect,
+                exit_enabled=self._watchdog_exit_enabled,
+            )
+            self._watchdog_timer = QTimer(self)
+            self._watchdog_timer.setInterval(int(WATCHDOG_TICK_S * 1000))
+            self._watchdog_timer.timeout.connect(self._watchdog.tick)
+            self._watchdog_timer.start()
 
         # Lazily-computed list snapshots for QML bindings. Every read of a
         # ``@Property(list, ...)`` returns the cached value until the
@@ -403,6 +419,14 @@ class Backend(QObject):
         self._configureUpdateChecks()
         self._consumeUpdateResultMarker()
         self._cleanupStaleUpdatePreparation()
+
+    def _watchdog_reconnect(self):
+        hg = getattr(getattr(self._engine, "hook", None), "_hid_gesture", None)
+        if hg is not None:
+            hg.force_reconnect()
+
+    def _watchdog_exit_enabled(self) -> bool:
+        return bool(self._cfg.get("settings", {}).get("watchdog_exit", True))
 
     # ── Properties ─────────────────────────────────────────────
 

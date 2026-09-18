@@ -1561,6 +1561,9 @@ class HidGestureListener:
         # exponentially instead of hammering open/probe/timeout loops that
         # peg a core and starve the WH_MOUSE_LL hook chain.
         self._reconnect_backoff_s = 0.0
+        # Lifetime count of empty reads; the self-check watchdog compares
+        # successive samples to tell a spinning read loop from an idle one.
+        self.empty_read_total = 0
         # Candidates that opened but had no REPROG_V4 on any devIdx --
         # skip them for a while so each retry doesn't re-pay their probe
         # timeouts. TTL-based (not event-only): a sleeping mouse wakes
@@ -3969,6 +3972,7 @@ class HidGestureListener:
                             self._on_report(raw)
                     else:
                         _no_data_count += 1
+                        self.empty_read_total += 1
                         # Force-release buttons stuck in held state when the
                         # device stops sending reports (firmware stall / sleep).
                         if _no_data_count >= _STALE_HOLD_LIMIT:
