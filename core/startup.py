@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -510,6 +511,22 @@ def _restore_macos_plist_then_raise(
     raise RuntimeError(f"failed to update launch agent: {exc}") from exc
 
 
+_LAUNCHD_PID_RE = re.compile(r"^\s*pid\s*=\s*(\d+)\s*$", re.MULTILINE)
+
+
+def _launchd_agent_pid(domain: str) -> int | None:
+    """PID launchd reports for the agent, 0 when loaded but not running,
+    None when the agent is not loaded at all."""
+    result = _launchctl_run(
+        ["launchctl", "print", f"{domain}/{MACOS_LAUNCH_AGENT_LABEL}"]
+    )
+    if result.returncode != 0:
+        return None
+    stdout = result.stdout if isinstance(result.stdout, str) else ""
+    match = _LAUNCHD_PID_RE.search(stdout)
+    return int(match.group(1)) if match else 0
+
+
 def _apply_macos(enabled: bool, *, program_arguments: list[str] | None = None) -> None:
     if sys.platform != "darwin":
         return
@@ -530,7 +547,6 @@ def _apply_macos(enabled: bool, *, program_arguments: list[str] | None = None) -
                 raise RuntimeError(
                     f"failed to preserve existing launch agent: {exc}"
                 ) from exc
-            _launchctl_run(["launchctl", "bootout", domain, plist_path])
         payload = macos_launch_agent_payload(
             program_arguments or _program_arguments()
         )
@@ -539,6 +555,25 @@ def _apply_macos(enabled: bool, *, program_arguments: list[str] | None = None) -
         except OSError:
             pass
         new_plist = plistlib.dumps(payload, fmt=plistlib.FMT_XML)
+        # This runs on every launch. Bootout + bootstrap here used to spawn
+        # a second Mouser (RunAtLoad) that lost the instance lock, raised
+        # the window and exited -- the "self-sync" window pop. Converge
+        # instead: identical plist means only `enable`; a changed plist is
+        # written in place when launchd already owns this very process,
+        # and only re-bootstrapped when it does not.
+        if previous_plist == new_plist:
+            _launchctl_run(
+                ["launchctl", "enable", f"{domain}/{MACOS_LAUNCH_AGENT_LABEL}"]
+            )
+            return
+        if plist_existed and _launchd_agent_pid(domain) == os.getpid():
+            _atomic_write_file(plist_path, new_plist)
+            _launchctl_run(
+                ["launchctl", "enable", f"{domain}/{MACOS_LAUNCH_AGENT_LABEL}"]
+            )
+            return
+        if plist_existed:
+            _launchctl_run(["launchctl", "bootout", domain, plist_path])
         try:
             _atomic_write_file(plist_path, new_plist)
             result = _launchctl_run(["launchctl", "bootstrap", domain, plist_path])

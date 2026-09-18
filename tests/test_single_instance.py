@@ -470,19 +470,41 @@ class StartTests(unittest.TestCase):
         self.assertEqual(calls[0][:2], ["bootstrap", "gui/501"])
         self.assertTrue(calls[0][2].endswith(f"{si.APP_BUNDLE_ID}.plist"))
 
-    def test_macos_direct_spawn_without_agent_never_uses_open(self):
-        spawned: list[str] = []
+    def test_macos_without_agent_refuses_instead_of_spawning(self):
+        """A direct spawn is the unmanaged Mouser that outlives launchd's
+        parked copy; ``start`` must fail loudly instead."""
         with patch.object(si.sys, "platform", "darwin"), patch.object(si.subprocess, "run") as run:
             code = si.ctl_start(
                 self.exe,
                 launchctl=lambda args: self.fail("no launchctl"),
                 agent_loaded=lambda: False,
                 plist_exists=lambda: False,
-                spawn=spawned.append,
+                spawn=lambda _p: self.fail("must not spawn"),
             )
-        self.assertEqual(code, 0)
-        self.assertEqual(spawned, [self.exe])
+        self.assertEqual(code, 1)
         run.assert_not_called()
+
+    def test_macos_bootstrap_failure_returns_nonzero_without_spawning(self):
+        with patch.object(si.sys, "platform", "darwin"), patch("os.getuid", return_value=501, create=True):
+            code = si.ctl_start(
+                self.exe,
+                launchctl=lambda args: MagicMock(returncode=5, stdout="", stderr="Bootstrap failed"),
+                agent_loaded=lambda: False,
+                plist_exists=lambda: True,
+                spawn=lambda _p: self.fail("must not spawn"),
+            )
+        self.assertEqual(code, 1)
+
+    def test_macos_kickstart_failure_returns_nonzero_without_spawning(self):
+        with patch.object(si.sys, "platform", "darwin"), patch("os.getuid", return_value=501, create=True):
+            code = si.ctl_start(
+                self.exe,
+                launchctl=lambda args: MagicMock(returncode=3, stdout="", stderr="kickstart failed"),
+                agent_loaded=lambda: True,
+                plist_exists=lambda: True,
+                spawn=lambda _p: self.fail("must not spawn"),
+            )
+        self.assertEqual(code, 1)
 
     def test_missing_executable_fails(self):
         self.assertEqual(si.ctl_start(os.path.join(self.tmp.name, "nope")), 1)

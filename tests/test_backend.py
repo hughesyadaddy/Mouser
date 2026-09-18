@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 import unittest.mock
 from types import SimpleNamespace
@@ -1336,6 +1337,14 @@ class BackendDeviceLayoutTests(unittest.TestCase):
         self.assertIn("Profile already exists", status_messages)
 
 
+def _settle_login_startup_sync(backend):
+    """The sync runs on a worker thread; join it and deliver its outcome."""
+    thread = backend._login_startup_sync_thread
+    if thread is not None:
+        thread.join(timeout=5)
+    _ensure_qapp().processEvents()
+
+
 @unittest.skipIf(Backend is None, "PySide6 not installed in test environment")
 class BackendLoginStartupTests(unittest.TestCase):
     def test_init_calls_sync_from_config_when_supported(self):
@@ -1347,8 +1356,27 @@ class BackendLoginStartupTests(unittest.TestCase):
             patch("ui.backend.supports_login_startup", return_value=True),
             patch("ui.backend.sync_login_startup_from_config") as sync_mock,
         ):
-            Backend(engine=None)
+            backend = Backend(engine=None)
+            _settle_login_startup_sync(backend)
         sync_mock.assert_called_once_with(True)
+
+    def test_init_sync_runs_off_the_main_thread(self):
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["start_at_login"] = True
+        threads = []
+        with (
+            patch("ui.backend.load_config", return_value=cfg),
+            patch("ui.backend.save_config"),
+            patch("ui.backend.supports_login_startup", return_value=True),
+            patch(
+                "ui.backend.sync_login_startup_from_config",
+                side_effect=lambda _enabled: threads.append(threading.current_thread()),
+            ),
+        ):
+            backend = Backend(engine=None)
+            _settle_login_startup_sync(backend)
+        self.assertEqual(len(threads), 1)
+        self.assertIsNot(threads[0], threading.main_thread())
 
     def test_init_clears_start_at_login_when_sync_fails(self):
         cfg = copy.deepcopy(DEFAULT_CONFIG)
@@ -1363,6 +1391,7 @@ class BackendLoginStartupTests(unittest.TestCase):
             ),
         ):
             backend = Backend(engine=None)
+            _settle_login_startup_sync(backend)
 
         self.assertFalse(backend.startAtLogin)
         save_mock.assert_called_once()
@@ -1380,6 +1409,7 @@ class BackendLoginStartupTests(unittest.TestCase):
             ),
         ):
             backend = Backend(engine=None)
+            _settle_login_startup_sync(backend)
 
         self.assertFalse(backend.startAtLogin)
         save_mock.assert_not_called()

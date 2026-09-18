@@ -248,6 +248,7 @@ class Backend(QObject):
     _updateInstallStateRequest = Signal(str, str, bool)
     _updateInstallProgressRequest = Signal(int)
     _wheelDivertChangeRequest = Signal(bool)
+    _loginStartupSyncFailed = Signal(str)
 
     def __init__(self, engine=None, parent=None, root_dir=None):
         super().__init__(parent)
@@ -302,6 +303,7 @@ class Backend(QObject):
         self._wheel_divert_active = False
         self._watchdog = None
         self._watchdog_timer = None
+        self._login_startup_sync_thread = None
         if engine is not None:
             self._watchdog = SelfWatchdog(
                 hid_listener=lambda: getattr(
@@ -357,6 +359,8 @@ class Backend(QObject):
             self._handleUpdateInstallProgress, Qt.QueuedConnection)
         self._wheelDivertChangeRequest.connect(
             self._handleWheelDivertChange, Qt.QueuedConnection)
+        self._loginStartupSyncFailed.connect(
+            self._handleLoginStartupSyncFailure, Qt.QueuedConnection)
 
         # List-property cache invalidation. Each notify signal maps to the
         # subset of caches that depends on it; reads after the next emit
@@ -395,30 +399,48 @@ class Backend(QObject):
                 getattr(engine, "hid_features_ready", False)
             )
         if supports_login_startup():
-            try:
-                sync_login_startup_from_config(self.startAtLogin)
-            except Exception as exc:
-                print(f"[startup] Failed to sync desktop integration: {exc}", file=sys.stderr)
-                if self.startAtLogin:
-                    self._cfg.setdefault("settings", {})["start_at_login"] = False
-                    try:
-                        save_config(self._cfg)
-                    except Exception as save_exc:
-                        print(
-                            "[startup] Failed to save start-at-login recovery state: "
-                            f"{save_exc}",
-                            file=sys.stderr,
-                        )
-                    self.settingsChanged.emit()
-                    self.statusMessage.emit(
-                        "Start at login could not be enabled. Please try again."
-                    )
+            # launchctl round-trips must not sit between the process start
+            # and the first window paint.
+            self._login_startup_sync_thread = threading.Thread(
+                target=self._run_login_startup_sync,
+                args=(self.startAtLogin,),
+                daemon=True,
+                name="LoginStartupSync",
+            )
+            self._login_startup_sync_thread.start()
         else:
             self._cfg.setdefault("settings", {})["start_at_login"] = False
         self._sync_connected_device_info()
         self._configureUpdateChecks()
         self._consumeUpdateResultMarker()
         self._cleanupStaleUpdatePreparation()
+
+    def _run_login_startup_sync(self, enabled):
+        try:
+            sync_login_startup_from_config(enabled)
+        except Exception as exc:
+            print(f"[startup] Failed to sync desktop integration: {exc}", file=sys.stderr)
+            if enabled:
+                self._loginStartupSyncFailed.emit(str(exc))
+
+    @Slot(str)
+    def _handleLoginStartupSyncFailure(self, _reason):
+        """Runs on Qt main thread."""
+        if not self.startAtLogin:
+            return
+        self._cfg.setdefault("settings", {})["start_at_login"] = False
+        try:
+            save_config(self._cfg)
+        except Exception as save_exc:
+            print(
+                "[startup] Failed to save start-at-login recovery state: "
+                f"{save_exc}",
+                file=sys.stderr,
+            )
+        self.settingsChanged.emit()
+        self.statusMessage.emit(
+            "Start at login could not be enabled. Please try again."
+        )
 
     def _watchdog_reconnect(self):
         hg = getattr(getattr(self._engine, "hook", None), "_hid_gesture", None)
