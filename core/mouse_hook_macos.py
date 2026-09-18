@@ -86,6 +86,7 @@ _CG_SCROLL_PHASE_ENDED = getattr(
 )
 _kCGEventTapDisabledByTimeout = 0xFFFFFFFE
 _kCGEventTapDisabledByUserInput = 0xFFFFFFFF
+_kCFRunLoopRunFinished = 1
 
 from core.macos_iokit_scroll import LogitechScrollMonitor, SCROLL_MONITOR_AVAILABLE
 from core.native_hook_mac import (
@@ -108,7 +109,7 @@ NATIVE_DRAIN_TIMEOUT_MS = 50
 class _QuartzBindings:
     """Quartz functions and field ids resolved once, not per event.
 
-    The CGEventTap callback runs on the main run loop at up to 1 kHz. Every
+    The CGEventTap callback runs on the tap thread's run loop at up to 1 kHz. Every
     ``Quartz.<name>`` inside it is a module-dict lookup (through PyObjC's
     lazy loader on first touch), and every ``CGEventGet*`` is an ObjC bridge
     crossing. Resolving the names once per Quartz module object keeps the
@@ -190,7 +191,7 @@ class MouseHook(BaseMouseHook):
         self._tap_source = None
         # Pointer motion gets its own tap, enabled only while a directional
         # gesture is armed: at up to 1 kHz it was the bulk of the Python
-        # entries on the main run loop and did nothing outside a capture.
+        # entries on the tap run loop and did nothing outside a capture.
         self._motion_tap = None
         self._motion_tap_source = None
         # The tap runs on its own thread's CFRunLoop (Python callback and
@@ -695,10 +696,12 @@ class MouseHook(BaseMouseHook):
         self._set_motion_tap_enabled(True)
 
     def _release_gesture_anchor(self):
+        # Disarm before disabling: the disable's own DisabledByUserInput
+        # notification must not find an armed anchor and re-enable the tap.
+        anchor, self._gesture_anchor = self._gesture_anchor, None
         self._set_motion_tap_enabled(False)
-        if self._gesture_anchor is not None:
-            self._warp_cursor(self._gesture_anchor)
-            self._gesture_anchor = None
+        if anchor is not None:
+            self._warp_cursor(anchor)
 
     def _current_cursor_pos(self):
         """Pointer location at the moment of the press. The motion tap is
@@ -993,7 +996,10 @@ class MouseHook(BaseMouseHook):
             return
         while self._running:
             with objc.autorelease_pool():
-                Quartz.CFRunLoopRunInMode(Quartz.kCFRunLoopDefaultMode, 1.0, False)
+                rc = Quartz.CFRunLoopRunInMode(Quartz.kCFRunLoopDefaultMode, 1.0, False)
+            if rc == _kCFRunLoopRunFinished:
+                # No sources left (port invalidated): do not spin.
+                time.sleep(0.25)
         self._teardown_python_tap()
 
     def _create_motion_tap(self, motion_mask):
@@ -1137,8 +1143,10 @@ class MouseHook(BaseMouseHook):
         native = self._native
         if native is None:
             return
-        state = compute_tap_filter(self)
+        # Computed under the lock: a tick computing capture=0 must not land
+        # after the HID thread pushed capture=1 for a stroke just begun.
         with self._native_filter_lock:
+            state = compute_tap_filter(self)
             if state == self._native_filter_state:
                 return
             try:
@@ -1156,6 +1164,7 @@ class MouseHook(BaseMouseHook):
         native = self._native
         dropped_seen = 0
         reenabled_seen = 0
+        monitor_warned = False
         while self._running:
             try:
                 got = native.next_event(event, NATIVE_DRAIN_TIMEOUT_MS)
@@ -1167,6 +1176,9 @@ class MouseHook(BaseMouseHook):
                         self._handle_native_event(event)
                 dropped = native.dropped
                 reenabled = native.reenabled
+                if not monitor_warned and native.hid_monitor_open:
+                    monitor_warned = True
+                    print("[MouseHook] Logitech wheel monitor open (native tap)", flush=True)
             except Exception as exc:  # noqa: BLE001 - native boundary
                 print(f"[MouseHook] native tap drain error: {exc}")
                 return

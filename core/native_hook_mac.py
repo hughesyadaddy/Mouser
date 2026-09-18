@@ -296,12 +296,6 @@ class NativeTapEvent(ctypes.Structure):
         ("blocked", ctypes.c_uint32),
     ]
 
-    @property
-    def event_type_name(self):
-        if self.event_code == EVT_NONE:
-            return None
-        return TAP_EVENT_NAMES.get(self.event_code)
-
 
 class _CTapFields(ctypes.Structure):
     _fields_ = [

@@ -696,6 +696,22 @@ class MotionTapGatingTests(_MacOSHookCase):
         )
         self.assertEqual(hook.tap_reenable_total, 2)
 
+    def test_release_disarms_before_disabling_the_motion_tap(self):
+        """The disable's own DisabledByUserInput notification races the
+        release; it must find no armed anchor, or it re-enables the tap."""
+        hook = self._started_hook()
+        hook._gesture_direction_enabled = True
+        hook._arm_gesture_anchor()
+        seen = []
+        self.quartz.CGEventTapEnable.side_effect = (
+            lambda tap, enabled: seen.append((tap, enabled, hook._gesture_anchor))
+        )
+
+        hook._release_gesture_anchor()
+
+        self.assertEqual(seen, [("motion-tap", False, None)])
+        self.quartz.CGWarpMouseCursorPosition.assert_called_with((10.0, 20.0))
+
     def test_stop_tears_down_both_taps(self):
         hook = self._started_hook()
         with patch("builtins.print"):
@@ -1145,6 +1161,22 @@ class NativeTapTests(_TapLifecycleCase):
         self.assertEqual(self.native.enabled_calls[-1], True)
         flags, _interest, _block = self.native.filters[-1]
         self.assertTrue(flags & self.module.compute_tap_filter.__globals__["FILTER_INTERCEPT"])
+
+    def test_filter_is_computed_under_its_lock(self):
+        """A drain tick computing capture=0 must not land after the HID
+        thread pushed capture=1 for a stroke that just began."""
+        self._bind()
+        self.hook.start()
+        held = []
+        real = self.module.compute_tap_filter
+        with patch.object(
+            self.module, "compute_tap_filter",
+            side_effect=lambda hook: (held.append(hook._native_filter_lock.locked()), real(hook))[1],
+        ):
+            self.hook._gesture_active = True
+            self.hook._gesture_direction_enabled = True
+            self.hook._push_native_filter()
+        self.assertTrue(held and all(held))
 
     def test_unchanged_filter_is_not_repushed(self):
         self.hook.start()

@@ -39,6 +39,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #define MOUSER_TAP_ABI 1u
 
@@ -57,8 +58,6 @@
 #define FILTER_IGNORE_TRACKPAD  (1u << 5)
 #define FILTER_THUMB_VIA_HID    (1u << 6)
 #define FILTER_SENSE_PANEL      (1u << 7)
-
-#define CAPTURE_MAX_MS 3000ull
 
 /* -- event codes: mirror core/native_hook_filter.py + core/native_hook_mac.py */
 
@@ -188,7 +187,6 @@ static _Atomic uint64_t g_last_logitech_wheel_ms;
 
 static _Atomic int32_t g_capture_dx;
 static _Atomic int32_t g_capture_dy;
-static _Atomic uint64_t g_capture_deadline_ms;
 static CGPoint g_capture_anchor;
 static _Atomic int g_capture_have_anchor;
 
@@ -215,12 +213,6 @@ static void ring_push(const MouserTapEvent *event)
     g_ring[head & RING_MASK] = *event;
     atomic_store_explicit(&g_ring_head, head + 1u, memory_order_release);
     dispatch_semaphore_signal(g_sem);
-}
-
-static bool capture_active(void)
-{
-    uint64_t deadline = atomic_load(&g_capture_deadline_ms);
-    return deadline != 0 && now_ms() < deadline;
 }
 
 static bool wheel_is_logitech(void)
@@ -455,7 +447,7 @@ static CGEventRef tap_callback(CGEventTapProxy proxy, CGEventType type,
     /* Pointer motion: the 1 kHz path. Nothing but a live directional
      * capture ever needs it, so decide from the flag word alone. */
     if (type == kCGEventMouseMoved || type == kCGEventOtherMouseDragged) {
-        if (!(flags & FILTER_CAPTURE) || !capture_active()) {
+        if (!(flags & FILTER_CAPTURE)) {
             return event;
         }
         atomic_fetch_add(&g_capture_dx,
@@ -707,8 +699,13 @@ static void *tap_thread_main(void *arg)
     dispatch_semaphore_signal(g_ready);
 
     while (!atomic_load(&g_stop)) {
+        SInt32 rc;
         @autoreleasepool {
-            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, false);
+            rc = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, false);
+        }
+        if (rc == kCFRunLoopRunFinished) {
+            /* No sources left (port invalidated): do not spin. */
+            usleep(250000);
         }
     }
 
@@ -734,11 +731,15 @@ EXPORT int mouser_tap_stop(void);
 EXPORT int mouser_tap_start(void)
 {
     if (g_thread_started) {
-        return g_start_ok;
+        /* A stop that timed out left a thread on its way down; nothing
+         * can be started against it. */
+        return atomic_load(&g_stop) ? 0 : g_start_ok;
     }
     if (g_sem == NULL) {
         g_sem = dispatch_semaphore_create(0);
     }
+    atomic_store(&g_ring_head, 0u);
+    atomic_store(&g_ring_tail, 0u);
     g_ready = dispatch_semaphore_create(0);
     g_done = dispatch_semaphore_create(0);
     atomic_store(&g_stop, 0);
@@ -777,7 +778,6 @@ EXPORT int mouser_tap_stop(void)
     pthread_join(g_thread, NULL);
     g_thread_started = 0;
     g_blocked_down_active = 0u;
-    atomic_store(&g_capture_deadline_ms, 0);
     atomic_store(&g_capture_dx, 0);
     atomic_store(&g_capture_dy, 0);
     atomic_store(&g_capture_have_anchor, 0);
@@ -814,34 +814,34 @@ EXPORT void mouser_tap_set_filter(unsigned int flags, unsigned int interest_mask
      * invert fallback is armed (a physical Logitech is bound and the user
      * asked for it) -- the same moment the Python monitor would have. */
     if ((flags & (FILTER_VSCROLL_INVERT | FILTER_HSCROLL_INVERT)) &&
+        !(was & (FILTER_VSCROLL_INVERT | FILTER_HSCROLL_INVERT)) &&
         !atomic_load(&g_hid_monitor_open)) {
         perform_on_tap_loop(^{
             hid_monitor_try_open();
         });
     }
 
-    if (flags & FILTER_CAPTURE) {
-        if (!(was & FILTER_CAPTURE)) {
-            /* Fresh stroke: clear the accumulator and pin the pointer where
-             * it is now, mirroring _arm_gesture_anchor. */
-            CGEventRef probe = CGEventCreate(NULL);
-            atomic_store(&g_capture_dx, 0);
-            atomic_store(&g_capture_dy, 0);
-            if (probe != NULL) {
-                g_capture_anchor = CGEventGetLocation(probe);
-                CFRelease(probe);
-                atomic_store(&g_capture_have_anchor, 1);
-                warp_to_anchor();
-            }
-        }
-        atomic_store(&g_capture_deadline_ms, now_ms() + CAPTURE_MAX_MS);
-    } else {
-        atomic_store(&g_capture_deadline_ms, 0);
-        if (was & FILTER_CAPTURE) {
-            /* Mirrors _release_gesture_anchor. */
+    /* The capture lasts exactly as long as Python holds the flag, as the
+     * Python tap's did: every path that can lose the release (focus flip,
+     * device unbind, listener teardown) pushes it clear, and a Python that
+     * is wedged outright is the watchdog's job. */
+    if ((flags & FILTER_CAPTURE) && !(was & FILTER_CAPTURE)) {
+        /* Fresh stroke: clear the accumulator and pin the pointer where it
+         * is now, mirroring _arm_gesture_anchor. */
+        CGEventRef probe = CGEventCreate(NULL);
+        atomic_store(&g_capture_dx, 0);
+        atomic_store(&g_capture_dy, 0);
+        if (probe != NULL) {
+            g_capture_anchor = CGEventGetLocation(probe);
+            CFRelease(probe);
+            atomic_store(&g_capture_have_anchor, 1);
             warp_to_anchor();
-            atomic_store(&g_capture_have_anchor, 0);
         }
+    } else if (!(flags & FILTER_CAPTURE) && (was & FILTER_CAPTURE)) {
+        /* Mirrors _release_gesture_anchor. */
+        atomic_store(&g_capture_have_anchor, 0);
+        CGWarpMouseCursorPosition(g_capture_anchor);
+        CGAssociateMouseAndMouseCursorPosition(true);
     }
 }
 
