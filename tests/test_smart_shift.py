@@ -453,29 +453,49 @@ class BackendSmartShiftTests(unittest.TestCase):
             backend.setSmartShift("freespin")
         self.assertEqual(backend.smartShiftMode, "freespin")
 
+    @staticmethod
+    def _engine_with_write_queue():
+        """The slots hand the HID++ write to the engine's DeviceWrite FIFO
+        and return; the write only runs when that job does."""
+        engine_mock = Mock()
+        engine_mock.cfg = {}
+        jobs = []
+        engine_mock._submit_device_write.side_effect = lambda name, fn: jobs.append(fn)
+        return engine_mock, jobs
+
     def test_set_smart_shift_sends_all_params_to_engine(self):
         backend = self._make_backend({"smart_shift_enabled": True, "smart_shift_threshold": 30})
-        engine_mock = Mock()
+        engine_mock, jobs = self._engine_with_write_queue()
         backend._engine = engine_mock
         with patch("ui.backend.save_config"):
             backend.setSmartShift("freespin")
-        engine_mock.set_smart_shift.assert_called_once_with("freespin", True, 30)
+        engine_mock.hook._hid_gesture.set_smart_shift.assert_not_called()
+        with patch("builtins.print"):
+            for job in jobs:
+                job()
+        engine_mock.hook._hid_gesture.set_smart_shift.assert_called_once_with("freespin", True, 30)
 
     def test_set_smart_shift_enabled_sends_all_params_to_engine(self):
         backend = self._make_backend({"smart_shift_mode": "ratchet", "smart_shift_threshold": 30})
-        engine_mock = Mock()
+        engine_mock, jobs = self._engine_with_write_queue()
         backend._engine = engine_mock
         with patch("ui.backend.save_config"):
             backend.setSmartShiftEnabled(True)
-        engine_mock.set_smart_shift.assert_called_once_with("ratchet", True, 30)
+        with patch("builtins.print"):
+            for job in jobs:
+                job()
+        engine_mock.hook._hid_gesture.set_smart_shift.assert_called_once_with("ratchet", True, 30)
 
     def test_set_smart_shift_threshold_sends_all_params_to_engine(self):
         backend = self._make_backend({"smart_shift_mode": "ratchet", "smart_shift_enabled": True})
-        engine_mock = Mock()
+        engine_mock, jobs = self._engine_with_write_queue()
         backend._engine = engine_mock
         with patch("ui.backend.save_config"):
             backend.setSmartShiftThreshold(45)
-        engine_mock.set_smart_shift.assert_called_once_with("ratchet", True, 45)
+        with patch("builtins.print"):
+            for job in jobs:
+                job()
+        engine_mock.hook._hid_gesture.set_smart_shift.assert_called_once_with("ratchet", True, 45)
 
     def test_handle_smart_shift_read_updates_in_memory_config(self):
         backend = self._make_backend({"smart_shift_threshold": 42})

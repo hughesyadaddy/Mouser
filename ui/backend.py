@@ -1544,15 +1544,61 @@ class Backend(QObject):
             "Start at login enabled" if enabled else "Start at login disabled"
         )
 
+    # ── async device writes (DPI / SmartShift) ─────────────────────
+    # A HID++ write can block for the full 3 s request timeout; on the Qt
+    # main thread that froze the UI (B-4). The slots persist and notify
+    # immediately and hand the write to the engine's single DeviceWrite
+    # FIFO; the device's answer comes back through the existing queued
+    # read signals, so nothing here ever waits on the mouse.
+
+    def _submit_device_write(self, name, write, on_result):
+        """Run ``write(hg)`` on the engine's DeviceWrite thread.
+
+        ``on_result(ok)`` runs on that thread too and must only emit queued
+        signals. Returns False (and calls nothing) without an engine.
+        """
+        engine = self._engine
+        submit = getattr(engine, "_submit_device_write", None) if engine else None
+        if submit is None:
+            return False
+
+        def _job():
+            hg = getattr(getattr(engine, "hook", None), "_hid_gesture", None)
+            if hg is None:
+                print(f"[Backend] {name}: No HID++ connection -- not applied")
+                on_result(False)
+                return
+            on_result(bool(write(hg)))
+
+        submit(name, _job)
+        return True
+
+    def _sync_engine_settings(self):
+        """Keep the engine's config picture in step when it holds a
+        different dict (it reloads its own on some paths)."""
+        engine = self._engine
+        if engine is None or getattr(engine, "cfg", None) is self._cfg:
+            return
+        cfg = getattr(engine, "cfg", None)
+        if isinstance(cfg, dict):
+            cfg.setdefault("settings", {}).update(self._cfg.get("settings", {}))
+
     @Slot(int)
     def setDpi(self, value):
         device = self._resolved_connected_device()
         dpi = clamp_dpi(value, device)
         self._cfg.setdefault("settings", {})["dpi"] = dpi
         save_config(self._cfg)
-        if self._engine:
-            self._engine.set_dpi(dpi)
+        self._sync_engine_settings()
         self.settingsChanged.emit()
+
+        def _done(ok):
+            if ok:
+                self._dpiReadRequest.emit(dpi)
+            else:
+                self._statusMessageRequest.emit("DPI change not applied -- mouse not reachable")
+
+        self._submit_device_write("set_dpi", lambda hg: hg.set_dpi(dpi), _done)
 
     def _applySmartShift(self, mode=None, enabled=None, threshold=None):
         """Update one or more SmartShift settings, persist config, and push to device."""
@@ -1576,13 +1622,28 @@ class Backend(QObject):
         if threshold is not None:
             settings["smart_shift_threshold"] = threshold
         save_config(self._cfg)
-        if self._engine:
-            self._engine.set_smart_shift(
-                settings.get("smart_shift_mode", "ratchet"),
-                settings.get("smart_shift_enabled", False),
-                settings.get("smart_shift_threshold", 25),
-            )
+        self._sync_engine_settings()
         self.smartShiftChanged.emit()
+        state = {
+            "mode": settings.get("smart_shift_mode", "ratchet"),
+            "enabled": settings.get("smart_shift_enabled", False),
+            "threshold": settings.get("smart_shift_threshold", 25),
+        }
+
+        def _done(ok):
+            print(f"[Backend] set_smart_shift -> {'OK' if ok else 'FAILED'}")
+            if ok:
+                self._onEngineSmartShiftRead(state)
+            else:
+                self._statusMessageRequest.emit("SmartShift change not applied -- mouse not reachable")
+
+        self._submit_device_write(
+            "set_smart_shift",
+            lambda hg: hg.set_smart_shift(
+                state["mode"], state["enabled"], state["threshold"]
+            ),
+            _done,
+        )
 
     @Slot(str)
     def setSmartShift(self, mode):

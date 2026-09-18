@@ -218,6 +218,8 @@ class LogitechScrollMonitor:
         self._callback_ref = None
         self._opened = False
         self._scheduled = False
+        # The run loop start() scheduled on; stop() may run on another thread.
+        self._run_loop = None
         self._retry_after_s = float(retry_after_s)
         self._failure_retry_s = float(failure_retry_s)
         self._clock = clock
@@ -312,6 +314,7 @@ class LogitechScrollMonitor:
             _iokit.IOHIDManagerScheduleWithRunLoop(
                 manager, loop, _K_CF_RUN_LOOP_DEFAULT_MODE
             )
+            self._run_loop = loop
             self._scheduled = True
 
             def _on_value(context, result, sender, value):
@@ -372,6 +375,8 @@ class LogitechScrollMonitor:
         element_matching = self._element_matching
         opened = self._opened
         scheduled = self._scheduled
+        loop = self._run_loop
+        self._run_loop = None
         self._manager = None
         self._matching = None
         self._element_matching = None
@@ -383,7 +388,6 @@ class LogitechScrollMonitor:
         if manager is not None:
             try:
                 if scheduled:
-                    loop = _cf.CFRunLoopGetCurrent()
                     _iokit.IOHIDManagerUnscheduleFromRunLoop(
                         manager, loop, _K_CF_RUN_LOOP_DEFAULT_MODE
                     )

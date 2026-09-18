@@ -128,6 +128,13 @@ class RealCompileTests(unittest.TestCase):
                 break
         if not compiler:
             self.skipTest("no mingw-w64 cross-compiler on PATH")
+        # macOS ships a `gcc` that is clang targeting Darwin; it has no
+        # windows.h and cannot build this.
+        probe = subprocess.run(
+            [compiler, "-dumpmachine"], capture_output=True, text=True, check=False
+        )
+        if "mingw" not in probe.stdout and "w64" not in probe.stdout:
+            self.skipTest(f"{compiler} targets {probe.stdout.strip() or 'unknown'}, not Windows")
 
         with tempfile.TemporaryDirectory() as tmp:
             output = os.path.join(tmp, "mouser_hook_x64.dll")

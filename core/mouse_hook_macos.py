@@ -88,6 +88,21 @@ _kCGEventTapDisabledByTimeout = 0xFFFFFFFE
 _kCGEventTapDisabledByUserInput = 0xFFFFFFFF
 
 from core.macos_iokit_scroll import LogitechScrollMonitor, SCROLL_MONITOR_AVAILABLE
+from core.native_hook_mac import (
+    EVT_NONE,
+    EVT_SENSE_PANEL_DOWN,
+    EVT_SENSE_PANEL_UP,
+    TAP_EVENT_NAMES,
+    NativeTap,
+    NativeTapEvent,
+    compute_tap_filter,
+    describe_tap_filter,
+)
+
+#: How long stop() waits for the tap thread. Must stay above the dylib's
+#: TAP_STOP_WAIT_MS so Python never abandons a thread still tearing down.
+TAP_THREAD_JOIN_S = 3.0
+NATIVE_DRAIN_TIMEOUT_MS = 50
 
 
 class _QuartzBindings:
@@ -163,6 +178,11 @@ class MouseHook(BaseMouseHook):
     events. Requires Accessibility permission.
     """
 
+    _UP_TO_DOWN_EVENT = {
+        **BaseMouseHook._UP_TO_DOWN_EVENT,
+        MouseEvent.THUMB_BUTTON_UP: MouseEvent.THUMB_BUTTON_DOWN,
+    }
+
     def __init__(self):
         super().__init__()
         self._running = False
@@ -173,6 +193,18 @@ class MouseHook(BaseMouseHook):
         # entries on the main run loop and did nothing outside a capture.
         self._motion_tap = None
         self._motion_tap_source = None
+        # The tap runs on its own thread's CFRunLoop (Python callback and
+        # native dylib alike); stop()/sync target the captured loop.
+        self._tap_loop = None
+        self._tap_thread = None
+        self._tap_wanted = False
+        self._tap_lock = threading.Lock()
+        # Native CGEventTap callback (native/mac/mouser_tap.m); None means
+        # the Python callback is in the input path.
+        self._native = None
+        self._native_drain_thread = None
+        self._native_filter_state = None
+        self._native_filter_lock = threading.Lock()
         self.ignore_trackpad = True
         self._wake_observer = None
         self._screens_wake_observer = None
@@ -376,6 +408,9 @@ class MouseHook(BaseMouseHook):
                 _kCGEventTapDisabledByTimeout,
                 _kCGEventTapDisabledByUserInput,
             ):
+                # Also delivered for our own CGEventTapEnable(False).
+                if not self._tap_wanted:
+                    return cg_event
                 self.tap_reenable_total += 1
                 print(
                     f"[MouseHook] CGEventTap disabled by system "
@@ -576,6 +611,12 @@ class MouseHook(BaseMouseHook):
                 )
 
             if mouse_event:
+                # The tap can be disabled between a press and its release
+                # (focus flip, device unbind); never swallow an UP whose
+                # DOWN reached the OS.
+                should_block = self._pair_blocked_updown(
+                    mouse_event.event_type, should_block
+                )
                 self._enqueue_dispatch_event(mouse_event)
 
             if should_block:
@@ -759,12 +800,14 @@ class MouseHook(BaseMouseHook):
         hg = self._hid_gesture
 
         def _re_enable_tap_and_reconnect(reason, reconnect=True):
-            if self._tap and self._running:
-                Quartz.CGEventTapEnable(self._tap, True)
-                ok = Quartz.CGEventTapIsEnabled(self._tap)
+            # macOS may have disabled the tap across sleep; converge it to
+            # the predicate rather than forcing it on, so a wake with no
+            # device bound does not put an idle callback back in the path.
+            if self._running:
+                self.sync_hook_state()
                 print(
-                    f"[MouseHook] Event tap re-enabled ({reason}): "
-                    f"{'OK' if ok else 'FAILED -- may need restart'}",
+                    f"[MouseHook] Event tap re-synced ({reason}): "
+                    f"{'enabled' if self._tap_wanted else 'idle'}",
                     flush=True,
                 )
             if hg and reconnect:
@@ -848,55 +891,11 @@ class MouseHook(BaseMouseHook):
             | Quartz.CGEventMaskBit(Quartz.kCGEventOtherMouseDragged)
         )
 
-        self._tap = Quartz.CGEventTapCreate(
-            Quartz.kCGSessionEventTap,
-            Quartz.kCGHeadInsertEventTap,
-            Quartz.kCGEventTapOptionDefault,
-            event_mask,
-            self._event_tap_callback,
-            None,
-        )
-
-        if self._tap is None:
-            print("[MouseHook] ERROR: Failed to create CGEventTap!")
-            print("[MouseHook] Grant Accessibility permission in:")
-            print(
-                "[MouseHook]   System Settings -> Privacy & Security -> Accessibility"
-            )
-            return False
-
-        print("[MouseHook] CGEventTap created successfully", flush=True)
-
-        self._tap_source = Quartz.CFMachPortCreateRunLoopSource(None, self._tap, 0)
-        Quartz.CFRunLoopAddSource(
-            Quartz.CFRunLoopGetCurrent(),
-            self._tap_source,
-            Quartz.kCFRunLoopCommonModes,
-        )
-        Quartz.CGEventTapEnable(self._tap, True)
-        print("[MouseHook] CGEventTap enabled and integrated with run loop", flush=True)
-
-        self._motion_tap = Quartz.CGEventTapCreate(
-            Quartz.kCGSessionEventTap,
-            Quartz.kCGHeadInsertEventTap,
-            Quartz.kCGEventTapOptionDefault,
-            motion_mask,
-            self._event_tap_callback,
-            None,
-        )
-        if self._motion_tap is None:
-            print("[MouseHook] WARNING: motion tap unavailable; directional gestures off")
-        else:
-            self._motion_tap_source = Quartz.CFMachPortCreateRunLoopSource(
-                None, self._motion_tap, 0
-            )
-            Quartz.CFRunLoopAddSource(
-                Quartz.CFRunLoopGetCurrent(),
-                self._motion_tap_source,
-                Quartz.kCFRunLoopCommonModes,
-            )
-            Quartz.CGEventTapEnable(self._motion_tap, False)
         self._running = True
+        self._tap_wanted = self._hook_should_be_installed()
+        if not self._start_tap(event_mask, motion_mask):
+            self._running = False
+            return False
 
         self._dispatch_thread = threading.Thread(
             target=self._dispatch_worker,
@@ -909,41 +908,333 @@ class MouseHook(BaseMouseHook):
         self._register_wake_observer()
         return True
 
+    def _start_tap(self, event_mask, motion_mask):
+        native = NativeTap.load()
+        if native is not None:
+            self._native = native
+            self._push_native_filter()
+            native.set_enabled(self._tap_wanted)
+            if native.start():
+                print(f"[MouseHook] CGEventTap created (native tap: {native.path})", flush=True)
+                self._native_drain_thread = threading.Thread(
+                    target=self._native_drain_worker,
+                    daemon=True,
+                    name="MouseHook-tap-drain",
+                )
+                self._native_drain_thread.start()
+                return True
+            print("[MouseHook] Native tap start failed -- using Python tap")
+            self._native = None
+            self._native_filter_state = None
+        return self._start_python_tap(event_mask, motion_mask)
+
+    def _start_python_tap(self, event_mask, motion_mask):
+        ready = threading.Event()
+        self._tap_thread = threading.Thread(
+            target=self._python_tap_loop,
+            args=(event_mask, motion_mask, ready),
+            daemon=True,
+            name="MouseHook-tap",
+        )
+        self._tap_thread.start()
+        ready.wait(5.0)
+        if self._tap is None:
+            print("[MouseHook] ERROR: Failed to create CGEventTap!")
+            print("[MouseHook] Grant Accessibility permission in:")
+            print(
+                "[MouseHook]   System Settings -> Privacy & Security -> Accessibility"
+            )
+            self._tap_thread.join(timeout=1)
+            self._tap_thread = None
+            return False
+        print("[MouseHook] CGEventTap enabled on its own run loop", flush=True)
+        return True
+
+    def _python_tap_loop(self, event_mask, motion_mask, ready):
+        """Tap thread: owns the CGEventTap for its whole life.
+
+        Creating, enabling and tearing the tap down all happen here, so no
+        other thread ever touches a tap a callback may be running on;
+        stop() just stops the loop and waits.
+        """
+        tap = None
+        try:
+            tap = Quartz.CGEventTapCreate(
+                Quartz.kCGSessionEventTap,
+                Quartz.kCGHeadInsertEventTap,
+                Quartz.kCGEventTapOptionDefault,
+                event_mask,
+                self._event_tap_callback,
+                None,
+            )
+            if tap is None:
+                return
+            with self._tap_lock:
+                self._tap = tap
+                self._tap_source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
+                self._tap_loop = Quartz.CFRunLoopGetCurrent()
+                Quartz.CFRunLoopAddSource(
+                    self._tap_loop, self._tap_source, Quartz.kCFRunLoopCommonModes
+                )
+                Quartz.CGEventTapEnable(tap, self._tap_wanted)
+                self._create_motion_tap(motion_mask)
+        finally:
+            ready.set()
+        if tap is None:
+            return
+        while self._running:
+            with objc.autorelease_pool():
+                Quartz.CFRunLoopRunInMode(Quartz.kCFRunLoopDefaultMode, 1.0, False)
+        self._teardown_python_tap()
+
+    def _create_motion_tap(self, motion_mask):
+        """Tap thread only, under _tap_lock: the motion tap shares the
+        callback and loop, and starts disabled until a gesture arms it."""
+        self._motion_tap = Quartz.CGEventTapCreate(
+            Quartz.kCGSessionEventTap,
+            Quartz.kCGHeadInsertEventTap,
+            Quartz.kCGEventTapOptionDefault,
+            motion_mask,
+            self._event_tap_callback,
+            None,
+        )
+        if self._motion_tap is None:
+            print("[MouseHook] WARNING: motion tap unavailable; directional gestures off")
+            return
+        self._motion_tap_source = Quartz.CFMachPortCreateRunLoopSource(
+            None, self._motion_tap, 0
+        )
+        Quartz.CFRunLoopAddSource(
+            self._tap_loop, self._motion_tap_source, Quartz.kCFRunLoopCommonModes
+        )
+        Quartz.CGEventTapEnable(self._motion_tap, False)
+
+    def _teardown_python_tap(self):
+        with self._tap_lock:
+            tap, source, loop = self._tap, self._tap_source, self._tap_loop
+            motion_tap, motion_source = self._motion_tap, self._motion_tap_source
+            self._tap = None
+            self._tap_source = None
+            self._tap_loop = None
+            self._motion_tap = None
+            self._motion_tap_source = None
+        if motion_tap is not None:
+            Quartz.CGEventTapEnable(motion_tap, False)
+        if motion_source is not None and loop is not None:
+            Quartz.CFRunLoopRemoveSource(loop, motion_source, Quartz.kCFRunLoopCommonModes)
+        if tap is not None:
+            Quartz.CGEventTapEnable(tap, False)
+        if source is not None and loop is not None:
+            Quartz.CFRunLoopRemoveSource(loop, source, Quartz.kCFRunLoopCommonModes)
+        self._logitech_scroll_monitor.stop()
+        if tap is not None:
+            print("[MouseHook] CGEventTap disabled and removed", flush=True)
+
     def stop(self):
         self._unregister_wake_observer()
         self._running = False
         self._stop_hid_listener()
         self._connected_device = None
-        self._logitech_scroll_monitor.stop()
         self._scroll_monitor_applied = None
         self._scroll_prefetch = None
-
-        if self._motion_tap:
-            Quartz.CGEventTapEnable(self._motion_tap, False)
-            if self._motion_tap_source:
-                Quartz.CFRunLoopRemoveSource(
-                    Quartz.CFRunLoopGetCurrent(),
-                    self._motion_tap_source,
-                    Quartz.kCFRunLoopCommonModes,
-                )
-                self._motion_tap_source = None
-            self._motion_tap = None
-
-        if self._tap:
-            Quartz.CGEventTapEnable(self._tap, False)
-            if self._tap_source:
-                Quartz.CFRunLoopRemoveSource(
-                    Quartz.CFRunLoopGetCurrent(),
-                    self._tap_source,
-                    Quartz.kCFRunLoopCommonModes,
-                )
-                self._tap_source = None
-            self._tap = None
-            print("[MouseHook] CGEventTap disabled and removed", flush=True)
+        self._stop_tap()
 
         if self._dispatch_thread:
             self._dispatch_thread.join(timeout=1)
             self._dispatch_thread = None
+
+    def _stop_tap(self):
+        native = self._native
+        if native is not None:
+            # Drain first: it pushes filters on every tick, and nothing may
+            # touch the dylib while its thread is tearing down.
+            drain = self._native_drain_thread
+            if drain is not None:
+                drain.join(timeout=1)
+                self._native_drain_thread = None
+            if not native.stop():
+                print("[MouseHook] Native tap stop timed out -- thread left running")
+            self._native = None
+            self._native_filter_state = None
+            print("[MouseHook] CGEventTap disabled and removed (native tap)", flush=True)
+            return
+        loop = self._tap_loop
+        if loop is not None:
+            Quartz.CFRunLoopStop(loop)
+        thread = self._tap_thread
+        if thread is not None:
+            thread.join(timeout=TAP_THREAD_JOIN_S)
+            self._tap_thread = None
+            if thread.is_alive():
+                print("[MouseHook] Tap thread did not exit; disabling tap from caller")
+        # No-op when the tap thread already tore down; the fallback for a
+        # wedged thread or a tap that was never given one.
+        self._teardown_python_tap()
+
+    # ── hook state (enable / disable without recreating the tap) ────
+
+    def sync_hook_state(self):
+        """Thread-safe: converge the tap to ``_hook_should_be_installed``.
+
+        A disabled tap costs nothing on the input path, so it stands down
+        whenever nothing here would act (no Logitech bound, or KVM focus
+        remote with no scroll-invert fallback armed) and comes back on the
+        next device / focus change. A pointer capture that focus loss will
+        never release is aborted first, mirroring the Windows hook.
+        """
+        if self._gesture_active and not self._should_intercept_events():
+            self._abort_gesture_capture("hook standing down")
+        if not self._running:
+            return
+        want = self._hook_should_be_installed()
+        with self._tap_lock:
+            self._tap_wanted = want
+            native = self._native
+            if native is not None:
+                self._push_native_filter()
+                native.set_enabled(want)
+                return
+            loop = self._tap_loop
+            if loop is None:
+                return
+            Quartz.CFRunLoopPerformBlock(
+                loop, Quartz.kCFRunLoopCommonModes, self._apply_python_tap_state
+            )
+            Quartz.CFRunLoopWakeUp(loop)
+
+    def _apply_python_tap_state(self):
+        """Tap thread only: the last pushed ``_tap_wanted`` wins."""
+        with self._tap_lock:
+            tap = self._tap
+            want = self._tap_wanted
+        if tap is None:
+            return
+        Quartz.CGEventTapEnable(tap, want)
+        if not want:
+            self._logitech_scroll_monitor.stop()
+            self._scroll_monitor_applied = None
+
+    def _abort_gesture_capture(self, reason):
+        with self._gesture_lock:
+            if not self._gesture_active:
+                return
+        self._emit_debug(f"Gesture capture aborted: {reason}")
+        self._end_gesture_capture(f"aborted ({reason})")
+        self._release_gesture_anchor()
+
+    # ── native tap ──────────────────────────────────────────────────
+
+    def _push_native_filter(self):
+        native = self._native
+        if native is None:
+            return
+        state = compute_tap_filter(self)
+        with self._native_filter_lock:
+            if state == self._native_filter_state:
+                return
+            try:
+                native.set_filter(*state)
+            except Exception as exc:  # noqa: BLE001 - native boundary
+                print(f"[MouseHook] native set_filter failed: {exc}")
+                return
+            self._native_filter_state = state
+        self._emit_debug(f"Native tap filter {describe_tap_filter(*state)}")
+
+    def _native_drain_worker(self):
+        """Collect events the native tap queued. ctypes releases the GIL for
+        the wait, so this thread holds nothing the tap thread needs."""
+        event = NativeTapEvent()
+        native = self._native
+        dropped_seen = 0
+        reenabled_seen = 0
+        while self._running:
+            try:
+                got = native.next_event(event, NATIVE_DRAIN_TIMEOUT_MS)
+                # Invert toggles, debug_mode and friends are plain attribute
+                # writes with nothing to hang a push on; the tick lands them.
+                self._push_native_filter()
+                if got:
+                    with objc.autorelease_pool():
+                        self._handle_native_event(event)
+                dropped = native.dropped
+                reenabled = native.reenabled
+            except Exception as exc:  # noqa: BLE001 - native boundary
+                print(f"[MouseHook] native tap drain error: {exc}")
+                return
+            if dropped > dropped_seen:
+                print(
+                    f"[MouseHook] native tap ring dropped {dropped - dropped_seen} "
+                    "event(s) -- drain thread fell behind"
+                )
+                dropped_seen = dropped
+            if reenabled > reenabled_seen:
+                print(
+                    "[MouseHook] CGEventTap disabled by system, re-enabled "
+                    f"(native tap, {reenabled - reenabled_seen}x)",
+                    flush=True,
+                )
+                reenabled_seen = reenabled
+
+    def _handle_native_event(self, event):
+        if self.debug_mode and self._debug_callback:
+            qb = self._quartz()
+            try:
+                if event.event_type == qb.t_other_down:
+                    self._debug_callback(f"OtherMouseDown btn={event.button}")
+                elif event.event_type == qb.t_other_up:
+                    self._debug_callback(f"OtherMouseUp btn={event.button}")
+                elif event.event_type == qb.t_scroll:
+                    self._debug_callback(
+                        f"ScrollWheel v={event.v_fixed / 65536.0} "
+                        f"h={event.h_fixed / 65536.0}"
+                    )
+            except Exception:
+                pass
+        code = event.event_code
+        if code == EVT_NONE:
+            return
+        if code == EVT_SENSE_PANEL_DOWN:
+            self._arm_gesture_anchor()
+            self._begin_gesture_capture("Sense panel gesture")
+            return
+        if code == EVT_SENSE_PANEL_UP:
+            self._end_gesture_capture("Sense panel gesture")
+            self._release_gesture_anchor()
+            return
+        name = TAP_EVENT_NAMES.get(code)
+        if name is None:
+            return
+        if name in (MouseEvent.HSCROLL_LEFT, MouseEvent.HSCROLL_RIGHT):
+            self._enqueue_dispatch_event(
+                MouseEvent(name, abs(event.h_fixed / 65536.0))
+            )
+            return
+        self._enqueue_dispatch_event(MouseEvent(name))
+
+    def _begin_gesture_capture(self, source_label):
+        super()._begin_gesture_capture(source_label)
+        # Pushed now rather than on the drain tick: the first 50 ms of a
+        # swipe is where the direction is decided.
+        self._push_native_filter()
+
+    def _end_gesture_capture(self, source_label):
+        self._drain_capture_motion()
+        try:
+            super()._end_gesture_capture(source_label)
+        finally:
+            self._push_native_filter()
+
+    def _drain_capture_motion(self):
+        native = self._native
+        if native is None:
+            return
+        try:
+            delta_x, delta_y = native.take_capture_delta()
+        except Exception as exc:  # noqa: BLE001 - native boundary
+            print(f"[MouseHook] native capture drain failed: {exc}")
+            return
+        if delta_x or delta_y:
+            self._accumulate_gesture_delta(delta_x, delta_y, "event_tap")
 
 
 MouseHook._platform_module = sys.modules[__name__]

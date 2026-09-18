@@ -11,6 +11,8 @@ Quartz is mocked; nothing here needs macOS.
 
 import importlib
 import sys
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import call, MagicMock, Mock, patch
@@ -785,3 +787,399 @@ class ResumeRecoveryDedupeTests(_MacOSHookCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _TapLifecycleCase(_MacOSHookCase):
+    """start()/stop() against a fake Quartz whose run loop is per-thread."""
+
+    def setUp(self):
+        super().setUp()
+        self.quartz.CGEventTapCreate.return_value = MagicMock(name="tap")
+        self.quartz.CFRunLoopGetCurrent.side_effect = (
+            lambda: ("loop", threading.get_ident())
+        )
+        self.quartz.CFRunLoopRunInMode.side_effect = (
+            lambda _mode, _secs, _once: time.sleep(0.005)
+        )
+        self.native_load = patch.object(self.module.NativeTap, "load", return_value=None)
+        self.native_load.start()
+        self.addCleanup(self.native_load.stop)
+        self.listener = patch.object(self.module, "HidGestureListener", None)
+        self.listener.start()
+        self.addCleanup(self.listener.stop)
+        self.hook = self.module.MouseHook()
+        self.hook._logitech_scroll_monitor = Mock(name="monitor")
+        self.hook._register_wake_observer = lambda: None
+        self.hook._unregister_wake_observer = lambda: None
+        self.addCleanup(self.hook.stop)
+
+    def _bind(self):
+        self.hook._hid_gesture = SimpleNamespace(
+            connected_device=SimpleNamespace(source="hidapi", thumb_button_via_hid=False,
+                                             gesture_via_sense_panel=False),
+            stop=lambda: None,
+        )
+        self.hook._on_hid_connect()
+
+
+class PythonTapThreadTests(_TapLifecycleCase):
+    def test_tap_is_created_on_its_own_thread_and_the_loop_is_captured(self):
+        self.assertTrue(self.hook.start())
+        self.assertTrue(self.hook._running)
+        tap_ident = self.hook._tap_loop[1]
+        self.assertNotEqual(tap_ident, threading.get_ident())
+        self.assertEqual(self.hook._tap_thread.ident, tap_ident)
+        add = self.quartz.CFRunLoopAddSource.call_args
+        self.assertEqual(add.args[0], ("loop", tap_ident))
+        self.assertEqual(add.args[1], self.quartz.CFMachPortCreateRunLoopSource.return_value)
+
+    def test_tap_starts_idle_until_a_device_binds(self):
+        self.hook.start()
+        self.quartz.CGEventTapEnable.assert_called_once_with(
+            self.quartz.CGEventTapCreate.return_value, False
+        )
+
+    def test_tap_starts_enabled_when_a_device_is_already_bound(self):
+        self._bind()
+        self.hook.start()
+        self.quartz.CGEventTapEnable.assert_called_once_with(
+            self.quartz.CGEventTapCreate.return_value, True
+        )
+
+    def test_stop_targets_the_captured_loop_not_the_callers(self):
+        self.hook.start()
+        loop = self.hook._tap_loop
+        thread = self.hook._tap_thread
+
+        self.hook.stop()
+
+        self.quartz.CFRunLoopStop.assert_called_once_with(loop)
+        self.assertFalse(thread.is_alive())
+        remove = self.quartz.CFRunLoopRemoveSource.call_args
+        self.assertEqual(remove.args[0], loop)
+        self.assertNotEqual(remove.args[0][1], threading.get_ident())
+        self.assertIsNone(self.hook._tap)
+        self.assertIsNone(self.hook._tap_loop)
+        self.assertIsNone(self.hook._tap_thread)
+        self.quartz.CGEventTapEnable.assert_called_with(
+            self.quartz.CGEventTapCreate.return_value, False
+        )
+        self.hook._logitech_scroll_monitor.stop.assert_called()
+
+    def test_failed_tap_creation_returns_false_and_leaves_nothing_running(self):
+        self.quartz.CGEventTapCreate.return_value = None
+        with patch("builtins.print"):
+            self.assertFalse(self.hook.start())
+        self.assertFalse(self.hook._running)
+        self.assertIsNone(self.hook._tap_thread)
+        self.assertIsNone(self.hook._tap_loop)
+        self.quartz.CFRunLoopAddSource.assert_not_called()
+
+    def test_start_twice_is_idempotent(self):
+        self.hook.start()
+        self.assertTrue(self.hook.start())
+        self.quartz.CGEventTapCreate.assert_called_once()
+
+    def test_each_loop_pass_runs_inside_an_autorelease_pool(self):
+        pool = MagicMock(name="autorelease_pool")
+        with patch.object(self.module, "objc", SimpleNamespace(autorelease_pool=pool)):
+            self.hook.start()
+            time.sleep(0.03)
+            self.hook.stop()
+        self.assertGreater(pool.call_count, 1)
+        self.assertEqual(pool.call_count, pool.return_value.__enter__.call_count)
+
+
+class PythonTapSyncTests(_TapLifecycleCase):
+    def _run_posted_blocks(self):
+        for call in self.quartz.CFRunLoopPerformBlock.call_args_list:
+            call.args[2]()
+        self.quartz.CFRunLoopPerformBlock.reset_mock()
+
+    def test_device_bind_enables_on_the_tap_loop(self):
+        self.hook.start()
+        self.quartz.CGEventTapEnable.reset_mock()
+        self._bind()
+        post = self.quartz.CFRunLoopPerformBlock.call_args
+        self.assertEqual(post.args[0], self.hook._tap_loop)
+        self.quartz.CFRunLoopWakeUp.assert_called_with(self.hook._tap_loop)
+        self.quartz.CGEventTapEnable.assert_not_called()
+        self._run_posted_blocks()
+        self.quartz.CGEventTapEnable.assert_called_once_with(self.hook._tap, True)
+
+    def test_remote_focus_with_nothing_to_do_disables_and_stops_the_monitor(self):
+        self._bind()
+        self.hook.start()
+        self.hook._logitech_scroll_monitor.stop.reset_mock()
+        self.hook.set_remote_forwarder(SimpleNamespace(should_forward=lambda: True))
+        self._run_posted_blocks()
+        self.quartz.CGEventTapEnable.assert_called_with(self.hook._tap, False)
+        self.hook._logitech_scroll_monitor.stop.assert_called_once()
+        self.assertIsNone(self.hook._scroll_monitor_applied)
+
+    def test_remote_focus_keeps_the_tap_for_the_invert_fallback(self):
+        self._bind()
+        self.hook.invert_vscroll = True
+        self.hook.start()
+        self.hook.set_remote_forwarder(SimpleNamespace(should_forward=lambda: True))
+        self._run_posted_blocks()
+        self.quartz.CGEventTapEnable.assert_called_with(self.hook._tap, True)
+
+    def test_last_pushed_state_wins_when_blocks_coalesce(self):
+        self.hook.start()
+        self._bind()
+        self.hook._on_hid_disconnect()
+        self._bind()
+        self.quartz.CGEventTapEnable.reset_mock()
+        self._run_posted_blocks()
+        for call in self.quartz.CGEventTapEnable.call_args_list:
+            self.assertEqual(call.args[1], True)
+
+    def test_focus_return_re_enables(self):
+        self._bind()
+        self.hook.start()
+        focus = {"remote": True}
+        self.hook.set_remote_forwarder(SimpleNamespace(should_forward=lambda: focus["remote"]))
+        self._run_posted_blocks()
+        self.quartz.CGEventTapEnable.assert_called_with(self.hook._tap, False)
+        focus["remote"] = False
+        self.hook.sync_hook_state()
+        self._run_posted_blocks()
+        self.quartz.CGEventTapEnable.assert_called_with(self.hook._tap, True)
+
+    def test_sync_before_start_is_harmless(self):
+        self._bind()
+        self.quartz.CFRunLoopPerformBlock.assert_not_called()
+        self.quartz.CGEventTapEnable.assert_not_called()
+
+    def test_wake_converges_to_the_predicate_instead_of_forcing_on(self):
+        self.hook.start()
+        with patch.object(self.hook, "sync_hook_state") as sync:
+            hg = Mock()
+            self.hook._hid_gesture = hg
+            center = MagicMock()
+            center.addObserverForName_object_queue_usingBlock_.side_effect = (
+                lambda name, _o, _q, block: block
+            )
+            workspace = SimpleNamespace(notificationCenter=lambda: center)
+            fake_appkit = SimpleNamespace(
+                NSWorkspace=SimpleNamespace(sharedWorkspace=lambda: workspace)
+            )
+            self.hook._register_wake_observer = self.module.MouseHook._register_wake_observer.__get__(self.hook)
+            with patch.dict(sys.modules, {"AppKit": fake_appkit}), patch("builtins.print"):
+                self.hook._register_wake_observer()
+                self.hook._session_activate_observer(None)
+        sync.assert_called_once()
+        hg.force_reconnect.assert_called_once()
+        self.quartz.CGEventTapEnable.assert_called_once()
+
+    def test_focus_loss_mid_capture_aborts_the_stroke(self):
+        self._bind()
+        self.hook._gesture_direction_enabled = True
+        self.hook.start()
+        self.hook._begin_gesture_capture("HID gesture")
+        self.assertTrue(self.hook._gesture_active)
+        with patch("builtins.print"):
+            self.hook.set_remote_forwarder(SimpleNamespace(should_forward=lambda: True))
+        self.assertFalse(self.hook._gesture_active)
+
+
+class TapDisabledNotificationTests(_MacOSHookCase):
+    """macOS delivers kCGEventTapDisabledByUserInput for a programmatic
+    CGEventTapEnable(False) as well; re-enabling on it would undo every
+    stand-down."""
+
+    def test_unwanted_tap_is_not_put_back(self):
+        hook = self._hook()
+        hook._tap_wanted = False
+        for kind in (self.module._kCGEventTapDisabledByUserInput,
+                     self.module._kCGEventTapDisabledByTimeout):
+            self.assertIs(self._fire(hook, kind), self.cg_event)
+        self.quartz.CGEventTapEnable.assert_not_called()
+
+    def test_wanted_tap_is_re_enabled(self):
+        hook = self._hook()
+        hook._tap_wanted = True
+        with patch("builtins.print"):
+            self._fire(hook, self.module._kCGEventTapDisabledByTimeout)
+        self.quartz.CGEventTapEnable.assert_called_once_with(hook._tap, True)
+
+
+class ButtonPairingTests(_MacOSHookCase):
+    def test_up_is_not_swallowed_when_its_down_reached_the_os(self):
+        hook = self._hook()
+        hook.block(MouseEvent.MIDDLE_UP)
+        self.fields[_F_BUTTON] = 2
+        self.assertIs(self._fire(hook, _OTHER_UP), self.cg_event)
+
+    def test_up_is_swallowed_when_its_down_was(self):
+        hook = self._hook()
+        hook.block(MouseEvent.MIDDLE_DOWN)
+        hook.block(MouseEvent.MIDDLE_UP)
+        self.fields[_F_BUTTON] = 2
+        self.assertIsNone(self._fire(hook, _OTHER_DOWN))
+        self.assertIsNone(self._fire(hook, _OTHER_UP))
+        self.assertIs(self._fire(hook, _OTHER_UP), self.cg_event)
+
+    def test_thumb_button_pairs_too(self):
+        hook = self._hook()
+        hook.block(MouseEvent.THUMB_BUTTON_UP)
+        self.fields[_F_BUTTON] = 6
+        self.assertIs(self._fire(hook, _OTHER_UP), self.cg_event)
+
+
+class _FakeNative:
+    def __init__(self, *, start_ok=True):
+        self.path = "/fake/libmouser_tap.dylib"
+        self.start_ok = start_ok
+        self.filters = []
+        self.enabled_calls = []
+        self.started = False
+        self.stopped = False
+        self.capture_delta = (0, 0)
+        self.dropped = 0
+        self.reenabled = 0
+        self.hid_monitor_open = True
+        self.events = []
+
+    def start(self):
+        self.started = True
+        return self.start_ok
+
+    def stop(self):
+        self.stopped = True
+        return True
+
+    def set_enabled(self, enabled):
+        self.enabled_calls.append(bool(enabled))
+
+    @property
+    def enabled(self):
+        return self.enabled_calls[-1] if self.enabled_calls else False
+
+    def set_filter(self, flags, interest, block):
+        self.filters.append((flags, interest, block))
+
+    def next_event(self, event, timeout_ms):
+        if not self.events:
+            time.sleep(timeout_ms / 1000.0)
+            return False
+        src = self.events.pop(0)
+        for name, _ in event._fields_:
+            setattr(event, name, getattr(src, name, 0))
+        return True
+
+    def take_capture_delta(self):
+        delta, self.capture_delta = self.capture_delta, (0, 0)
+        return delta
+
+
+class NativeTapTests(_TapLifecycleCase):
+    def setUp(self):
+        super().setUp()
+        self.native = _FakeNative()
+        self.native_load.stop()
+        self.native_load = patch.object(
+            self.module.NativeTap, "load", return_value=self.native
+        )
+        self.native_load.start()
+        self.addCleanup(self.native_load.stop)
+
+    def test_native_tap_is_preferred_and_python_tap_never_created(self):
+        self.assertTrue(self.hook.start())
+        self.assertTrue(self.native.started)
+        self.assertEqual(self.native.enabled_calls, [False])
+        self.assertEqual(len(self.native.filters), 1)
+        self.quartz.CGEventTapCreate.assert_not_called()
+        self.assertIsNone(self.hook._tap_thread)
+        self.assertTrue(self.hook._native_drain_thread.is_alive())
+
+    def test_failed_native_start_falls_back_to_the_python_tap(self):
+        self.native.start_ok = False
+        with patch("builtins.print"):
+            self.assertTrue(self.hook.start())
+        self.assertIsNone(self.hook._native)
+        self.quartz.CGEventTapCreate.assert_called_once()
+        self.assertIsNotNone(self.hook._tap_thread)
+
+    def test_device_bind_pushes_filter_and_enables(self):
+        self.hook.start()
+        self._bind()
+        self.assertEqual(self.native.enabled_calls[-1], True)
+        flags, _interest, _block = self.native.filters[-1]
+        self.assertTrue(flags & self.module.compute_tap_filter.__globals__["FILTER_INTERCEPT"])
+
+    def test_unchanged_filter_is_not_repushed(self):
+        self.hook.start()
+        self._bind()
+        pushes = len(self.native.filters)
+        self.hook.sync_hook_state()
+        self.hook.sync_hook_state()
+        self.assertEqual(len(self.native.filters), pushes)
+
+    def test_drain_thread_converges_attribute_writes(self):
+        self._bind()
+        self.hook.start()
+        pushes = len(self.native.filters)
+        self.hook.invert_vscroll = True
+        time.sleep(0.15)
+        self.assertGreater(len(self.native.filters), pushes)
+        self.assertTrue(self.native.filters[-1][0] & 0b10)
+
+    def test_stop_stops_native_and_joins_the_drain(self):
+        self.hook.start()
+        drain = self.hook._native_drain_thread
+        self.hook.stop()
+        self.assertTrue(self.native.stopped)
+        self.assertIsNone(self.hook._native)
+        self.assertFalse(drain.is_alive())
+        self.quartz.CFRunLoopStop.assert_not_called()
+
+    def test_queued_events_reach_the_dispatch_queue(self):
+        from core.native_hook_mac import EVT_HSCROLL_LEFT, EVT_MIDDLE_DOWN, NativeTapEvent
+
+        self._bind()
+        self.hook.start()
+        seen = []
+        self.hook.register(MouseEvent.MIDDLE_DOWN, seen.append)
+        self.hook.register(MouseEvent.HSCROLL_LEFT, seen.append)
+        self.native.events.append(NativeTapEvent(event_type=_OTHER_DOWN, event_code=EVT_MIDDLE_DOWN, button=2))
+        self.native.events.append(NativeTapEvent(event_type=_SCROLL, event_code=EVT_HSCROLL_LEFT, h_fixed=-98304))
+        deadline = time.monotonic() + 2
+        while len(seen) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual([e.event_type for e in seen], [MouseEvent.MIDDLE_DOWN, MouseEvent.HSCROLL_LEFT])
+        self.assertEqual(seen[1].raw_data, 1.5)
+
+    def test_sense_panel_events_drive_capture_and_drain_motion(self):
+        from core.native_hook_mac import EVT_SENSE_PANEL_DOWN, EVT_SENSE_PANEL_UP, NativeTapEvent
+
+        self._bind()
+        self.hook._gesture_direction_enabled = True
+        self.hook._gesture_threshold = 10.0
+        self.hook.start()
+        swipes = []
+        self.hook.register(MouseEvent.GESTURE_SWIPE_RIGHT, swipes.append)
+        self.hook._handle_native_event(NativeTapEvent(event_type=_OTHER_DOWN, event_code=EVT_SENSE_PANEL_DOWN, button=6))
+        self.assertTrue(self.hook._gesture_active)
+        self.assertTrue(self.native.filters[-1][0] & 0b10000)
+        self.native.capture_delta = (400, 3)
+        with patch("builtins.print"):
+            self.hook._handle_native_event(NativeTapEvent(event_type=_OTHER_UP, event_code=EVT_SENSE_PANEL_UP, button=6))
+        self.assertFalse(self.hook._gesture_active)
+        self.assertFalse(self.native.filters[-1][0] & 0b10000)
+        self.assertEqual([e.event_type for e in swipes], [MouseEvent.GESTURE_SWIPE_RIGHT])
+        self.assertEqual(swipes[0].raw_data["source"], "event_tap")
+
+    def test_debug_mirror_logs_and_dispatches_nothing(self):
+        from core.native_hook_mac import NativeTapEvent
+
+        self._bind()
+        self.hook.start()
+        logged = []
+        self.hook.debug_mode = True
+        self.hook.set_debug_callback(logged.append)
+        self.hook._handle_native_event(NativeTapEvent(event_type=_OTHER_DOWN, event_code=0, button=5))
+        self.hook._handle_native_event(NativeTapEvent(event_type=_SCROLL, event_code=0, v_fixed=65536, h_fixed=0))
+        self.assertEqual(logged, ["OtherMouseDown btn=5", "ScrollWheel v=1.0 h=0.0"])
+        self.assertTrue(self.hook._dispatch_queue.empty())
