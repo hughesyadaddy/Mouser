@@ -22,6 +22,7 @@ import time
 import weakref
 from dataclasses import replace as _dataclass_replace
 
+from core.log_setup import debug_enabled, log_debug
 from core.logi_devices import (
     DEFAULT_GESTURE_CIDS,
     build_connected_device_info,
@@ -2837,7 +2838,7 @@ class HidGestureListener:
             _, _, _, _, p = resp
             mode_byte = p[0] if p else 0
             auto_disengage = p[1] if len(p) > 1 else 0
-            print(f"[HidGesture] Smart Shift raw: mode=0x{mode_byte:02X} auto_disengage=0x{auto_disengage:02X}")
+            log_debug(f"[HidGesture] Smart Shift raw: mode=0x{mode_byte:02X} auto_disengage=0x{auto_disengage:02X}")
             # Freespin mode means fixed free-spin -- SmartShift auto-switching is always OFF.
             # The device preserves the auto_disengage byte in freespin state, so we must
             # not use it to infer enabled=True; only ratchet mode can have SmartShift active.
@@ -2850,7 +2851,7 @@ class HidGestureListener:
                 result = {"mode": "ratchet", "enabled": True, "threshold": auto_disengage}
             else:
                 result = {"mode": "ratchet", "enabled": False, "threshold": 25}
-            print(f"[HidGesture] Smart Shift state = {result}")
+            log_debug(f"[HidGesture] Smart Shift state = {result}")
             self._finish_pending_smart_shift(result)
         else:
             print("[HidGesture] Smart Shift read FAILED")
@@ -3285,7 +3286,8 @@ class HidGestureListener:
 
         if gesture_now and not self._held:
             self._held = True
-            print("[HidGesture] Gesture DOWN")
+            if debug_enabled():
+                print("[HidGesture] Gesture DOWN")
             if self._on_down:
                 try:
                     self._on_down()
@@ -3294,7 +3296,8 @@ class HidGestureListener:
 
         elif not gesture_now and self._held:
             self._held = False
-            print("[HidGesture] Gesture UP")
+            if debug_enabled():
+                print("[HidGesture] Gesture UP")
             if self._on_up:
                 try:
                     self._on_up()
@@ -3306,7 +3309,8 @@ class HidGestureListener:
             btn_now = cid in cids
             if btn_now and not info["held"]:
                 info["held"] = True
-                print(f"[HidGesture] Extra {_format_cid(cid)} DOWN")
+                if debug_enabled():
+                    print(f"[HidGesture] Extra {_format_cid(cid)} DOWN")
                 cb = info.get("on_down")
                 if cb:
                     try:
@@ -3315,7 +3319,8 @@ class HidGestureListener:
                         print(f"[HidGesture] extra down callback error: {e}")
             elif not btn_now and info["held"]:
                 info["held"] = False
-                print(f"[HidGesture] Extra {_format_cid(cid)} UP")
+                if debug_enabled():
+                    print(f"[HidGesture] Extra {_format_cid(cid)} UP")
                 cb = info.get("on_up")
                 if cb:
                     try:

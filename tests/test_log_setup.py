@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import sys
@@ -44,7 +45,7 @@ class GetLogDirTests(unittest.TestCase):
         self.assertEqual(result, os.path.join(fake_appdata, "Mouser", "logs"))
 
 
-class SetupLoggingTests(unittest.TestCase):
+class _LoggingCase(unittest.TestCase):
     def setUp(self):
         self._orig_stdout = sys.stdout
         self._orig_handlers = logging.root.handlers[:]
@@ -64,6 +65,8 @@ class SetupLoggingTests(unittest.TestCase):
         logging.root.setLevel(self._orig_level)
         self._tmp_dir.cleanup()
 
+
+class SetupLoggingTests(_LoggingCase):
     def test_creates_log_file_on_startup(self):
         with patch.object(log_setup, "_get_log_dir", return_value=self.tmp):
             path = log_setup.setup_logging()
@@ -136,6 +139,57 @@ class SetupLoggingTests(unittest.TestCase):
         )
         self.assertEqual(rotating.maxBytes, 5 * 1024 * 1024)
         self.assertEqual(rotating.backupCount, 5)
+
+
+class LogLevelTests(_LoggingCase):
+    def _setup(self, *, config=None, env=None):
+        env_vars = {"MOUSER_LOG_LEVEL": env} if env else {}
+        with tempfile.TemporaryDirectory() as cfg_dir:
+            cfg_path = os.path.join(cfg_dir, "config.json")
+            if config is not None:
+                with open(cfg_path, "w", encoding="utf-8") as f:
+                    json.dump(config, f)
+            with (
+                patch.object(log_setup, "_get_log_dir", return_value=self.tmp),
+                patch("core.config.CONFIG_FILE", cfg_path),
+                patch.dict(os.environ, env_vars, clear=False),
+            ):
+                if not env:
+                    os.environ.pop("MOUSER_LOG_LEVEL", None)
+                log_setup.setup_logging()
+
+    def test_default_level_is_info_and_debug_is_gated(self):
+        self._setup(config={"settings": {}})
+        self.assertEqual(logging.root.level, logging.INFO)
+        self.assertFalse(log_setup.debug_enabled())
+
+    def test_missing_config_defaults_to_info(self):
+        self._setup(config=None)
+        self.assertEqual(logging.root.level, logging.INFO)
+
+    def test_config_log_level_debug_enables_per_event_lines(self):
+        self._setup(config={"settings": {"log_level": "debug"}})
+        self.assertEqual(logging.root.level, logging.DEBUG)
+        self.assertTrue(log_setup.debug_enabled())
+
+    def test_env_overrides_config(self):
+        self._setup(config={"settings": {"log_level": "DEBUG"}}, env="WARNING")
+        self.assertEqual(logging.root.level, logging.WARNING)
+
+    def test_unknown_level_name_falls_back_to_info(self):
+        self._setup(config={"settings": {"log_level": "LOUD"}})
+        self.assertEqual(logging.root.level, logging.INFO)
+
+    def test_prints_still_reach_the_file_at_info(self):
+        self._setup(config={"settings": {}})
+        print("[Test] info-level print")
+        log_setup.log_debug("[Test] debug-only line")
+        for h in logging.root.handlers:
+            h.flush()
+        with open(os.path.join(self.tmp, "mouser.log"), encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("[Test] info-level print", content)
+        self.assertNotIn("[Test] debug-only line", content)
 
 
 class StreamToLoggerTests(unittest.TestCase):

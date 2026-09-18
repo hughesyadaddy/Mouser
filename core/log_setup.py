@@ -4,11 +4,14 @@ log_setup.py — Redirect all print() output to a rotating log file.
 Call setup_logging() once, early in main_qml.py, before Qt and core imports.
 """
 import io
+import json
 import logging
 import logging.handlers
 import os
 import sys
 import threading
+
+DEFAULT_LOG_LEVEL = "INFO"
 
 
 def _get_log_dir() -> str:
@@ -23,6 +26,31 @@ def _get_log_dir() -> str:
     else:  # Windows
         appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
         return os.path.join(appdata, "Mouser", "logs")
+
+
+def _configured_log_level() -> int:
+    """``settings.log_level`` from config.json (``MOUSER_LOG_LEVEL`` overrides),
+    default INFO. Read raw so this stays usable before core.config loads."""
+    name = os.environ.get("MOUSER_LOG_LEVEL", "")
+    if not name:
+        try:
+            from core.config import CONFIG_FILE
+
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                name = (json.load(f).get("settings") or {}).get("log_level", "")
+        except Exception:  # noqa: BLE001 - missing/corrupt config = default level
+            name = ""
+    level = logging.getLevelName(str(name or DEFAULT_LOG_LEVEL).upper())
+    return level if isinstance(level, int) else logging.INFO
+
+
+def debug_enabled() -> bool:
+    """Gate for per-event prints (one per button/wheel report)."""
+    return logging.getLogger().isEnabledFor(logging.DEBUG)
+
+
+def log_debug(msg: str) -> None:
+    logging.getLogger().debug(msg)
 
 
 class _StreamToLogger:
@@ -107,7 +135,7 @@ def setup_logging() -> str:
         console_handler.setFormatter(fmt)
         root.addHandler(console_handler)
 
-    root.setLevel(logging.DEBUG)
+    root.setLevel(_configured_log_level())
 
     # Redirect stdout — must come AFTER StreamHandler setup above.
     # StreamHandler uses sys.__stdout__ (original), not sys.stdout, so
