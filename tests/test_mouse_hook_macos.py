@@ -59,6 +59,8 @@ def _fake_quartz():
     q.kCGScrollWheelEventFixedPtDeltaAxis2 = _F_H_FIXED
     q.kCGScrollWheelEventFixedPtDeltaAxis1 = _F_V_FIXED
     q.CGEventGetLocation.return_value = (10.0, 20.0)
+    # A disabled-by-system notification finds the tap disabled.
+    q.CGEventTapIsEnabled.return_value = False
     return q
 
 
@@ -593,14 +595,22 @@ class MotionTapGatingTests(_MacOSHookCase):
     def _started_hook(self):
         hook = self.module.MouseHook()
         self.quartz.CGEventTapCreate.side_effect = ["main-tap", "motion-tap"]
-        with (
+        self.quartz.CFRunLoopRunInMode.side_effect = (
+            lambda _mode, _secs, _once: time.sleep(0.005)
+        )
+        for patcher in (
+            patch.object(self.module.NativeTap, "load", return_value=None),
             patch.object(hook, "_start_hid_listener"),
             patch.object(hook, "_register_wake_observer"),
-            patch.object(self.module.threading, "Thread"),
-            patch("builtins.print"),
+            patch.object(hook, "_unregister_wake_observer"),
         ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        with patch("builtins.print"):
             self.assertTrue(hook.start())
-        self.addCleanup(setattr, hook, "_running", False)
+        # Timeouts are only answered on a tap Mouser wants enabled.
+        hook._tap_wanted = True
+        self.addCleanup(hook.stop)
         return hook
 
     def _mask_of(self, create_call):
@@ -794,7 +804,9 @@ class _TapLifecycleCase(_MacOSHookCase):
 
     def setUp(self):
         super().setUp()
-        self.quartz.CGEventTapCreate.return_value = MagicMock(name="tap")
+        self.main_tap = MagicMock(name="tap")
+        self.motion_tap = MagicMock(name="motion-tap")
+        self.quartz.CGEventTapCreate.side_effect = [self.main_tap, self.motion_tap]
         self.quartz.CFRunLoopGetCurrent.side_effect = (
             lambda: ("loop", threading.get_ident())
         )
@@ -821,6 +833,10 @@ class _TapLifecycleCase(_MacOSHookCase):
         )
         self.hook._on_hid_connect()
 
+    def _main_tap_enables(self):
+        tap = self.main_tap
+        return [c.args[1] for c in self.quartz.CGEventTapEnable.call_args_list if c.args[0] is tap]
+
 
 class PythonTapThreadTests(_TapLifecycleCase):
     def test_tap_is_created_on_its_own_thread_and_the_loop_is_captured(self):
@@ -835,16 +851,12 @@ class PythonTapThreadTests(_TapLifecycleCase):
 
     def test_tap_starts_idle_until_a_device_binds(self):
         self.hook.start()
-        self.quartz.CGEventTapEnable.assert_called_once_with(
-            self.quartz.CGEventTapCreate.return_value, False
-        )
+        self.assertEqual(self._main_tap_enables(), [False])
 
     def test_tap_starts_enabled_when_a_device_is_already_bound(self):
         self._bind()
         self.hook.start()
-        self.quartz.CGEventTapEnable.assert_called_once_with(
-            self.quartz.CGEventTapCreate.return_value, True
-        )
+        self.assertEqual(self._main_tap_enables(), [True])
 
     def test_stop_targets_the_captured_loop_not_the_callers(self):
         self.hook.start()
@@ -861,12 +873,12 @@ class PythonTapThreadTests(_TapLifecycleCase):
         self.assertIsNone(self.hook._tap)
         self.assertIsNone(self.hook._tap_loop)
         self.assertIsNone(self.hook._tap_thread)
-        self.quartz.CGEventTapEnable.assert_called_with(
-            self.quartz.CGEventTapCreate.return_value, False
-        )
+        self.assertIn(call(self.main_tap, False), self.quartz.CGEventTapEnable.call_args_list)
+        self.assertIn(call(self.motion_tap, False), self.quartz.CGEventTapEnable.call_args_list)
         self.hook._logitech_scroll_monitor.stop.assert_called()
 
     def test_failed_tap_creation_returns_false_and_leaves_nothing_running(self):
+        self.quartz.CGEventTapCreate.side_effect = None
         self.quartz.CGEventTapCreate.return_value = None
         with patch("builtins.print"):
             self.assertFalse(self.hook.start())
@@ -878,7 +890,8 @@ class PythonTapThreadTests(_TapLifecycleCase):
     def test_start_twice_is_idempotent(self):
         self.hook.start()
         self.assertTrue(self.hook.start())
-        self.quartz.CGEventTapCreate.assert_called_once()
+        # One main tap plus one motion tap.
+        self.assertEqual(self.quartz.CGEventTapCreate.call_count, 2)
 
     def test_each_loop_pass_runs_inside_an_autorelease_pool(self):
         pool = MagicMock(name="autorelease_pool")
@@ -971,7 +984,7 @@ class PythonTapSyncTests(_TapLifecycleCase):
                 self.hook._session_activate_observer(None)
         sync.assert_called_once()
         hg.force_reconnect.assert_called_once()
-        self.quartz.CGEventTapEnable.assert_called_once()
+        self.assertEqual(self._main_tap_enables(), [False])
 
     def test_focus_loss_mid_capture_aborts_the_stroke(self):
         self._bind()
@@ -1003,6 +1016,30 @@ class TapDisabledNotificationTests(_MacOSHookCase):
         with patch("builtins.print"):
             self._fire(hook, self.module._kCGEventTapDisabledByTimeout)
         self.quartz.CGEventTapEnable.assert_called_once_with(hook._tap, True)
+        self.assertEqual(hook.tap_reenable_total, 1)
+
+    def test_motion_tap_release_is_not_counted_as_a_system_disable(self):
+        """Every gesture release disables the motion tap; counting that
+        would trip the watchdog after ten gestures in an hour."""
+        hook = self._hook()
+        hook._tap_wanted = True
+        hook._motion_tap = MagicMock(name="motion-tap")
+        hook._gesture_anchor = None
+        self.quartz.CGEventTapIsEnabled.return_value = True
+        self.assertIs(self._fire(hook, self.module._kCGEventTapDisabledByUserInput), self.cg_event)
+        self.quartz.CGEventTapEnable.assert_not_called()
+        self.assertEqual(hook.tap_reenable_total, 0)
+
+    def test_motion_tap_timeout_mid_gesture_is_put_back(self):
+        hook = self._hook()
+        hook._tap_wanted = True
+        hook._motion_tap = MagicMock(name="motion-tap")
+        hook._gesture_anchor = (1.0, 1.0)
+        self.quartz.CGEventTapIsEnabled.return_value = True
+        with patch("builtins.print"):
+            self._fire(hook, self.module._kCGEventTapDisabledByTimeout)
+        self.quartz.CGEventTapEnable.assert_called_once_with(hook._motion_tap, True)
+        self.assertEqual(hook.tap_reenable_total, 1)
 
 
 class ButtonPairingTests(_MacOSHookCase):
@@ -1099,7 +1136,7 @@ class NativeTapTests(_TapLifecycleCase):
         with patch("builtins.print"):
             self.assertTrue(self.hook.start())
         self.assertIsNone(self.hook._native)
-        self.quartz.CGEventTapCreate.assert_called_once()
+        self.assertEqual(self.quartz.CGEventTapCreate.call_count, 2)
         self.assertIsNotNone(self.hook._tap_thread)
 
     def test_device_bind_pushes_filter_and_enables(self):
@@ -1125,6 +1162,14 @@ class NativeTapTests(_TapLifecycleCase):
         time.sleep(0.15)
         self.assertGreater(len(self.native.filters), pushes)
         self.assertTrue(self.native.filters[-1][0] & 0b10)
+
+    def test_native_reenables_feed_the_watchdog_counter(self):
+        self.hook.start()
+        self.native.reenabled = 3
+        deadline = time.monotonic() + 2
+        while self.hook.tap_reenable_total < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.hook.tap_reenable_total, 3)
 
     def test_stop_stops_native_and_joins_the_drain(self):
         self.hook.start()

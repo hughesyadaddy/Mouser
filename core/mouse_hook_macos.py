@@ -408,8 +408,16 @@ class MouseHook(BaseMouseHook):
                 _kCGEventTapDisabledByTimeout,
                 _kCGEventTapDisabledByUserInput,
             ):
-                # Also delivered for our own CGEventTapEnable(False).
+                # Also delivered for our own CGEventTapEnable(False) -- the
+                # main tap standing down, or the motion tap at gesture
+                # release -- which must neither re-enable nor count.
                 if not self._tap_wanted:
+                    return cg_event
+                main_disabled = not Quartz.CGEventTapIsEnabled(self._tap)
+                motion_armed = (
+                    self._motion_tap is not None and self._gesture_anchor is not None
+                )
+                if not main_disabled and not motion_armed:
                     return cg_event
                 self.tap_reenable_total += 1
                 print(
@@ -418,8 +426,9 @@ class MouseHook(BaseMouseHook):
                     f"(total={self.tap_reenable_total})",
                     flush=True,
                 )
-                Quartz.CGEventTapEnable(self._tap, True)
-                if self._motion_tap is not None and self._gesture_anchor is not None:
+                if main_disabled:
+                    Quartz.CGEventTapEnable(self._tap, True)
+                if motion_armed:
                     Quartz.CGEventTapEnable(self._motion_tap, True)
                 return cg_event
 
@@ -1168,9 +1177,10 @@ class MouseHook(BaseMouseHook):
                 )
                 dropped_seen = dropped
             if reenabled > reenabled_seen:
+                self.tap_reenable_total += reenabled - reenabled_seen
                 print(
                     "[MouseHook] CGEventTap disabled by system, re-enabled "
-                    f"(native tap, {reenabled - reenabled_seen}x)",
+                    f"(native tap, total={self.tap_reenable_total})",
                     flush=True,
                 )
                 reenabled_seen = reenabled
