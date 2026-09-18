@@ -825,7 +825,7 @@ Item {
 
                             // Battery badge
                             Rectangle {
-                                visible: backend.batteryLevel >= 0
+                                visible: backend.batteryLevel >= 0 && !backend.deviceReadOnly
                                 width: battRow.implicitWidth + 16
                                 height: 24; radius: 12
                                 anchors.verticalCenter: parent.verticalCenter
@@ -1638,7 +1638,7 @@ Item {
                                 id: dpiPresetsCard
                                 property int activeSlot: 0
                                 readonly property var slotColors: ["#e8d44d", "#5da5e8", "#e8943a", "#e05daa"]
-                                visible: selectedActionId === "cycle_dpi"
+                                visible: selectedActionId === "cycle_dpi" && !backend.deviceReadOnly
                                 width: parent.width
                                 height: dpiPresetsCol.implicitHeight + 28
                                 radius: 12

@@ -43,6 +43,7 @@ from core.key_simulator import (
     normalize_captured_shortcut_parts,
     valid_custom_key_names,
 )
+from core.mouse_hook_types import DEVICE_SOURCE_DESKFLOW_SHIM
 from core.startup import (
     apply_login_startup,
     supports_login_startup,
@@ -767,6 +768,11 @@ class Backend(QObject):
     @Property(str, notify=deviceInfoChanged)
     def connectionType(self):
         return self._connected_device_transport
+
+    @Property(bool, notify=deviceInfoChanged)
+    def deviceReadOnly(self):
+        """Device reached through the Deskflow shim: no firmware writes."""
+        return self._connected_device_source == DEVICE_SOURCE_DESKFLOW_SHIM
 
     @Property(int, notify=deviceInfoChanged)
     def deviceDpiMin(self):

@@ -17,7 +17,7 @@ from core.config import (
     WHEEL_DIVERT_OFF, coerce_wheel_divert_setting,
 )
 from core.app_detector import AppDetector
-from core.mouse_hook_types import HidRuntimeState
+from core.mouse_hook_types import DEVICE_SOURCE_DESKFLOW_SHIM, HidRuntimeState
 from core.linux_permissions import (
     linux_permission_log_message,
     linux_permission_report,
@@ -758,6 +758,8 @@ class Engine:
             return False
         if hasattr(hg, "connected_device") and hg.connected_device is None:
             return False
+        if self.device_readonly:
+            return True
 
         replay_ok = True
         retry_dpi = False
@@ -1039,6 +1041,16 @@ class Engine:
     @property
     def connected_device(self):
         return self._hid_runtime_state().connected_device
+
+    @property
+    def device_readonly(self):
+        """True while the device is reached through the Deskflow shim: reports
+        flow in, but firmware writes (DPI, SmartShift, wheel mode, battery
+        reads) cannot reach the mouse on this host."""
+        return (
+            getattr(self.connected_device, "source", "")
+            == DEVICE_SOURCE_DESKFLOW_SHIM
+        )
 
     def dump_device_info(self):
         return getattr(self.hook, "dump_device_info", lambda: None)()

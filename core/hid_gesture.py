@@ -243,6 +243,13 @@ PRESENT_BACKOFF_UNCACHED_MAX_S = 5.0
 ABSENT_POLL_NOTIFIED_S = 30.0
 ABSENT_POLL_UNNOTIFIED_S = 5.0
 
+# A 1 s read that returns None faster than this did not wait at all: the
+# backend is dead (closed Deskflow sink, sleeping hidapi interface). Sleep
+# 5 ms per instant None, and on a read-only sink give up after this many
+# in a row so the outer loop backs off instead of spinning.
+INSTANT_NONE_S = 0.010
+INSTANT_NONE_LIMIT = 50
+
 # Bound on the native (IOKit) input-report queue. Reports are produced
 # by the IOHIDDevice callback while the listener thread pumps the run
 # loop inside ``read()``, so in normal operation the queue holds at most
@@ -1739,6 +1746,9 @@ class HidGestureListener:
         from core.hid_deskflow_backend import get_deskflow_sink
 
         sink = get_deskflow_sink()
+        if getattr(sink, "closed", False):
+            print("[HidGesture] Deskflow attach rejected: sink is closed")
+            return False
         sink.flush()
         sink.set_nonblocking(False)
         self._dev = sink
@@ -2600,6 +2610,8 @@ class HidGestureListener:
     def set_dpi(self, dpi_value):
         """Queue a DPI change -- will be applied on the listener thread.
         Can be called from any thread.  Returns True on success."""
+        if self._deskflow_readonly:
+            return False
         dpi = clamp_dpi(dpi_value, self._connected_device_info)
         self._dpi_result = None
         self._pending_dpi = dpi
@@ -2639,6 +2651,8 @@ class HidGestureListener:
     def read_dpi(self):
         """Queue a DPI read -- will be applied on the listener thread.
         Can be called from any thread.  Returns the DPI value or None."""
+        if self._deskflow_readonly:
+            return None
         self._dpi_result = None
         self._pending_dpi = "read"  # special sentinel
         for _ in range(30):
@@ -2701,6 +2715,8 @@ class HidGestureListener:
         smart_shift_enabled: True to enable auto SmartShift (auto-switching)
         threshold: 1-50 sensitivity when SmartShift is enabled
         Can be called from any thread.  Returns True on success."""
+        if self._deskflow_readonly:
+            return False
         pending = (mode, smart_shift_enabled, threshold)
         with self._smart_shift_call_lock:
             with self._smart_shift_slot_lock:
@@ -2773,6 +2789,8 @@ class HidGestureListener:
     def read_smart_shift(self):
         """Queue a Smart Shift read.
         Returns dict {'mode': str, 'enabled': bool, 'threshold': int} or None."""
+        if self._deskflow_readonly:
+            return None
         with self._smart_shift_call_lock:
             with self._smart_shift_slot_lock:
                 self._smart_shift_result = None
@@ -3078,6 +3096,8 @@ class HidGestureListener:
         intent persists across reconnect.
         """
         target = (bool(invert_vertical), bool(invert_horizontal))
+        if self._deskflow_readonly:
+            return (False, False)
         with self._wheel_divert_call_lock:
             self._wheel_divert_target = target
             with self._wheel_divert_lock:
@@ -3100,6 +3120,8 @@ class HidGestureListener:
 
     def read_battery(self):
         """Queue a battery read and wait for the listener thread result."""
+        if self._deskflow_readonly:
+            return None
         self._battery_result = None
         self._pending_battery = "read"
         for _ in range(30):
@@ -3908,6 +3930,7 @@ class HidGestureListener:
             _session_started = time.time()
             _session_got_data = False
             _no_data_count = 0          # consecutive _rx() returning None
+            _instant_none_count = 0     # consecutive _rx() None that did not wait
             _STALE_HOLD_LIMIT = 3       # force-release held buttons after this many empty reads (~3 s)
             _CONSECUTIVE_TIMEOUT_RECONNECT = 3  # force reconnect after this many request timeouts
             self._consecutive_request_timeouts = 0
@@ -3936,9 +3959,11 @@ class HidGestureListener:
                             self._apply_pending_native_wheel_invert()
                         if self._pending_battery is not None:
                             self._apply_pending_read_battery()
+                    _rx_started = time.monotonic()
                     raw = self._rx(1000)
                     if raw:
                         _no_data_count = 0
+                        _instant_none_count = 0
                         _session_got_data = True
                         if not (self._on_raw_report and self._on_raw_report(raw)):
                             self._on_report(raw)
@@ -3948,6 +3973,21 @@ class HidGestureListener:
                         # device stops sending reports (firmware stall / sleep).
                         if _no_data_count >= _STALE_HOLD_LIMIT:
                             self._force_release_stale_holds()
+                        if time.monotonic() - _rx_started < INSTANT_NONE_S:
+                            # Same busy-spin guard as _request(): a dead
+                            # backend returns None without waiting.
+                            _instant_none_count += 1
+                            if (
+                                self._deskflow_readonly
+                                and _instant_none_count >= INSTANT_NONE_LIMIT
+                            ):
+                                raise IOError(
+                                    f"sink returned no data instantly x{_instant_none_count} "
+                                    "-- backing off"
+                                )
+                            time.sleep(0.005)
+                        else:
+                            _instant_none_count = 0
             except Exception as e:
                 print(f"[HidGesture] read error: {e}")
 
@@ -3964,15 +4004,19 @@ class HidGestureListener:
             )
 
             # Cleanup before potential reconnect
-            if not self._deskflow_readonly:
+            _was_readonly = self._deskflow_readonly
+            if not _was_readonly:
                 self._undivert()
             else:
                 from core.hid_deskflow_backend import flush_deskflow_sink
 
                 flush_deskflow_sink()
                 self._deskflow_readonly = False
+            # The Deskflow sink is process-global and close() is terminal:
+            # closing it here and re-attaching the same object left read()
+            # returning None instantly, which spun this thread at 100 %.
             try:
-                if self._dev:
+                if self._dev and not _was_readonly:
                     self._dev.close()
             except Exception:
                 pass
