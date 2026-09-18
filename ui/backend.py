@@ -437,7 +437,9 @@ class Backend(QObject):
             if enabled:
                 self._loginStartupSyncFailed.emit(str(exc))
         try:
-            self._launchd_owned = macos_launchd_owns_process()
+            # A disabled-in-place service is not relaunched by KeepAlive,
+            # so with the toggle off an exit would just be a dead Mouser.
+            self._launchd_owned = bool(enabled) and macos_launchd_owns_process()
         except Exception as exc:  # noqa: BLE001 - launchctl boundary
             print(f"[startup] launchd ownership probe failed: {exc}", file=sys.stderr)
 

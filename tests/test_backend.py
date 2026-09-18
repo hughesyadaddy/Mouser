@@ -1380,6 +1380,7 @@ class BackendWatchdogTests(unittest.TestCase):
 
     def test_sync_thread_records_launchd_ownership(self):
         cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["start_at_login"] = True
         with (
             patch("ui.backend.load_config", return_value=cfg),
             patch("ui.backend.save_config"),
@@ -1390,6 +1391,22 @@ class BackendWatchdogTests(unittest.TestCase):
             backend = Backend(engine=_FakeEngine())
             _settle_login_startup_sync(backend)
         self.assertTrue(backend._launchd_owned)
+
+    def test_toggle_off_disables_exit_even_when_launchd_owns_the_pid(self):
+        """Disabled in place = no KeepAlive relaunch; an exit would be a dead Mouser."""
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["start_at_login"] = False
+        with (
+            patch("ui.backend.load_config", return_value=cfg),
+            patch("ui.backend.save_config"),
+            patch("ui.backend.supports_login_startup", return_value=True),
+            patch("ui.backend.sync_login_startup_from_config"),
+            patch("ui.backend.macos_launchd_owns_process", return_value=True),
+        ):
+            backend = Backend(engine=_FakeEngine())
+            _settle_login_startup_sync(backend)
+        self.assertFalse(backend._launchd_owned)
+        self.assertFalse(backend._watchdog_exit_enabled())
 
 
 def _settle_login_startup_sync(backend):

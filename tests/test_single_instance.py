@@ -508,15 +508,42 @@ class StartTests(unittest.TestCase):
         self.assertEqual(code, 1)
 
     def test_macos_kickstart_failure_returns_nonzero_without_spawning(self):
+        calls: list[list[str]] = []
+
+        def launchctl(args):
+            calls.append(args)
+            return MagicMock(returncode=3, stdout="", stderr="kickstart failed")
+
         with patch.object(si.sys, "platform", "darwin"), patch("os.getuid", return_value=501, create=True):
             code = si.ctl_start(
                 self.exe,
-                launchctl=lambda args: MagicMock(returncode=3, stdout="", stderr="kickstart failed"),
+                launchctl=launchctl,
                 agent_loaded=lambda: True,
                 plist_exists=lambda: True,
                 spawn=lambda _p: self.fail("must not spawn"),
             )
         self.assertEqual(code, 1)
+        self.assertEqual([c[0] for c in calls], ["kickstart", "enable", "kickstart"])
+
+    def test_macos_kickstart_of_a_disabled_service_enables_and_retries(self):
+        calls: list[list[str]] = []
+
+        def launchctl(args):
+            calls.append(args)
+            if args[0] == "kickstart" and ["enable", args[-1]] not in calls:
+                return MagicMock(returncode=125, stdout="", stderr="Domain does not support specified action")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.object(si.sys, "platform", "darwin"), patch("os.getuid", return_value=501, create=True):
+            code = si.ctl_start(
+                self.exe,
+                launchctl=launchctl,
+                agent_loaded=lambda: True,
+                plist_exists=lambda: True,
+                spawn=lambda _p: self.fail("must not spawn"),
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual([c[0] for c in calls], ["kickstart", "enable", "kickstart"])
 
     def test_macos_plist_write_failure_returns_nonzero(self):
         def boom(_exe):

@@ -708,6 +708,10 @@ def ctl_start(
         target = _macos_service_target()
         if agent_loaded():
             result = launchctl(["kickstart", "-k", target])
+            if result.returncode != 0:
+                # Loaded but disabled in place (toggle off, then Quit).
+                launchctl(["enable", target])
+                result = launchctl(["kickstart", "-k", target])
             if result.returncode == 0:
                 _log(f"start: launchctl kickstart -k {target}")
                 return 0
