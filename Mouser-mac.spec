@@ -12,6 +12,7 @@ environment supports it:
 import os
 import json
 import subprocess
+import sys
 
 ROOT = os.path.abspath(".")
 COMMITTED_ICON = os.path.join(ROOT, "images", "AppIcon.icns")
@@ -92,10 +93,34 @@ def _write_build_info(version: str) -> str:
 APP_VERSION = _load_app_version()
 BUILD_INFO_DATA = _write_build_info(APP_VERSION)
 
+
+def _native_tap_binaries():
+    """Bundle the native CGEventTap callback (native/mac/mouser_tap.m).
+
+    Built here when missing or stale so a packaged app never silently ships
+    the slower Python tap; without clang the app still works on that path.
+    The dylib lands in Contents/Frameworks, where build_macos_app.sh
+    re-signs every nested dylib with the hardened runtime.
+    """
+    build_py = os.path.join(ROOT, "native", "mac", "build.py")
+    dylib = os.path.join(ROOT, "native", "mac", "libmouser_tap.dylib")
+    source = os.path.join(ROOT, "native", "mac", "mouser_tap.m")
+    stale = not os.path.isfile(dylib) or (
+        os.path.isfile(source) and os.path.getmtime(dylib) < os.path.getmtime(source)
+    )
+    if stale and os.path.isfile(build_py):
+        subprocess.run([sys.executable, build_py], cwd=ROOT, check=False)
+    if not os.path.isfile(dylib):
+        print("[Mouser] native/mac/libmouser_tap.dylib not built -- "
+              "the app will use the Python event tap")
+        return []
+    print(f"[Mouser] bundling native tap: {dylib}")
+    return [(dylib, ".")]
+
 a = Analysis(
     ["main_qml.py"],
     pathex=[ROOT],
-    binaries=[],
+    binaries=_native_tap_binaries(),
     datas=[
         (os.path.join(ROOT, "ui", "qml"), os.path.join("ui", "qml")),
         (os.path.join(ROOT, "images"), "images"),

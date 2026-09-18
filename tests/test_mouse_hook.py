@@ -1344,6 +1344,7 @@ class MacOSEventTapDisabledTests(unittest.TestCase):
 
     def setUp(self):
         self.mock_quartz = MagicMock(name="Quartz")
+        self.mock_quartz.CGEventTapIsEnabled.return_value = False
         mouse_hook.Quartz = self.mock_quartz
 
     def tearDown(self):
@@ -1355,6 +1356,9 @@ class MacOSEventTapDisabledTests(unittest.TestCase):
         hook = mouse_hook.MouseHook()
         hook._running = True
         hook._tap = MagicMock(name="tap")
+        # macOS delivers the same event for a programmatic disable; only a
+        # tap Mouser wants enabled is put back.
+        hook._tap_wanted = True
         return hook
 
     def test_reenable_on_timeout(self):

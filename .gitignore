@@ -49,3 +49,4 @@ native/win/*.dll
 native/win/*.obj
 native/win/*.lib
 native/win/*.exp
+native/mac/*.dylib

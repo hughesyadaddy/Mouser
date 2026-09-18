@@ -1839,3 +1839,145 @@ class BackendListPropertyMemoizationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _WriteEngine(_FakeEngine):
+    """Engine with the DeviceWrite FIFO: jobs are collected, not run, so a
+    test can prove the slot returned before the device was touched."""
+
+    def __init__(self, hg=None, **kwargs):
+        super().__init__(**kwargs)
+        self.cfg = {}
+        self.hook = SimpleNamespace(_hid_gesture=hg)
+        self.jobs = []
+
+    def _submit_device_write(self, name, fn):
+        self.jobs.append((name, fn))
+
+    def run_jobs(self):
+        while self.jobs:
+            _name, fn = self.jobs.pop(0)
+            fn()
+
+
+@unittest.skipIf(Backend is None, "PySide6 not installed in test environment")
+class BackendAsyncDeviceWriteTests(unittest.TestCase):
+    """setDpi / SmartShift slots must never block the Qt thread on HID++."""
+
+    def setUp(self) -> None:
+        self._save_mock = unittest.mock.MagicMock()
+        self._patches = (
+            patch("ui.backend.save_config", self._save_mock),
+            patch("ui.backend.supports_login_startup", return_value=False),
+        )
+        for p in self._patches:
+            p.start()
+        self.addCleanup(self._stop_patches)
+
+    def _stop_patches(self) -> None:
+        for p in self._patches:
+            p.stop()
+
+    def _build(self, engine):
+        loaded = copy.deepcopy(DEFAULT_CONFIG)
+        with patch("ui.backend.load_config", return_value=loaded):
+            backend = Backend(engine=engine)
+        engine.cfg = backend._cfg
+        self._save_mock.reset_mock()
+        return backend
+
+    def test_set_dpi_persists_once_and_defers_the_device_write(self):
+        hg = unittest.mock.Mock()
+        hg.set_dpi.return_value = True
+        engine = _WriteEngine(hg=hg)
+        backend = self._build(engine)
+        changed = []
+        backend.settingsChanged.connect(lambda: changed.append(True))
+
+        backend.setDpi(1600)
+
+        self.assertEqual(backend._cfg["settings"]["dpi"], 1600)
+        self.assertEqual(self._save_mock.call_count, 1)
+        self.assertEqual(changed, [True])
+        hg.set_dpi.assert_not_called()
+        self.assertEqual([name for name, _ in engine.jobs], ["set_dpi"])
+
+        with patch.object(backend, "_dpiReadRequest") as read:
+            engine.run_jobs()
+        hg.set_dpi.assert_called_once_with(1600)
+        read.emit.assert_called_once_with(1600)
+        self.assertEqual(self._save_mock.call_count, 1)
+
+    def test_failed_dpi_write_reports_instead_of_reading_back(self):
+        hg = unittest.mock.Mock()
+        hg.set_dpi.return_value = False
+        engine = _WriteEngine(hg=hg)
+        backend = self._build(engine)
+        backend.setDpi(1600)
+        with patch.object(backend, "_dpiReadRequest") as read, \
+                patch.object(backend, "_statusMessageRequest") as status:
+            engine.run_jobs()
+        read.emit.assert_not_called()
+        status.emit.assert_called_once()
+
+    def test_no_hid_connection_reports_without_raising(self):
+        engine = _WriteEngine(hg=None)
+        backend = self._build(engine)
+        backend.setDpi(1600)
+        with patch.object(backend, "_statusMessageRequest") as status, \
+                patch("builtins.print"):
+            engine.run_jobs()
+        status.emit.assert_called_once()
+
+    def test_engine_with_its_own_config_dict_is_kept_in_step(self):
+        engine = _WriteEngine(hg=unittest.mock.Mock())
+        backend = self._build(engine)
+        engine.cfg = {"settings": {"dpi": 800}}
+        backend.setDpi(1200)
+        self.assertEqual(engine.cfg["settings"]["dpi"], 1200)
+
+    def test_smart_shift_defers_the_write_and_reads_back_on_success(self):
+        hg = unittest.mock.Mock()
+        hg.set_smart_shift.return_value = True
+        engine = _WriteEngine(hg=hg)
+        backend = self._build(engine)
+        changed = []
+        backend.smartShiftChanged.connect(lambda: changed.append(True))
+
+        backend._applySmartShift(mode="freespin", enabled=False, threshold=30)
+
+        settings = backend._cfg["settings"]
+        self.assertEqual(
+            (settings["smart_shift_mode"], settings["smart_shift_enabled"], settings["smart_shift_threshold"]),
+            ("freespin", False, 30),
+        )
+        self.assertEqual(self._save_mock.call_count, 1)
+        self.assertEqual(changed, [True])
+        hg.set_smart_shift.assert_not_called()
+
+        with patch.object(backend, "_onEngineSmartShiftRead") as read, patch("builtins.print"):
+            engine.run_jobs()
+        hg.set_smart_shift.assert_called_once_with("freespin", False, 30)
+        read.assert_called_once_with({"mode": "freespin", "enabled": False, "threshold": 30})
+        self.assertEqual(self._save_mock.call_count, 1)
+
+    def test_unchanged_smart_shift_submits_nothing(self):
+        engine = _WriteEngine(hg=unittest.mock.Mock())
+        backend = self._build(engine)
+        settings = backend._cfg["settings"]
+        backend._applySmartShift(
+            mode=settings.get("smart_shift_mode", "ratchet"),
+            enabled=settings.get("smart_shift_enabled", False),
+            threshold=settings.get("smart_shift_threshold", 25),
+        )
+        self.assertEqual(engine.jobs, [])
+        self._save_mock.assert_not_called()
+
+    def test_without_an_engine_the_slots_still_persist(self):
+        loaded = copy.deepcopy(DEFAULT_CONFIG)
+        with patch("ui.backend.load_config", return_value=loaded):
+            backend = Backend(engine=None)
+        backend.setDpi(1000)
+        backend._applySmartShift(mode="freespin")
+        self.assertEqual(backend._cfg["settings"]["dpi"], 1000)
+        self.assertEqual(backend._cfg["settings"]["smart_shift_mode"], "freespin")
