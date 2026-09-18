@@ -120,7 +120,7 @@ Item {
             // ── DPI / Pointer Speed ───────────────────────────────
             Rectangle {
                 id: dpiCard
-                visible: backend.hidFeaturesReady
+                visible: backend.hidFeaturesReady && !backend.deviceReadOnly
                 width: parent.width - 72
                 anchors.horizontalCenter: parent.horizontalCenter
                 height: dpiContent.implicitHeight + 40
@@ -292,11 +292,11 @@ Item {
                 }
             }
 
-            Item { width: 1; height: 16; visible: backend.smartShiftSupported && backend.deviceHasSmartShift }
+            Item { width: 1; height: 16; visible: backend.smartShiftSupported && backend.deviceHasSmartShift && !backend.deviceReadOnly }
 
             // ── Scroll Wheel Mode ─────────────────────────────────
             Rectangle {
-                visible: backend.smartShiftSupported && backend.deviceHasSmartShift
+                visible: backend.smartShiftSupported && backend.deviceHasSmartShift && !backend.deviceReadOnly
                 width: parent.width - 72
                 anchors.horizontalCenter: parent.horizontalCenter
                 height: smartShiftContent.implicitHeight + 40

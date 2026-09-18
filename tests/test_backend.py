@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 import unittest.mock
 from types import SimpleNamespace
@@ -1337,6 +1338,86 @@ class BackendDeviceLayoutTests(unittest.TestCase):
 
 
 @unittest.skipIf(Backend is None, "PySide6 not installed in test environment")
+class BackendWatchdogTests(unittest.TestCase):
+    def _backend(self, engine):
+        with (
+            patch("ui.backend.load_config", return_value=copy.deepcopy(DEFAULT_CONFIG)),
+            patch("ui.backend.save_config"),
+            patch("ui.backend.supports_login_startup", return_value=False),
+        ):
+            return Backend(engine=engine)
+
+    def test_init_never_arms_the_watchdog(self):
+        """The second consecutive trip calls os._exit; a Backend built by a
+        test must never be able to reach that."""
+        backend = self._backend(_FakeEngine())
+        self.assertIsNone(backend._watchdog)
+        self.assertIsNone(backend._watchdog_timer)
+
+    def test_start_watchdog_arms_once_with_a_precise_timer(self):
+        backend = self._backend(_FakeEngine())
+        backend.start_watchdog()
+        timer = backend._watchdog_timer
+        self.assertTrue(timer.isActive())
+        self.assertEqual(timer.timerType(), Qt.PreciseTimer)
+        self.assertEqual(timer.interval(), 60_000)
+        backend.start_watchdog()
+        self.assertIs(backend._watchdog_timer, timer)
+        timer.stop()
+
+    def test_start_watchdog_without_engine_is_a_no_op(self):
+        backend = self._backend(None)
+        backend.start_watchdog()
+        self.assertIsNone(backend._watchdog_timer)
+
+    def test_exit_requires_launchd_ownership_and_config(self):
+        backend = self._backend(_FakeEngine())
+        self.assertFalse(backend._watchdog_exit_enabled())
+        backend._launchd_owned = True
+        self.assertTrue(backend._watchdog_exit_enabled())
+        backend._cfg["settings"]["watchdog_exit"] = False
+        self.assertFalse(backend._watchdog_exit_enabled())
+
+    def test_sync_thread_records_launchd_ownership(self):
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["start_at_login"] = True
+        with (
+            patch("ui.backend.load_config", return_value=cfg),
+            patch("ui.backend.save_config"),
+            patch("ui.backend.supports_login_startup", return_value=True),
+            patch("ui.backend.sync_login_startup_from_config"),
+            patch("ui.backend.macos_launchd_owns_process", return_value=True),
+        ):
+            backend = Backend(engine=_FakeEngine())
+            _settle_login_startup_sync(backend)
+        self.assertTrue(backend._launchd_owned)
+
+    def test_toggle_off_disables_exit_even_when_launchd_owns_the_pid(self):
+        """Disabled in place = no KeepAlive relaunch; an exit would be a dead Mouser."""
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["start_at_login"] = False
+        with (
+            patch("ui.backend.load_config", return_value=cfg),
+            patch("ui.backend.save_config"),
+            patch("ui.backend.supports_login_startup", return_value=True),
+            patch("ui.backend.sync_login_startup_from_config"),
+            patch("ui.backend.macos_launchd_owns_process", return_value=True),
+        ):
+            backend = Backend(engine=_FakeEngine())
+            _settle_login_startup_sync(backend)
+        self.assertFalse(backend._launchd_owned)
+        self.assertFalse(backend._watchdog_exit_enabled())
+
+
+def _settle_login_startup_sync(backend):
+    """The sync runs on a worker thread; join it and deliver its outcome."""
+    thread = backend._login_startup_sync_thread
+    if thread is not None:
+        thread.join(timeout=5)
+    _ensure_qapp().processEvents()
+
+
+@unittest.skipIf(Backend is None, "PySide6 not installed in test environment")
 class BackendLoginStartupTests(unittest.TestCase):
     def test_init_calls_sync_from_config_when_supported(self):
         cfg = copy.deepcopy(DEFAULT_CONFIG)
@@ -1347,8 +1428,27 @@ class BackendLoginStartupTests(unittest.TestCase):
             patch("ui.backend.supports_login_startup", return_value=True),
             patch("ui.backend.sync_login_startup_from_config") as sync_mock,
         ):
-            Backend(engine=None)
+            backend = Backend(engine=None)
+            _settle_login_startup_sync(backend)
         sync_mock.assert_called_once_with(True)
+
+    def test_init_sync_runs_off_the_main_thread(self):
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["start_at_login"] = True
+        threads = []
+        with (
+            patch("ui.backend.load_config", return_value=cfg),
+            patch("ui.backend.save_config"),
+            patch("ui.backend.supports_login_startup", return_value=True),
+            patch(
+                "ui.backend.sync_login_startup_from_config",
+                side_effect=lambda _enabled: threads.append(threading.current_thread()),
+            ),
+        ):
+            backend = Backend(engine=None)
+            _settle_login_startup_sync(backend)
+        self.assertEqual(len(threads), 1)
+        self.assertIsNot(threads[0], threading.main_thread())
 
     def test_init_clears_start_at_login_when_sync_fails(self):
         cfg = copy.deepcopy(DEFAULT_CONFIG)
@@ -1363,6 +1463,7 @@ class BackendLoginStartupTests(unittest.TestCase):
             ),
         ):
             backend = Backend(engine=None)
+            _settle_login_startup_sync(backend)
 
         self.assertFalse(backend.startAtLogin)
         save_mock.assert_called_once()
@@ -1380,6 +1481,7 @@ class BackendLoginStartupTests(unittest.TestCase):
             ),
         ):
             backend = Backend(engine=None)
+            _settle_login_startup_sync(backend)
 
         self.assertFalse(backend.startAtLogin)
         save_mock.assert_not_called()

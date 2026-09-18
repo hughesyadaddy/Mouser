@@ -43,8 +43,11 @@ from core.key_simulator import (
     normalize_captured_shortcut_parts,
     valid_custom_key_names,
 )
+from core.mouse_hook_types import DEVICE_SOURCE_DESKFLOW_SHIM
+from core.self_watchdog import SelfWatchdog, TICK_S as WATCHDOG_TICK_S
 from core.startup import (
     apply_login_startup,
+    macos_launchd_owns_process,
     supports_login_startup,
     sync_from_config as sync_login_startup_from_config,
 )
@@ -246,6 +249,7 @@ class Backend(QObject):
     _updateInstallStateRequest = Signal(str, str, bool)
     _updateInstallProgressRequest = Signal(int)
     _wheelDivertChangeRequest = Signal(bool)
+    _loginStartupSyncFailed = Signal(str)
 
     def __init__(self, engine=None, parent=None, root_dir=None):
         super().__init__(parent)
@@ -298,6 +302,12 @@ class Backend(QObject):
         self._update_timer.setInterval(DEFAULT_AUTO_CHECK_INTERVAL_SECONDS * 1000)
         self._update_timer.timeout.connect(lambda: self._startUpdateCheck(manual=False))
         self._wheel_divert_active = False
+        self._watchdog = None
+        self._watchdog_timer = None
+        self._login_startup_sync_thread = None
+        # Only launchd (KeepAlive SuccessfulExit=false) turns the watchdog's
+        # exit into a respawn; set on the sync thread, read on the tick.
+        self._launchd_owned = False
 
         # Lazily-computed list snapshots for QML bindings. Every read of a
         # ``@Property(list, ...)`` returns the cached value until the
@@ -340,6 +350,8 @@ class Backend(QObject):
             self._handleUpdateInstallProgress, Qt.QueuedConnection)
         self._wheelDivertChangeRequest.connect(
             self._handleWheelDivertChange, Qt.QueuedConnection)
+        self._loginStartupSyncFailed.connect(
+            self._handleLoginStartupSyncFailure, Qt.QueuedConnection)
 
         # List-property cache invalidation. Each notify signal maps to the
         # subset of caches that depends on it; reads after the next emit
@@ -378,30 +390,88 @@ class Backend(QObject):
                 getattr(engine, "hid_features_ready", False)
             )
         if supports_login_startup():
-            try:
-                sync_login_startup_from_config(self.startAtLogin)
-            except Exception as exc:
-                print(f"[startup] Failed to sync desktop integration: {exc}", file=sys.stderr)
-                if self.startAtLogin:
-                    self._cfg.setdefault("settings", {})["start_at_login"] = False
-                    try:
-                        save_config(self._cfg)
-                    except Exception as save_exc:
-                        print(
-                            "[startup] Failed to save start-at-login recovery state: "
-                            f"{save_exc}",
-                            file=sys.stderr,
-                        )
-                    self.settingsChanged.emit()
-                    self.statusMessage.emit(
-                        "Start at login could not be enabled. Please try again."
-                    )
+            # launchctl round-trips must not sit between the process start
+            # and the first window paint.
+            self._login_startup_sync_thread = threading.Thread(
+                target=self._run_login_startup_sync,
+                args=(self.startAtLogin,),
+                daemon=True,
+                name="LoginStartupSync",
+            )
+            self._login_startup_sync_thread.start()
         else:
             self._cfg.setdefault("settings", {})["start_at_login"] = False
         self._sync_connected_device_info()
         self._configureUpdateChecks()
         self._consumeUpdateResultMarker()
         self._cleanupStaleUpdatePreparation()
+
+    def start_watchdog(self):
+        """Arm the self-check timer. Called by the app after the window is
+        up, never from __init__: the second consecutive trip calls
+        os._exit, which no test-constructed Backend may ever do."""
+        if self._engine is None or self._watchdog_timer is not None:
+            return
+        engine = self._engine
+        self._watchdog = SelfWatchdog(
+            hid_listener=lambda: getattr(
+                getattr(engine, "hook", None), "_hid_gesture", None
+            ),
+            mouse_hook=lambda: getattr(engine, "hook", None),
+            reconnect=self._watchdog_reconnect,
+            exit_enabled=self._watchdog_exit_enabled,
+        )
+        self._watchdog_timer = QTimer(self)
+        # A coarse 60 s timer may land 3 s late by design (5 % tolerance),
+        # which would read as a stalled main thread.
+        self._watchdog_timer.setTimerType(Qt.PreciseTimer)
+        self._watchdog_timer.setInterval(int(WATCHDOG_TICK_S * 1000))
+        self._watchdog_timer.timeout.connect(self._watchdog.tick)
+        self._watchdog_timer.start()
+
+    def _run_login_startup_sync(self, enabled):
+        try:
+            sync_login_startup_from_config(enabled)
+        except Exception as exc:
+            print(f"[startup] Failed to sync desktop integration: {exc}", file=sys.stderr)
+            if enabled:
+                self._loginStartupSyncFailed.emit(str(exc))
+        try:
+            # A disabled-in-place service is not relaunched by KeepAlive,
+            # so with the toggle off an exit would just be a dead Mouser.
+            self._launchd_owned = bool(enabled) and macos_launchd_owns_process()
+        except Exception as exc:  # noqa: BLE001 - launchctl boundary
+            print(f"[startup] launchd ownership probe failed: {exc}", file=sys.stderr)
+
+    @Slot(str)
+    def _handleLoginStartupSyncFailure(self, _reason):
+        """Runs on Qt main thread."""
+        if not self.startAtLogin:
+            return
+        self._cfg.setdefault("settings", {})["start_at_login"] = False
+        try:
+            save_config(self._cfg)
+        except Exception as save_exc:
+            print(
+                "[startup] Failed to save start-at-login recovery state: "
+                f"{save_exc}",
+                file=sys.stderr,
+            )
+        self.settingsChanged.emit()
+        self.statusMessage.emit(
+            "Start at login could not be enabled. Please try again."
+        )
+
+    def _watchdog_reconnect(self):
+        hg = getattr(getattr(self._engine, "hook", None), "_hid_gesture", None)
+        if hg is not None:
+            hg.force_reconnect()
+
+    def _watchdog_exit_enabled(self) -> bool:
+        # Without a supervisor an exit is just a dead Mouser.
+        return self._launchd_owned and bool(
+            self._cfg.get("settings", {}).get("watchdog_exit", True)
+        )
 
     # ── Properties ─────────────────────────────────────────────
 
@@ -767,6 +837,11 @@ class Backend(QObject):
     @Property(str, notify=deviceInfoChanged)
     def connectionType(self):
         return self._connected_device_transport
+
+    @Property(bool, notify=deviceInfoChanged)
+    def deviceReadOnly(self):
+        """Device reached through the Deskflow shim: no firmware writes."""
+        return self._connected_device_source == DEVICE_SOURCE_DESKFLOW_SHIM
 
     @Property(int, notify=deviceInfoChanged)
     def deviceDpiMin(self):

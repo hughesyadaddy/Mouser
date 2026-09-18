@@ -9,6 +9,7 @@ import threading
 import time
 
 from core import key_registry
+from core.log_setup import debug_enabled
 
 
 # ==================================================================
@@ -744,7 +745,8 @@ if sys.platform == "win32":
 
     def execute_action(action_id):
         try:
-            print(f"[KeySimulator] execute_action({action_id})")
+            if debug_enabled():
+                print(f"[KeySimulator] execute_action({action_id})")
             if action_id.startswith("custom:"):
                 keys = _parse_custom_combo(action_id, _KEY_NAME_TO_CODE)
                 if keys:

@@ -16,6 +16,7 @@ class DeskflowSinkDevice:
         self._read_timeout_ms = max(0, int(read_timeout_ms))
         self._queue: queue.Queue[bytes | None] = queue.Queue(maxsize=512)
         self._closed = False
+        self._closed_read_logged = False
         self._lock = threading.Lock()
 
     @property
@@ -30,8 +31,20 @@ class DeskflowSinkDevice:
         # Firmware writes cannot reach the physical device through Tier 1/1.5.
         return len(data) if data else 0
 
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
     def read(self, size, timeout_ms=0):
         if self._closed:
+            # close() is terminal; a caller still reading is the closed-sink
+            # spin that pinned a core for 27 h -- say so exactly once.
+            if not self._closed_read_logged:
+                self._closed_read_logged = True
+                print(
+                    "[DeskflowSink] read() on a closed sink -- caller must "
+                    "re-attach or back off"
+                )
             return None
         wait = self._read_timeout_ms if timeout_ms == 0 else int(timeout_ms)
         wait_sec = None if wait <= 0 else wait / 1000.0

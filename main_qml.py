@@ -1476,6 +1476,7 @@ def main():
     _t7 = _time.perf_counter()
     # ── QML Backend ────────────────────────────────────────────
     backend = Backend(engine, root_dir=ROOT)
+    backend.start_watchdog()
     ui_state.appearanceMode = backend.appearanceMode
     backend.settingsChanged.connect(
         lambda: setattr(ui_state, "appearanceMode", backend.appearanceMode)
