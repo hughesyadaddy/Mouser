@@ -669,25 +669,34 @@ def _spawn_detached(exe_path: str) -> None:
         err.close()
 
 
+def _write_macos_launch_agent(exe_path: str) -> str:
+    from core.startup import write_macos_launch_agent
+
+    return write_macos_launch_agent([exe_path])
+
+
 def ctl_start(
     exe_path: str | None = None,
     *,
     launchctl: Callable[[list[str]], subprocess.CompletedProcess] = _launchctl,
     agent_loaded: Callable[[], bool] | None = None,
     plist_exists: Callable[[], bool] | None = None,
+    write_plist: Callable[[str], str] = _write_macos_launch_agent,
     spawn: Callable[[str], None] = _spawn_detached,
     run_powershell: Callable[[str], subprocess.CompletedProcess] = _run_powershell,
     console_user: Callable[[], str] | None = None,
 ) -> int:
     """Start exactly one Mouser without ``open`` / ``Start-Process``.
 
-    macOS: ``launchctl kickstart -k`` when the agent is loaded, else
-    ``launchctl bootstrap`` of the plist (RunAtLoad starts it). There is
-    no direct-spawn fallback: an unmanaged Mouser is exactly the ownership
-    drift that left launchd's copy parked dead beside a live stray, so a
-    failed bootstrap is reported, not papered over.  Windows: a one-shot
-    interactive scheduled task for the console user, so a session-0 caller
-    (SSH) still gets a visible, hook-capable Mouser.
+    macOS: launchd is the only launcher. ``launchctl kickstart -k`` when
+    the agent is loaded; otherwise render the plist if it is missing,
+    ``launchctl enable`` (the Start-at-login toggle disables in place) and
+    ``bootstrap`` it (RunAtLoad starts it). There is no direct-spawn
+    fallback: an unmanaged Mouser is exactly the ownership drift that left
+    launchd's copy parked dead beside a live stray, so a failed bootstrap
+    is reported, not papered over.  Windows: a one-shot interactive
+    scheduled task for the console user, so a session-0 caller (SSH) still
+    gets a visible, hook-capable Mouser.
     """
     exe_path = exe_path or default_executable()
     if not os.path.isfile(exe_path):
@@ -703,18 +712,19 @@ def ctl_start(
                 _log(f"start: launchctl kickstart -k {target}")
                 return 0
             _log(f"start: kickstart failed: {(result.stderr or result.stdout).strip()}")
-        elif plist_exists():
-            result = launchctl(["bootstrap", f"gui/{os.getuid()}", _macos_plist_path()])
-            if result.returncode == 0:
-                _log("start: launchctl bootstrap (RunAtLoad)")
-                return 0
-            _log(f"start: bootstrap failed: {(result.stderr or result.stdout).strip()}")
-        else:
-            _log(
-                f"start: no launch agent at {_macos_plist_path()}; "
-                "enable Start at login (or reinstall) so launchd owns Mouser"
-            )
-        _log("start: refusing to spawn an unmanaged Mouser")
+            return 1
+        if not plist_exists():
+            try:
+                _log(f"start: rendered launch agent {write_plist(exe_path)}")
+            except OSError as exc:
+                _log(f"start: could not write launch agent: {exc}")
+                return 1
+        launchctl(["enable", target])
+        result = launchctl(["bootstrap", f"gui/{os.getuid()}", _macos_plist_path()])
+        if result.returncode == 0:
+            _log("start: launchctl bootstrap (RunAtLoad)")
+            return 0
+        _log(f"start: bootstrap failed: {(result.stderr or result.stdout).strip()}")
         return 1
     if sys.platform == "win32":
         console_user = console_user or _windows_console_user

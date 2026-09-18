@@ -506,14 +506,69 @@ class ApplyLoginStartupMacTests(unittest.TestCase):
             patch("os.path.isfile", return_value=True),
             patch("os.remove") as m_remove,
         ):
-            m_lc.return_value = MagicMock(returncode=0)
+            m_lc.return_value = MagicMock(returncode=0, stdout="\tpid = 4242\n")
             st.apply_login_startup(False)
 
-        self.assertEqual(m_lc.call_count, 1)
-        m_lc.assert_called_with(
-            ["launchctl", "bootout", domain, plist]
+        self.assertEqual(
+            [call.args[0] for call in m_lc.call_args_list],
+            [
+                ["launchctl", "print", f"{domain}/{st.MACOS_LAUNCH_AGENT_LABEL}"],
+                ["launchctl", "bootout", domain, plist],
+            ],
         )
         m_remove.assert_called_once_with(plist)
+
+    def test_macos_disable_while_launchd_owns_this_process_only_disables(self):
+        """bootout of our own agent would SIGTERM this very process."""
+        plist = "/tmp/io.github.tombadash.mouser.plist"
+        domain = "gui/501"
+
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch("core.startup.os.getuid", return_value=501, create=True),
+            patch.object(st, "supports_login_startup", return_value=True),
+            patch.object(st, "_macos_plist_path", return_value=plist),
+            patch.object(st, "_launchctl_run") as m_lc,
+            patch("os.path.isfile", return_value=True),
+            patch("os.remove") as m_remove,
+        ):
+            m_lc.return_value = MagicMock(returncode=0, stdout=f"\tpid = {os.getpid()}\n")
+            st.apply_login_startup(False)
+
+        self.assertEqual(
+            [call.args[0] for call in m_lc.call_args_list],
+            [
+                ["launchctl", "print", f"{domain}/{st.MACOS_LAUNCH_AGENT_LABEL}"],
+                ["launchctl", "disable", f"{domain}/{st.MACOS_LAUNCH_AGENT_LABEL}"],
+            ],
+        )
+        m_remove.assert_not_called()
+
+    def test_macos_launchd_owns_process_helper(self):
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch("core.startup.os.getuid", return_value=501, create=True),
+            patch.object(st, "_launchctl_run") as m_lc,
+        ):
+            m_lc.return_value = MagicMock(returncode=0, stdout=f"\tpid = {os.getpid()}\n")
+            self.assertTrue(st.macos_launchd_owns_process())
+            m_lc.return_value = MagicMock(returncode=0, stdout="\tpid = 1\n")
+            self.assertFalse(st.macos_launchd_owns_process())
+        with patch.object(sys, "platform", "linux"):
+            self.assertFalse(st.macos_launchd_owns_process())
+
+    def test_write_macos_launch_agent_renders_without_launchctl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plist = os.path.join(tmp, "LaunchAgents", "x.plist")
+            with (
+                patch.object(st, "_macos_plist_path", return_value=plist),
+                patch.object(st, "_macos_log_dir", return_value=os.path.join(tmp, "Logs")),
+                patch.object(st, "_launchctl_run") as m_lc,
+            ):
+                self.assertEqual(st.write_macos_launch_agent(["/X/Mouser"]), plist)
+            m_lc.assert_not_called()
+            with open(plist, "rb") as f:
+                self.assertEqual(plistlib.load(f)["ProgramArguments"], ["/X/Mouser"])
 
     def test_macos_disable_uses_label_bootout_when_no_plist(self):
         plist = "/tmp/io.github.tombadash.mouser.plist"

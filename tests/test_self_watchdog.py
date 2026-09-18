@@ -126,12 +126,25 @@ class SelfWatchdogTests(unittest.TestCase):
             fx.tick()
         self.assertEqual(fx.tick(tap_reenables=1), [])
 
-    def test_late_heartbeat_trips_but_a_suspend_does_not(self):
+    def test_late_heartbeat_trips_on_two_consecutive_late_ticks(self):
         fx = _Fixture()
         self.assertEqual(fx.tick(late=1.0), [])
-        self.assertEqual(fx.tick(late=3.0), ["heartbeat_drift=3.0s"])
-        fx.tick()
+        self.assertEqual(fx.tick(late=3.0), [])
+        self.assertEqual(fx.tick(late=3.0), ["heartbeat_drift=3.0s late_ticks=2"])
+        self.assertEqual(fx.reconnects, 1)
+
+    def test_one_late_tick_is_timer_coalescing_not_a_stall(self):
+        fx = _Fixture()
+        for _ in range(20):
+            self.assertEqual(fx.tick(late=3.0), [])
+            self.assertEqual(fx.tick(), [])
+        self.assertEqual(fx.reconnects, 0)
+
+    def test_a_suspend_never_counts_as_drift(self):
+        fx = _Fixture()
         self.assertEqual(fx.tick(late=3600.0), [])
+        self.assertEqual(fx.tick(late=3600.0), [])
+        self.assertEqual(fx.reconnects, 0)
 
     def test_missing_counters_do_not_trip(self):
         wd = SelfWatchdog(

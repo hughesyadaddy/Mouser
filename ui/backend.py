@@ -47,6 +47,7 @@ from core.mouse_hook_types import DEVICE_SOURCE_DESKFLOW_SHIM
 from core.self_watchdog import SelfWatchdog, TICK_S as WATCHDOG_TICK_S
 from core.startup import (
     apply_login_startup,
+    macos_launchd_owns_process,
     supports_login_startup,
     sync_from_config as sync_login_startup_from_config,
 )
@@ -304,19 +305,9 @@ class Backend(QObject):
         self._watchdog = None
         self._watchdog_timer = None
         self._login_startup_sync_thread = None
-        if engine is not None:
-            self._watchdog = SelfWatchdog(
-                hid_listener=lambda: getattr(
-                    getattr(engine, "hook", None), "_hid_gesture", None
-                ),
-                mouse_hook=lambda: getattr(engine, "hook", None),
-                reconnect=self._watchdog_reconnect,
-                exit_enabled=self._watchdog_exit_enabled,
-            )
-            self._watchdog_timer = QTimer(self)
-            self._watchdog_timer.setInterval(int(WATCHDOG_TICK_S * 1000))
-            self._watchdog_timer.timeout.connect(self._watchdog.tick)
-            self._watchdog_timer.start()
+        # Only launchd (KeepAlive SuccessfulExit=false) turns the watchdog's
+        # exit into a respawn; set on the sync thread, read on the tick.
+        self._launchd_owned = False
 
         # Lazily-computed list snapshots for QML bindings. Every read of a
         # ``@Property(list, ...)`` returns the cached value until the
@@ -415,6 +406,29 @@ class Backend(QObject):
         self._consumeUpdateResultMarker()
         self._cleanupStaleUpdatePreparation()
 
+    def start_watchdog(self):
+        """Arm the self-check timer. Called by the app after the window is
+        up, never from __init__: the second consecutive trip calls
+        os._exit, which no test-constructed Backend may ever do."""
+        if self._engine is None or self._watchdog_timer is not None:
+            return
+        engine = self._engine
+        self._watchdog = SelfWatchdog(
+            hid_listener=lambda: getattr(
+                getattr(engine, "hook", None), "_hid_gesture", None
+            ),
+            mouse_hook=lambda: getattr(engine, "hook", None),
+            reconnect=self._watchdog_reconnect,
+            exit_enabled=self._watchdog_exit_enabled,
+        )
+        self._watchdog_timer = QTimer(self)
+        # A coarse 60 s timer may land 3 s late by design (5 % tolerance),
+        # which would read as a stalled main thread.
+        self._watchdog_timer.setTimerType(Qt.PreciseTimer)
+        self._watchdog_timer.setInterval(int(WATCHDOG_TICK_S * 1000))
+        self._watchdog_timer.timeout.connect(self._watchdog.tick)
+        self._watchdog_timer.start()
+
     def _run_login_startup_sync(self, enabled):
         try:
             sync_login_startup_from_config(enabled)
@@ -422,6 +436,10 @@ class Backend(QObject):
             print(f"[startup] Failed to sync desktop integration: {exc}", file=sys.stderr)
             if enabled:
                 self._loginStartupSyncFailed.emit(str(exc))
+        try:
+            self._launchd_owned = macos_launchd_owns_process()
+        except Exception as exc:  # noqa: BLE001 - launchctl boundary
+            print(f"[startup] launchd ownership probe failed: {exc}", file=sys.stderr)
 
     @Slot(str)
     def _handleLoginStartupSyncFailure(self, _reason):
@@ -448,7 +466,10 @@ class Backend(QObject):
             hg.force_reconnect()
 
     def _watchdog_exit_enabled(self) -> bool:
-        return bool(self._cfg.get("settings", {}).get("watchdog_exit", True))
+        # Without a supervisor an exit is just a dead Mouser.
+        return self._launchd_owned and bool(
+            self._cfg.get("settings", {}).get("watchdog_exit", True)
+        )
 
     # ── Properties ─────────────────────────────────────────────
 

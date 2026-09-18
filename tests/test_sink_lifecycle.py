@@ -24,6 +24,7 @@ from core.hid_sink import encode_report_frame
 from core.mouse_hook_types import DEVICE_SOURCE_DESKFLOW_SHIM
 
 from tests.test_deskflow_listener_ingress import (
+    DECODE,
     FRAME_GESTURE_DOWN,
     _IngressFixture,
     _wait_until,
@@ -156,6 +157,77 @@ class InstantNoneGuardTests(unittest.TestCase):
             hg._run_main_loop()
         # ~150 ms at >=5 ms per read is ~30 reads; a spin would be thousands.
         self.assertLess(dev.reads, 100)
+
+
+class RejectedAttachTests(unittest.TestCase):
+    """A pending attach short-circuits _wait_reconnect. If the attach is
+    rejected (bad decode, closed sink) and stays pending, the outer loop
+    spins at >100k iterations/s with a log line each. Uses the REAL
+    _wait_reconnect."""
+
+    def _spin_test(self, attach_decode, *, close_sink=False):
+        reset_deskflow_sink_for_tests()
+        self.addCleanup(reset_deskflow_sink_for_tests)
+        if close_sink:
+            get_deskflow_sink().close()
+        hg = HidGestureListener()
+        hg._running = True
+        hg._deskflow_attach = {
+            "decode": attach_decode,
+            "product_id": 0xB042,
+            "product_name": "MX Master 4",
+        }
+        hg._vendor_hid_infos = lambda manager: []
+        hg._mac_manager = lambda: None
+        connect_attempts = []
+        original = hg._try_connect
+
+        def counting_try_connect():
+            connect_attempts.append(time.monotonic())
+            if len(connect_attempts) >= 3 or time.monotonic() > stop_at:
+                hg._running = False
+            return original()
+
+        hg._try_connect = counting_try_connect
+        stop_at = time.monotonic() + 0.5
+        with patch.object(hid_gesture, "ABSENT_POLL_UNNOTIFIED_S", 0.05), \
+                patch.object(hid_gesture, "ABSENT_POLL_NOTIFIED_S", 0.05), \
+                redirect_stdout(io.StringIO()):
+            hg._run_main_loop()
+        return hg, connect_attempts
+
+    def test_invalid_decode_attach_is_dropped_and_the_loop_backs_off(self):
+        hg, attempts = self._spin_test({"gesture_cid": "0x01A0"})
+        self.assertIsNone(hg._deskflow_attach)
+        self.assertLessEqual(len(attempts), 3)
+        # Second attempt only after the absent-poll wait, not instantly.
+        self.assertGreaterEqual(attempts[1] - attempts[0], 0.04)
+
+    def test_closed_sink_attach_is_dropped_and_the_loop_backs_off(self):
+        hg, attempts = self._spin_test(dict(DECODE), close_sink=True)
+        self.assertIsNone(hg._deskflow_attach)
+        self.assertLessEqual(len(attempts), 3)
+        self.assertGreaterEqual(attempts[1] - attempts[0], 0.04)
+
+    def test_a_newer_attach_survives_the_rejection_of_an_older_one(self):
+        reset_deskflow_sink_for_tests()
+        self.addCleanup(reset_deskflow_sink_for_tests)
+        hg = HidGestureListener()
+        hg._vendor_hid_infos = lambda manager: []
+        hg._mac_manager = lambda: None
+        stale = {"decode": {"gesture_cid": "0x01A0"}, "product_id": 1, "product_name": "x"}
+        fresh = {"decode": dict(DECODE), "product_id": 0xB042, "product_name": "MX Master 4"}
+        hg._deskflow_attach = stale
+        original = hg._try_connect_deskflow
+
+        def reject_then_replace(attach):
+            hg._deskflow_attach = fresh
+            return original(attach)
+
+        hg._try_connect_deskflow = reject_then_replace
+        with redirect_stdout(io.StringIO()):
+            self.assertFalse(hg._try_connect())
+        self.assertIs(hg._deskflow_attach, fresh)
 
 
 class ReadOnlyEarlyReturnTests(unittest.TestCase):

@@ -1337,6 +1337,61 @@ class BackendDeviceLayoutTests(unittest.TestCase):
         self.assertIn("Profile already exists", status_messages)
 
 
+@unittest.skipIf(Backend is None, "PySide6 not installed in test environment")
+class BackendWatchdogTests(unittest.TestCase):
+    def _backend(self, engine):
+        with (
+            patch("ui.backend.load_config", return_value=copy.deepcopy(DEFAULT_CONFIG)),
+            patch("ui.backend.save_config"),
+            patch("ui.backend.supports_login_startup", return_value=False),
+        ):
+            return Backend(engine=engine)
+
+    def test_init_never_arms_the_watchdog(self):
+        """The second consecutive trip calls os._exit; a Backend built by a
+        test must never be able to reach that."""
+        backend = self._backend(_FakeEngine())
+        self.assertIsNone(backend._watchdog)
+        self.assertIsNone(backend._watchdog_timer)
+
+    def test_start_watchdog_arms_once_with_a_precise_timer(self):
+        backend = self._backend(_FakeEngine())
+        backend.start_watchdog()
+        timer = backend._watchdog_timer
+        self.assertTrue(timer.isActive())
+        self.assertEqual(timer.timerType(), Qt.PreciseTimer)
+        self.assertEqual(timer.interval(), 60_000)
+        backend.start_watchdog()
+        self.assertIs(backend._watchdog_timer, timer)
+        timer.stop()
+
+    def test_start_watchdog_without_engine_is_a_no_op(self):
+        backend = self._backend(None)
+        backend.start_watchdog()
+        self.assertIsNone(backend._watchdog_timer)
+
+    def test_exit_requires_launchd_ownership_and_config(self):
+        backend = self._backend(_FakeEngine())
+        self.assertFalse(backend._watchdog_exit_enabled())
+        backend._launchd_owned = True
+        self.assertTrue(backend._watchdog_exit_enabled())
+        backend._cfg["settings"]["watchdog_exit"] = False
+        self.assertFalse(backend._watchdog_exit_enabled())
+
+    def test_sync_thread_records_launchd_ownership(self):
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        with (
+            patch("ui.backend.load_config", return_value=cfg),
+            patch("ui.backend.save_config"),
+            patch("ui.backend.supports_login_startup", return_value=True),
+            patch("ui.backend.sync_login_startup_from_config"),
+            patch("ui.backend.macos_launchd_owns_process", return_value=True),
+        ):
+            backend = Backend(engine=_FakeEngine())
+            _settle_login_startup_sync(backend)
+        self.assertTrue(backend._launchd_owned)
+
+
 def _settle_login_startup_sync(backend):
     """The sync runs on a worker thread; join it and deliver its outcome."""
     thread = backend._login_startup_sync_thread

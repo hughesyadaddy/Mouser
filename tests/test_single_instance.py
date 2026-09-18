@@ -464,25 +464,37 @@ class StartTests(unittest.TestCase):
                 launchctl=launchctl,
                 agent_loaded=lambda: False,
                 plist_exists=lambda: True,
+                write_plist=lambda _p: self.fail("plist exists; must not rewrite"),
                 spawn=lambda _p: self.fail("must not spawn"),
             )
         self.assertEqual(code, 0)
-        self.assertEqual(calls[0][:2], ["bootstrap", "gui/501"])
-        self.assertTrue(calls[0][2].endswith(f"{si.APP_BUNDLE_ID}.plist"))
+        self.assertEqual(calls[0], ["enable", f"gui/501/{si.APP_BUNDLE_ID}"])
+        self.assertEqual(calls[1][:2], ["bootstrap", "gui/501"])
+        self.assertTrue(calls[1][2].endswith(f"{si.APP_BUNDLE_ID}.plist"))
 
-    def test_macos_without_agent_refuses_instead_of_spawning(self):
-        """A direct spawn is the unmanaged Mouser that outlives launchd's
-        parked copy; ``start`` must fail loudly instead."""
-        with patch.object(si.sys, "platform", "darwin"), patch.object(si.subprocess, "run") as run:
+    def test_macos_without_plist_renders_agent_then_bootstraps(self):
+        """Fresh install with start_at_login off: launchd must still own
+        the process, so the plist is rendered on demand instead of a
+        detached spawn (the stray instance that outlived launchd's copy)."""
+        calls: list[list[str]] = []
+        written: list[str] = []
+
+        def launchctl(args):
+            calls.append(args)
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.object(si.sys, "platform", "darwin"), patch("os.getuid", return_value=501, create=True):
             code = si.ctl_start(
                 self.exe,
-                launchctl=lambda args: self.fail("no launchctl"),
+                launchctl=launchctl,
                 agent_loaded=lambda: False,
                 plist_exists=lambda: False,
+                write_plist=lambda exe: (written.append(exe), "/x/agent.plist")[1],
                 spawn=lambda _p: self.fail("must not spawn"),
             )
-        self.assertEqual(code, 1)
-        run.assert_not_called()
+        self.assertEqual(code, 0)
+        self.assertEqual(written, [self.exe])
+        self.assertEqual([c[0] for c in calls], ["enable", "bootstrap"])
 
     def test_macos_bootstrap_failure_returns_nonzero_without_spawning(self):
         with patch.object(si.sys, "platform", "darwin"), patch("os.getuid", return_value=501, create=True):
@@ -502,6 +514,21 @@ class StartTests(unittest.TestCase):
                 launchctl=lambda args: MagicMock(returncode=3, stdout="", stderr="kickstart failed"),
                 agent_loaded=lambda: True,
                 plist_exists=lambda: True,
+                spawn=lambda _p: self.fail("must not spawn"),
+            )
+        self.assertEqual(code, 1)
+
+    def test_macos_plist_write_failure_returns_nonzero(self):
+        def boom(_exe):
+            raise OSError("read-only")
+
+        with patch.object(si.sys, "platform", "darwin"), patch("os.getuid", return_value=501, create=True):
+            code = si.ctl_start(
+                self.exe,
+                launchctl=lambda args: self.fail("no launchctl"),
+                agent_loaded=lambda: False,
+                plist_exists=lambda: False,
+                write_plist=boom,
                 spawn=lambda _p: self.fail("must not spawn"),
             )
         self.assertEqual(code, 1)

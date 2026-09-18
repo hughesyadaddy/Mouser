@@ -173,8 +173,12 @@ class LogLevelTests(_LoggingCase):
         self.assertTrue(log_setup.debug_enabled())
 
     def test_env_overrides_config(self):
-        self._setup(config={"settings": {"log_level": "DEBUG"}}, env="WARNING")
-        self.assertEqual(logging.root.level, logging.WARNING)
+        self._setup(config={"settings": {"log_level": "INFO"}}, env="DEBUG")
+        self.assertEqual(logging.root.level, logging.DEBUG)
+
+    def test_levels_above_info_are_clamped_so_prints_still_log(self):
+        self._setup(config={"settings": {"log_level": "ERROR"}})
+        self.assertEqual(logging.root.level, logging.INFO)
 
     def test_unknown_level_name_falls_back_to_info(self):
         self._setup(config={"settings": {"log_level": "LOUD"}})

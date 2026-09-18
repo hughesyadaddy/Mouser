@@ -3344,9 +3344,17 @@ class HidGestureListener:
         opens the in-process sink (Tier 1.5 hidapi shim). While a Deskflow
         attach is pending, skip USB probing so KVM ingress connects promptly.
         """
-        if self._deskflow_attach is not None:
-            if self._try_connect_deskflow(self._deskflow_attach):
+        attach = self._deskflow_attach
+        if attach is not None:
+            if self._try_connect_deskflow(attach):
                 return True
+            # A rejected attach (bad decode, closed sink) is permanent for
+            # this request; leaving it pending makes _wait_reconnect return
+            # instantly and the outer loop spins. Deskflow re-announces.
+            with self._deskflow_control_lock:
+                if self._deskflow_attach is attach:
+                    self._deskflow_attach = None
+                    self._deskflow_attach_ready = None
         if self._should_skip_enumeration():
             self._enumeration_skips += 1
             # Still "present": the last real scan saw candidates and no

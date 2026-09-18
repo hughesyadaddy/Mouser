@@ -7,7 +7,8 @@ Three symptoms are sampled once a minute from the Qt main thread:
   backend (the 27 h / 100 % CPU incident);
 * CGEventTap re-enables above 10 per hour -- macOS disables the tap when
   the callback stalls, so a climbing count means the main thread is starved;
-* the tick itself arriving more than 2 s late -- the main thread was blocked.
+* the tick itself arriving more than 2 s late on two consecutive ticks --
+  the main thread is blocked (one late tick is timer coalescing / App Nap).
 
 First trip: one structured log line and a listener reconnect. A second
 consecutive trip exits with status 3 so launchd (``KeepAlive
@@ -30,6 +31,7 @@ CPU_TRIP_TICKS = 3
 SPIN_EMPTY_READS_PER_TICK = 600
 TAP_REENABLE_TRIP_PER_HOUR = 10
 HEARTBEAT_DRIFT_S = 2.0
+HEARTBEAT_TRIP_TICKS = 2
 # A tick late by a whole interval or more is a suspend/resume, not a stall.
 HEARTBEAT_SUSPEND_S = TICK_S
 EXIT_STATUS = 3
@@ -64,6 +66,7 @@ class SelfWatchdog:
         self._last_empty_reads = 0
         self._last_tap_reenables = 0
         self._hot_ticks = 0
+        self._late_ticks = 0
         self._tap_reenable_window = deque(maxlen=int(3600 / tick_s) or 1)
         self.trips = 0
         self.consecutive_trips = 0
@@ -106,12 +109,16 @@ class SelfWatchdog:
         if tap_per_hour > TAP_REENABLE_TRIP_PER_HOUR:
             reasons.append(f"tap_reenables/h={tap_per_hour}")
         if HEARTBEAT_DRIFT_S < drift < HEARTBEAT_SUSPEND_S:
-            reasons.append(f"heartbeat_drift={drift:.1f}s")
+            self._late_ticks += 1
+        else:
+            self._late_ticks = 0
+        if self._late_ticks >= HEARTBEAT_TRIP_TICKS:
+            reasons.append(f"heartbeat_drift={drift:.1f}s late_ticks={self._late_ticks}")
 
         if not reasons:
-            # Still hot after a trip means the reconnect has not helped yet;
-            # only a genuinely idle tick disarms the escalation.
-            if self._hot_ticks == 0:
+            # Still hot/late after a trip means the reconnect has not helped
+            # yet; only a genuinely idle tick disarms the escalation.
+            if self._hot_ticks == 0 and self._late_ticks == 0:
                 self.consecutive_trips = 0
             return reasons
 
@@ -126,6 +133,7 @@ class SelfWatchdog:
             self._exit_for_respawn(reasons)
             return reasons
         self._hot_ticks = 0
+        self._late_ticks = 0
         self._tap_reenable_window.clear()
         try:
             self._reconnect()

@@ -41,7 +41,10 @@ def _configured_log_level() -> int:
         except Exception:  # noqa: BLE001 - missing/corrupt config = default level
             name = ""
     level = logging.getLevelName(str(name or DEFAULT_LOG_LEVEL).upper())
-    return level if isinstance(level, int) else logging.INFO
+    if not isinstance(level, int):
+        return logging.INFO
+    # print() lines are INFO records; anything quieter would blank the log.
+    return min(level, logging.INFO)
 
 
 def debug_enabled() -> bool:

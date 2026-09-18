@@ -527,6 +527,28 @@ def _launchd_agent_pid(domain: str) -> int | None:
     return int(match.group(1)) if match else 0
 
 
+def macos_launchd_owns_process() -> bool:
+    """True when launchd reports this very pid for the Mouser agent."""
+    if sys.platform != "darwin":
+        return False
+    return _launchd_agent_pid(f"gui/{os.getuid()}") == os.getpid()
+
+
+def write_macos_launch_agent(program_arguments: list[str]) -> str:
+    """Render the LaunchAgent plist without touching launchctl; returns its path."""
+    plist_path = _macos_plist_path()
+    os.makedirs(os.path.dirname(plist_path), exist_ok=True)
+    try:
+        os.makedirs(_macos_log_dir(), exist_ok=True)
+    except OSError:
+        pass
+    _atomic_write_file(
+        plist_path,
+        plistlib.dumps(macos_launch_agent_payload(program_arguments), fmt=plistlib.FMT_XML),
+    )
+    return plist_path
+
+
 def _apply_macos(enabled: bool, *, program_arguments: list[str] | None = None) -> None:
     if sys.platform != "darwin":
         return
@@ -534,6 +556,7 @@ def _apply_macos(enabled: bool, *, program_arguments: list[str] | None = None) -
     launch_agents_dir = os.path.dirname(plist_path)
     uid = os.getuid()
     domain = f"gui/{uid}"
+    service = f"{domain}/{MACOS_LAUNCH_AGENT_LABEL}"
 
     if enabled:
         os.makedirs(launch_agents_dir, exist_ok=True)
@@ -562,15 +585,11 @@ def _apply_macos(enabled: bool, *, program_arguments: list[str] | None = None) -
         # written in place when launchd already owns this very process,
         # and only re-bootstrapped when it does not.
         if previous_plist == new_plist:
-            _launchctl_run(
-                ["launchctl", "enable", f"{domain}/{MACOS_LAUNCH_AGENT_LABEL}"]
-            )
+            _launchctl_run(["launchctl", "enable", service])
             return
         if plist_existed and _launchd_agent_pid(domain) == os.getpid():
             _atomic_write_file(plist_path, new_plist)
-            _launchctl_run(
-                ["launchctl", "enable", f"{domain}/{MACOS_LAUNCH_AGENT_LABEL}"]
-            )
+            _launchctl_run(["launchctl", "enable", service])
             return
         if plist_existed:
             _launchctl_run(["launchctl", "bootout", domain, plist_path])
@@ -583,6 +602,12 @@ def _apply_macos(enabled: bool, *, program_arguments: list[str] | None = None) -
             _restore_macos_plist_then_raise(plist_path, previous_plist, domain, exc)
     else:
         if os.path.isfile(plist_path):
+            if _launchd_agent_pid(domain) == os.getpid():
+                # Booting out our own agent would SIGTERM this process.
+                # `disable` keeps it running now and stops the next login
+                # from auto-starting it; `ctl start` re-enables on demand.
+                _launchctl_run(["launchctl", "disable", service])
+                return
             _launchctl_run(["launchctl", "bootout", domain, plist_path])
             try:
                 os.remove(plist_path)
