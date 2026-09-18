@@ -13,7 +13,7 @@ import importlib
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import call, MagicMock, Mock, patch
 
 import core
 from core.mouse_hook_types import MouseEvent
@@ -320,6 +320,21 @@ class ButtonPathTests(_MacOSHookCase):
         self.assertEqual(self.int_reads, 1)
         self.assertTrue(hook._dispatch_queue.empty())
 
+    def test_deskflow_injected_button_passes_through_untouched(self):
+        """Deskflow marks the events it posts for a remote seat with 'DSKF';
+        the receiving Mac's tap must not route them through the remap
+        pipeline (or re-invert its wheel)."""
+        hook = self._hook()
+        self.fields[_F_USER_DATA] = self.module._DESKFLOW_INJECTED_EVENT_MARKER
+        self.fields[_F_BUTTON] = 3
+
+        for event_type in (_OTHER_DOWN, _OTHER_UP, _SCROLL):
+            with self.subTest(event_type=event_type):
+                self.assertIs(self._fire(hook, event_type), self.cg_event)
+        self.assertEqual(self.int_reads, 3)
+        self.assertTrue(hook._dispatch_queue.empty())
+        self.quartz.CGEventSetIntegerValueField.assert_not_called()
+
     def test_button_with_no_device_costs_only_the_marker_read(self):
         hook = self._hook(device=False)
         hook.block(MouseEvent.XBUTTON1_DOWN)
@@ -567,6 +582,115 @@ class QuartzBindingTests(_MacOSHookCase):
             self.cg_event, self.quartz.kCGScrollWheelEventPointDeltaAxis1, -4
         )
         self.assertEqual(self.int_reads, 3)
+
+
+class MotionTapGatingTests(_MacOSHookCase):
+    """Pointer motion has its own tap that is off unless a directional
+    gesture is armed, so idle motion never enters Python at all."""
+
+    def _started_hook(self):
+        hook = self.module.MouseHook()
+        self.quartz.CGEventTapCreate.side_effect = ["main-tap", "motion-tap"]
+        with (
+            patch.object(hook, "_start_hid_listener"),
+            patch.object(hook, "_register_wake_observer"),
+            patch.object(self.module.threading, "Thread"),
+            patch("builtins.print"),
+        ):
+            self.assertTrue(hook.start())
+        self.addCleanup(setattr, hook, "_running", False)
+        return hook
+
+    def _mask_of(self, create_call):
+        return create_call.args[3]
+
+    def test_start_splits_motion_into_a_second_tap_that_starts_disabled(self):
+        hook = self._started_hook()
+
+        creates = self.quartz.CGEventTapCreate.call_args_list
+        self.assertEqual(len(creates), 2)
+        self.assertEqual(hook._tap, "main-tap")
+        self.assertEqual(hook._motion_tap, "motion-tap")
+        self.assertEqual(
+            self.quartz.CGEventTapEnable.call_args_list[-1].args, ("motion-tap", False)
+        )
+
+    def test_main_tap_mask_excludes_motion(self):
+        self.quartz.CGEventMaskBit.side_effect = lambda t: 1 << t
+        hook = self._started_hook()
+        main_mask = self._mask_of(self.quartz.CGEventTapCreate.call_args_list[0])
+        motion_mask = self._mask_of(self.quartz.CGEventTapCreate.call_args_list[1])
+        self.assertEqual(main_mask, (1 << _OTHER_DOWN) | (1 << _OTHER_UP) | (1 << _SCROLL))
+        self.assertEqual(motion_mask, (1 << _MOVED) | (1 << _OTHER_DRAGGED))
+        self.assertIsNotNone(hook._motion_tap)
+
+    def test_arm_enables_motion_tap_and_release_disables_it(self):
+        hook = self._started_hook()
+        hook._gesture_direction_enabled = True
+        self.quartz.CGEventTapEnable.reset_mock()
+
+        hook._arm_gesture_anchor()
+        self.assertEqual(
+            self.quartz.CGEventTapEnable.call_args_list, [call("motion-tap", True)]
+        )
+        self.assertEqual(hook._gesture_anchor, (10.0, 20.0))
+
+        hook._release_gesture_anchor()
+        self.assertEqual(
+            self.quartz.CGEventTapEnable.call_args_list[-1], call("motion-tap", False)
+        )
+        self.assertIsNone(hook._gesture_anchor)
+
+    def test_arm_reads_the_anchor_from_a_fresh_event_not_a_tracked_move(self):
+        hook = self._started_hook()
+        hook._gesture_direction_enabled = True
+        hook._last_cursor_pos = (1.0, 1.0)
+        self.quartz.CGEventGetLocation.return_value = (33.0, 44.0)
+
+        hook._arm_gesture_anchor()
+
+        self.quartz.CGEventCreate.assert_called_once_with(None)
+        self.assertEqual(hook._gesture_anchor, (33.0, 44.0))
+        self.quartz.CGWarpMouseCursorPosition.assert_called_once_with((33.0, 44.0))
+
+    def test_arm_with_direction_disabled_leaves_motion_tap_off(self):
+        hook = self._started_hook()
+        hook._gesture_direction_enabled = False
+        self.quartz.CGEventTapEnable.reset_mock()
+
+        hook._arm_gesture_anchor()
+
+        self.quartz.CGEventTapEnable.assert_not_called()
+        self.assertIsNone(hook._gesture_anchor)
+
+    def test_tap_timeout_re_enables_motion_tap_only_while_armed(self):
+        hook = self._started_hook()
+        hook._gesture_direction_enabled = True
+        self.quartz.CGEventTapEnable.reset_mock()
+        with patch("builtins.print"):
+            self._fire(hook, self.module._kCGEventTapDisabledByTimeout)
+        self.assertEqual(
+            self.quartz.CGEventTapEnable.call_args_list, [call("main-tap", True)]
+        )
+        self.assertEqual(hook.tap_reenable_total, 1)
+
+        hook._arm_gesture_anchor()
+        self.quartz.CGEventTapEnable.reset_mock()
+        with patch("builtins.print"):
+            self._fire(hook, self.module._kCGEventTapDisabledByTimeout)
+        self.assertEqual(
+            self.quartz.CGEventTapEnable.call_args_list,
+            [call("main-tap", True), call("motion-tap", True)],
+        )
+        self.assertEqual(hook.tap_reenable_total, 2)
+
+    def test_stop_tears_down_both_taps(self):
+        hook = self._started_hook()
+        with patch("builtins.print"):
+            hook.stop()
+        self.assertIsNone(hook._tap)
+        self.assertIsNone(hook._motion_tap)
+        self.assertEqual(self.quartz.CFRunLoopRemoveSource.call_count, 2)
 
 
 class ResumeRecoveryDedupeTests(_MacOSHookCase):

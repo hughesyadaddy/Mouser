@@ -48,6 +48,12 @@ _BTN_FORWARD = 4
 # btn=6 drives _begin_gesture_capture / _end_gesture_capture below.
 _BTN_OS_EXTRA = 6
 _INJECTED_EVENT_MARKER = 0x4D4F5554
+# 'DSKF': set by the Deskflow client on the events it posts for a remote
+# seat, so a receiving Mac's tap passes them through untouched.
+_DESKFLOW_INJECTED_EVENT_MARKER = 0x44534B46
+_INJECTED_EVENT_MARKERS = frozenset(
+    {_INJECTED_EVENT_MARKER, _DESKFLOW_INJECTED_EVENT_MARKER}
+)
 # CGEvent integer-value-field id for kCGScrollWheelEventIsContinuous. Some
 # Quartz versions surface the symbolic constant (``Quartz.kCGScrollWheelEventIsContinuous``),
 # others do not -- we cache the integer here so the event-tap path does not
@@ -162,6 +168,11 @@ class MouseHook(BaseMouseHook):
         self._running = False
         self._tap = None
         self._tap_source = None
+        # Pointer motion gets its own tap, enabled only while a directional
+        # gesture is armed: at up to 1 kHz it was the bulk of the Python
+        # entries on the main run loop and did nothing outside a capture.
+        self._motion_tap = None
+        self._motion_tap_source = None
         self.ignore_trackpad = True
         self._wake_observer = None
         self._screens_wake_observer = None
@@ -373,6 +384,8 @@ class MouseHook(BaseMouseHook):
                     flush=True,
                 )
                 Quartz.CGEventTapEnable(self._tap, True)
+                if self._motion_tap is not None and self._gesture_anchor is not None:
+                    Quartz.CGEventTapEnable(self._motion_tap, True)
                 return cg_event
 
             if not self._first_event_logged:
@@ -441,7 +454,7 @@ class MouseHook(BaseMouseHook):
 
             # ---- Buttons and wheel: one marker read, then per-type work. --
             try:
-                if get_int(cg_event, qb.f_user_data) == _INJECTED_EVENT_MARKER:
+                if get_int(cg_event, qb.f_user_data) in _INJECTED_EVENT_MARKERS:
                     return cg_event
             except Exception as exc:  # noqa: BLE001 - Quartz boundary
                 # Surface failures so a borked Quartz binding cannot make
@@ -626,14 +639,36 @@ class MouseHook(BaseMouseHook):
         if not self._gesture_direction_enabled:
             self._gesture_anchor = None
             return
-        self._gesture_anchor = self._last_cursor_pos
+        self._gesture_anchor = self._current_cursor_pos()
         if self._gesture_anchor is not None:
             self._warp_cursor(self._gesture_anchor)
+        self._set_motion_tap_enabled(True)
 
     def _release_gesture_anchor(self):
+        self._set_motion_tap_enabled(False)
         if self._gesture_anchor is not None:
             self._warp_cursor(self._gesture_anchor)
             self._gesture_anchor = None
+
+    def _current_cursor_pos(self):
+        """Pointer location at the moment of the press. The motion tap is
+        off between gestures, so this cannot come from a tracked move."""
+        if not _QUARTZ_OK:
+            return self._last_cursor_pos
+        try:
+            return self._quartz().get_location(Quartz.CGEventCreate(None))
+        except Exception as exc:  # noqa: BLE001 - Quartz boundary
+            self._emit_debug(f"cursor location read failed: {exc!r}")
+            return self._last_cursor_pos
+
+    def _set_motion_tap_enabled(self, enabled: bool) -> None:
+        tap = self._motion_tap
+        if tap is None or not self._running:
+            return
+        try:
+            Quartz.CGEventTapEnable(tap, bool(enabled))
+        except Exception as exc:  # noqa: BLE001 - Quartz boundary
+            self._emit_debug(f"motion tap enable({enabled}) failed: {exc!r}")
 
     def _on_hid_mode_shift_down(self):
         self._emit_debug("HID mode shift button down")
@@ -804,11 +839,13 @@ class MouseHook(BaseMouseHook):
             return True
 
         event_mask = (
-            Quartz.CGEventMaskBit(Quartz.kCGEventMouseMoved)
-            | Quartz.CGEventMaskBit(Quartz.kCGEventOtherMouseDown)
+            Quartz.CGEventMaskBit(Quartz.kCGEventOtherMouseDown)
             | Quartz.CGEventMaskBit(Quartz.kCGEventOtherMouseUp)
-            | Quartz.CGEventMaskBit(Quartz.kCGEventOtherMouseDragged)
             | Quartz.CGEventMaskBit(Quartz.kCGEventScrollWheel)
+        )
+        motion_mask = (
+            Quartz.CGEventMaskBit(Quartz.kCGEventMouseMoved)
+            | Quartz.CGEventMaskBit(Quartz.kCGEventOtherMouseDragged)
         )
 
         self._tap = Quartz.CGEventTapCreate(
@@ -838,6 +875,27 @@ class MouseHook(BaseMouseHook):
         )
         Quartz.CGEventTapEnable(self._tap, True)
         print("[MouseHook] CGEventTap enabled and integrated with run loop", flush=True)
+
+        self._motion_tap = Quartz.CGEventTapCreate(
+            Quartz.kCGSessionEventTap,
+            Quartz.kCGHeadInsertEventTap,
+            Quartz.kCGEventTapOptionDefault,
+            motion_mask,
+            self._event_tap_callback,
+            None,
+        )
+        if self._motion_tap is None:
+            print("[MouseHook] WARNING: motion tap unavailable; directional gestures off")
+        else:
+            self._motion_tap_source = Quartz.CFMachPortCreateRunLoopSource(
+                None, self._motion_tap, 0
+            )
+            Quartz.CFRunLoopAddSource(
+                Quartz.CFRunLoopGetCurrent(),
+                self._motion_tap_source,
+                Quartz.kCFRunLoopCommonModes,
+            )
+            Quartz.CGEventTapEnable(self._motion_tap, False)
         self._running = True
 
         self._dispatch_thread = threading.Thread(
@@ -859,6 +917,17 @@ class MouseHook(BaseMouseHook):
         self._logitech_scroll_monitor.stop()
         self._scroll_monitor_applied = None
         self._scroll_prefetch = None
+
+        if self._motion_tap:
+            Quartz.CGEventTapEnable(self._motion_tap, False)
+            if self._motion_tap_source:
+                Quartz.CFRunLoopRemoveSource(
+                    Quartz.CFRunLoopGetCurrent(),
+                    self._motion_tap_source,
+                    Quartz.kCFRunLoopCommonModes,
+                )
+                self._motion_tap_source = None
+            self._motion_tap = None
 
         if self._tap:
             Quartz.CGEventTapEnable(self._tap, False)
@@ -890,6 +959,8 @@ __all__ = [
     "_BTN_FORWARD",
     "_BTN_OS_EXTRA",
     "_INJECTED_EVENT_MARKER",
+    "_DESKFLOW_INJECTED_EVENT_MARKER",
+    "_INJECTED_EVENT_MARKERS",
     "_kCGEventTapDisabledByTimeout",
     "_kCGEventTapDisabledByUserInput",
 ]
