@@ -1,0 +1,200 @@
+Process:         Mouser [3191]
+Path:            /Applications/Mouser.app/Contents/MacOS/Mouser
+Load Address:    0x10b5ce000
+Identifier:      io.github.hughesyadaddy.mouser
+Version:         3.6.0 (3.6.0)
+Code Type:       X86-64
+Platform:        macOS
+Parent Process:  launchd [1]
+Target Type:     live task
+
+Date/Time:       2026-09-21 18:21:11.495 -0400
+Launch Time:     2026-09-18 09:13:01.330 -0400
+OS Version:      macOS 26.2 (25C56)
+Report Version:  7
+Analysis Tool:   /Applications/Xcode.app/Contents/Developer/usr/bin/heap
+Analysis Tool Version:  Xcode 26.5 (17F42)
+
+Physical footprint:         6.0G
+Physical footprint (peak):  6.0G
+Idle exit:                  untracked
+----
+
+Process 3191: 5 zones
+
+All zones: 63308610 nodes malloced - Sizes: 48604KB[2] 32804KB[1] 8212KB[2] 4096KB[1] 2624KB[1] 1280KB[25] 960KB[1] 640KB[39] 608KB[1] 532KB[1] 512KB[4] 416KB[1] 384KB[1] 352KB[21] 320KB[1] 288KB[21] 256KB[2] 160KB[1] 148KB[1] 128KB[5] 96KB[20] 64KB[35] 32KB[3] 29.5KB[5] 27.5KB[2] 27KB[9] 25.5KB[4] 24.5KB[1] 24KB[4] 23KB[20] 22.5KB[1] 22KB[5] 20.5KB[3] 20KB[3] 19.5KB[4] 18.5KB[8] 18KB[9] 17KB[2] 16.5KB[4] 16KB[33] 15.5KB[28] 15KB[7] 14.5KB[8] 14KB[21] 13.5KB[10] 13KB[14] 12.5KB[16] 12KB[9] 11.5KB[6] 11KB[10] 10.5KB[28] 10KB[131] 9.5KB[21] 9KB[13] 8.5KB[58] 8KB[125] 7.5KB[27] 7KB[14] 6.5KB[97] 6KB[54] 5.5KB[64] 5KB[75] 4.5KB[98] 4KB[191] 3.5KB[248] 3KB[410] 2.5KB[431] 2KB[1175] 1.5KB[3057] 1KB[303] 1008[65] 992[111] 976[1634] 960[50] 944[45] 928[74] 912[44] 896[39] 880[74] 864[54] 848[51] 832[99] 816[68] 800[329] 784[76] 768[2731] 752[137] 736[164] 720[58] 704[115] 688[90] 672[753] 656[981] 640[1438] 624[162] 608[209] 592[575] 576[363] 560[233] 544[602] 528[591] 512[690] 496[187] 480[100] 464[358] 448[1144] 432[477] 416[260] 400[1366] 384[456] 368[170] 352[135] 336[986] 320[364918] 304[730174] 288[2308] 272[1360] 256[3219650] 240[1637] 224[1873] 208[3786] 192[4289] 176[1158] 160[3861146] 144[3961903] 128[2930621] 112[10826949] 96[1103020] 80[2197567] 64[4413251] 48[13657195] 32[11417133] 16[4583272] 
+
+Found:  1588 ObjC classes  244 Swift classes  314 C++ classes  259 CFTypes
+Type names for non-objects could be derived from allocation backtraces if the process used MallocStackLogging
+
+-----------------------------------------------------------------------
+All zones: 63308610 nodes (5874279184 bytes)
+
+   COUNT      BYTES       AVG   CLASS_NAME                                        TYPE    BINARY
+   =====      =====       ===   ==========                                        ====    ======
+17142676  2240253760     130.7   non-object                                                
+ 9357423  1048031376     112.0   HIDEvent                                          ObjC    IOKit
+ 3217274  463287456     144.0   CGSEventAppendix                                  CFType  CoreGraphics
+  729477  221760912     304.0   xpc_connection_t                                  ObjC    libxpc.dylib
+ 1459077  186761856     128.0   dispatch_queue_t (serial)                         ObjC    libdispatch.dylib
+  739690  152378832     206.0   CFString                                          ObjC    CoreFoundation
+ 3112007  149376336      48.0   NSMutableArray                                    ObjC    CoreFoundation
+  729457  116713120     160.0   NSXPCConnection                                   ObjC    Foundation
+  729478  105044832     144.0   dispatch_mach_t                                   ObjC    libdispatch.dylib
+ 3217274  102952768      32.0   CGEvent                                           CFType  SkyLight
+ 1459333   93397312      64.0   CFDictionary                                      ObjC    CoreFoundation
+  732251   82609232     112.8   NSMutableDictionary (Storage)                     C       CoreFoundation
+  729442   81697504     112.0   GPProcessMonitor                                  ObjC    GamePolicy
+ 1471909   70654416      48.0   __NSMallocBlock__                                 ObjC    libsystem_blocks.dylib
+  729457   70027872      96.0   NSLock                                            ObjC    Foundation
+  729496   58359680      80.0   dispatch_group_t                                  ObjC    libdispatch.dylib
+  729457   58356560      80.0   _NSXPCConnectionExportedObjectTable               ObjC    Foundation
+  729442   58355360      80.0   GPAutoEDRParameters                               ObjC    GamePolicy
+ 3111891   50161504      16.1   NSMutableArray (Storage)                          C       CoreFoundation
+  733535   46946240      64.0   NSXPCInterface                                    ObjC    Foundation
+ 1459199   46823296      32.1   CFDictionary (Value Storage)                      C       CoreFoundation
+ 1459058   46749392      32.0   CFDictionary (Key Storage)                        C       CoreFoundation
+ 1458914   46685248      32.0   _NSXPCConnectionClassCache                        ObjC    Foundation
+  729436   46683904      64.0   GPProcessInfo                                     ObjC    GamePolicy
+ 1451203   46438496      32.0   NSMutableSet                                      ObjC    CoreFoundation
+  729603   35020112      48.0   __NSExactBlockVariable__                          ObjC    libsystem_blocks.dylib
+  729457   35013936      48.0   _NSXPCConnectionImportInfo                        ObjC    Foundation
+  729457   35013936      48.0   _NSXPCConnectionRequestedReplies                  ObjC    Foundation
+  732406   23436992      32.0   NSMutableDictionary                               ObjC    CoreFoundation
+ 1459224   23347584      16.0   NSArray                                           ObjC    CoreFoundation
+  729457   23342624      32.0   _NSXPCConnectionExpectedReplies                   ObjC    Foundation
+     789     908480    1151.4   NSConcreteMutableData (Bytes Storage)             C       Foundation
+     639     566080     885.9   Class.methodCache._buckets (bucket_t)             C       libobjc.A.dylib
+    1309     531072     405.7   NSDictionary                                      ObjC    CoreFoundation
+    1236     257088     208.0   QSGTransformNode                                  C++     QtQuick
+    1688     243072     144.0   HIDLibElement                                     ObjC    IOHIDLib
+     371     237440     640.0   QQuickTextPrivate                                 C++     QtQuick
+     549     219600     400.0   GFXAAMD_MtlBuffer                                 ObjC    AMDRadeonX6000MTLDriver
+    1688     216064     128.0   HIDElement                                        ObjC    IOKit
+    1663     212864     128.0   QObjectPrivate                                    C++     QtCore
+     876     199248     227.5   CFString (Storage)                                C       CoreFoundation
+    2025     186096      91.9   CFData                                            ObjC    CoreFoundation
+    1505     168560     112.0   SVGAttribute                                      C++     CoreSVG
+     339     146448     432.0   QSGDefaultInternalRectangleNode                   C++     QtQuick
+       2     131072   65536.0   MTLResourceList                                   ObjC    Metal
+     273     126672     464.0   TFPFont                                           C++     libFontParser.dylib
+    3570     114240      32.0   Class.data (class_rw_t)                           C       libobjc.A.dylib
+     549     114192     208.0   pthread_rwlock_t                                  C       libpthread.dylib
+     966     108192     112.0   QQmlBoundSignalExpression                         C++     QtQml
+       6      98304   16384.0   Swift Metadata                                    C       libswiftCore.dylib
+       1      98304   98304.0   GFX10_MtlDevice                                   ObjC    AMDRadeonX6000MTLDriver
+      26      87968    3383.4   CFData (Bytes Storage)                            C       CoreFoundation
+      85      84320     992.0   _CUIInternalLinkRendition                         ObjC    CoreUI
+      98      78400     800.0   TTenuousComponentFont                             C++     CoreText
+     269      74544     277.1   CFSet (Value Storage)                             C       CoreFoundation
+     141      73904     524.1   CFDictionary (Weak Key Storage)                   C       CoreFoundation
+     119      70448     592.0   TBaseFont                                         C++     CoreText
+     337      70096     208.0   icu::UnicodeSet                                   C++     libicucore.A.dylib
+     474      68256     144.0   QQmlVMEMetaObject                                 C++     QtQml
+       1      65536   65536.0   Gfx10BltDevice                                    C++     AMDRadeonX6000MTLDriver
+     163      65200     400.0   QQuickItemPrivate                                 C++     QtQuick
+      15      61440    4096.0   @autoreleasepool content                          C       libobjc.A.dylib
+     410      59040     144.0   CGPath                                            CFType  CoreGraphics
+    1213      58224      48.0   std::__shared_ptr_pointer<char*, void (*)(char*)>  C++     libpyside6.abi3.6.11.dylib
+     105      57120     544.0   Foundation.LockedState<Foundation._LocaleICU.State>.(_Buffer in $7ff80b3e1620)<>  Swift   Foundation
+    1695      54240      32.0   NSNumber                                          ObjC    CoreFoundation
+    1505      48160      32.0   SVGAttribute                                      CFType  <unknown>
+     158      42976     272.0   CGImage                                           CFType  CoreGraphics
+     331      42368     128.0   QSGGeometry                                       C++     QtQuick
+     369      41328     112.0   BSObjCValue                                       ObjC    BaseBoard
+      99      41184     416.0   _NSViewLayoutAux                                  ObjC    AppKit
+     350      39200     112.0   CUIRenditionKey                                   ObjC    CoreUI
+     241      38560     160.0   QQuickAccessibleAttached                          C++     QtQuick
+     351      38304     109.1   NSURL                                             ObjC    CoreFoundation
+     789      37872      48.0   NSConcreteMutableData                             ObjC    Foundation
+      61      37088     608.0   NSCTFont                                          ObjC    UIFoundation
+      16      32768    2048.0   GFX10_MtlRenderPipelineState                      ObjC    AMDRadeonX6000MTLDriver
+     380      30400      80.0   SVGAttributeMap                                   C++     CoreSVG
+     227      29056     128.0   NSMapTable                                        ObjC    Foundation
+     205      26240     128.0   CGFont                                            CFType  CoreGraphics
+      42      26208     624.0   TSplicedFont                                      C++     CoreText
+     320      25600      80.0   QSGHiQSubPixelDistanceFieldTextMaterial           C++     QtQuick
+     142      25312     178.3   CGImageProvider                                   CFType  CoreGraphics
+     393      25152      64.0   SVGPathCommand                                    C++     CoreSVG
+      56      24192     432.0   _CUIThemePixelRendition                           ObjC    CoreUI
+      32      24064     752.0   GFX10_MtlTexture                                  ObjC    AMDRadeonX6000MTLDriver
+       1      23552   23552.0   Addr::V2::Gfx10Lib                                C++     AMDRadeonX6000MTLDriver
+       1      23552   23552.0   __NSFontExtraData._glyphAdvancementCache (double[])  C       UIFoundation
+      70      23520     336.0   SVGShapeNode                                      C++     CoreSVG
+     104      23296     224.0   TTrueTypeDataForkFont                             C++     libFontParser.dylib
+      52      23296     448.0   QCoreTextFontEngine                               C++     QtGui
+      40      23040     576.0   QSGDefaultInternalImageNode                       C++     QtQuick
+     105      21840     208.0   _LocaleICU                                        Swift   Foundation
+     318      21520      67.7   Class.data.methods.lists (method_list_t)          C       libobjc.A.dylib
+      84      21504     256.0   NSExtraMIData                                     ObjC    AppKit
+      18      21440    1191.1   NSArray (Storage)                                 C       CoreFoundation
+       1      20992   20992.0   Gfx10DmaBltDevice                                 C++     AMDRadeonX6000MTLDriver
+     197      20896     106.1   NSSet                                             ObjC    CoreFoundation
+      75      20592     274.6   NSArray._list (id[])                              C       CoreFoundation
+       8      20480    2560.0   CUIThemeDataEffectPreset                          ObjC    CoreUI
+       1      20480   20480.0   Gfx10ShaderVidMemMgr                              C++     AMDRadeonX6000MTLDriver
+     397      19056      48.0   Class.data.extended (class_rw_ext_t)              C       libobjc.A.dylib
+       4      16384    4096.0   QSGBatchRenderer::Renderer                        C++     QtQuick
+      85      16320     192.0   CUIRenditionMetrics                               ObjC    CoreUI
+     253      16192      64.0   OS_os_log                                         ObjC    libsystem_trace.dylib
+      59      16048     272.0   NSCache._cache (struct cache_s)                   C       CoreFoundation
+      25      16000     640.0   TOpenTypeDataForkFont                             C++     libFontParser.dylib
+     196      15680      80.0   NSAutoresizingMaskLayoutConstraint                ObjC    CoreAutoLayout
+      98      15680     160.0   NSMenuItem                                        ObjC    AppKit
+      20      15680     784.0   TOpenTypeCIDDataForkFont                          C++     libFontParser.dylib
+      61      15616     256.0   QQmlComponentPrivate                              C++     QtQml
+     322      15456      48.0   NSMutableCharacterSet                             ObjC    CoreFoundation
+     240      15360      64.0   NSISRestrictedToZeroMarkerVariable                ObjC    CoreAutoLayout
+     214      14944      69.8   NSMapTable (Key Storage)                          C       Foundation
+      78      14432     185.0   Class.data.methods (method_array_t)               C       libobjc.A.dylib
+       1      14336   14336.0   Gfx10BltResFmt                                    C++     AMDRadeonX6000MTLDriver
+      35      14000     400.0   QQuickPropertyAnimationPrivate                    C++     QtQuick
+      46      13984     304.0   QFontEngineMulti                                  C++     QtGui
+      88      13968     158.7   NSData                                            ObjC    Foundation
+     285      13680      48.0   CFSet                                             ObjC    CoreFoundation
+     224      13584      60.6   CFArray                                           ObjC    CoreFoundation
+     199      13568      68.2   NSMapTable (Value Storage)                        C       Foundation
+      32      13312     416.0   HVF::LoaderHVGL                                   C++     libhvf.dylib
+     102      13056     128.0   SVGPaint                                          C++     CoreSVG
+     134      12864      96.0   QSGOpacityNode                                    C++     QtQuick
+      50      12800     256.0   CUINamedVectorGlyph                               ObjC    CoreUI
+     398      12736      32.0   CGDisplayMode                                     CFType  SkyLight
+      36      12672     352.0   _CUIThemeSVGRendition                             ObjC    CoreUI
+     393      12576      32.0   SVGPathCommand                                    CFType  <unknown>
+     260      12480      48.0   QQuickPen                                         C++     QtQuick
+       4      12288    3072.0   CFRunLoop                                         CFType  CoreFoundation
+     380      12160      32.0   SVGAttributeMap                                   CFType  <unknown>
+     188      12032      64.0   QAccessibleQuickItem                              C++     QtQuick
+     150      12000      80.0   NSLayoutConstraint                                ObjC    CoreAutoLayout
+      75      12000     160.0   CUIVectorGlyphHierarchicalLayer                   ObjC    CoreUI
+      73      11680     160.0   NSImage                                           ObjC    AppKit
+     143      11440      80.0   Class.data.readonly (class_ro_t)                  C       libobjc.A.dylib
+     128      11440      89.4   Swift.StringStorage                               Swift   libswiftCore.dylib
+     177      11328      64.0   NSAccessibilityAttributeAccessorInfo              ObjC    AppKit
+     353      11296      32.0   NSKeyValueDependency                              ObjC    AppKit
+      15      11280     752.0   vImageConverterRef                                CFType  libCGInterfaces.dylib
+      76      10944     144.0   PySidePropertyPrivate                             C++     libpyside6.abi3.6.11.dylib
+      84      10752     128.0   dispatch_source_t                                 ObjC    libdispatch.dylib
+     232      10496      45.2   NSArray                                           ObjC    CoreFoundation
+     644      10304      16.0   QQuickAnchors                                     C++     QtQuick
+     107      10272      96.0   QSGPlainTexture                                   C++     QtQuick
+      40      10240     256.0   _NSServiceEntry                                   ObjC    AppKit
+       4      10240    2560.0   MTLIOAccelResourcePool._resourceArgs (struct IOAccelNewResourceArgs)  C       Metal
+     267      10080      37.8   NSConcreteValue                                   ObjC    Foundation
+      90      10080     112.0   NSKeyValueSlowMutableCollectionGetter             ObjC    Foundation
+      34       9792     288.0   SVGRootNode                                       C++     CoreSVG
+      18       9792     544.0   NSView                                            ObjC    AppKit
+      32       9728     304.0   THierVariationsDataForkFont                       C++     libFontParser.dylib
+      50       9600     192.0   NSSymbolImageRep                                  ObjC    AppKit
+     148       9472      64.0   NSISRestrictedToNonNegativeVariable               ObjC    CoreAutoLayout
+     148       9472      64.0   NSISUnrestrictedVariable                          ObjC    CoreAutoLayout
+      13       8944     688.0   LibraryWithData                                   C++     Metal
+       1       8704    8704.0   Swift._DictionaryStorage<Swift.String, Foundation._LocaleProtocol & Swift.AnyObject>  Swift   libswiftCore.dylib
+      30       8640     288.0   CGDataProvider                                    CFType  CoreGraphics
+     134       8576      64.0   BSObjCMethod                                      ObjC    BaseBoard
+     105       8400      80.0   NSPointerArray                                    ObjC    Foundation
+      15       8400     560.0   GFX10_GfxMtlFunctionVariant                       ObjC    AMDRadeonX6000MTLDriver
+      51       8160     160.0   QQuickLayoutAttached                              C++     QtQuickLayouts
+     126       8064      64.0   NSLayoutDimension                                 ObjC    CoreAutoLayout
+      14       8064     576.0   NSStatusBarContentView                            ObjC    AppKit
+     123       7872      64.0   NSKeyValueDependencyInfo                          ObjC    AppKit

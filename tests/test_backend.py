@@ -1365,6 +1365,15 @@ class BackendWatchdogTests(unittest.TestCase):
         self.assertIs(backend._watchdog_timer, timer)
         timer.stop()
 
+    def test_watchdog_status_goes_to_the_restart_signal(self):
+        backend = self._backend(_FakeEngine())
+        backend.start_watchdog()
+        self.addCleanup(backend._watchdog_timer.stop)
+        seen = []
+        backend.restartRequired.connect(seen.append)
+        backend._watchdog._status("mem footprint_mb=1600 > 1500")
+        self.assertEqual(seen, ["mem footprint_mb=1600 > 1500"])
+
     def test_start_watchdog_without_engine_is_a_no_op(self):
         backend = self._backend(None)
         backend.start_watchdog()
