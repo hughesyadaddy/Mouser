@@ -28,19 +28,26 @@ ApplicationWindow {
                                                   ? "Consolas"
                                                   : "monospace")
     property var s: lm.strings
-    property int currentPage: 0
+    // Owned by uiState so it survives the engine teardown that follows a
+    // hide (MainWindowHost): the re-created window lands on the same page.
+    // Only openPage() writes it, so this binding is never broken.
+    property int currentPage: uiState.currentPage
     property Item hoveredNavItem: null
     property string hoveredNavText: ""
     property string hoveredNavTipKey: ""
     property real hoveredNavCenterX: 0
     property real hoveredNavCenterY: 0
+    // Also read by MainWindowHost before it releases the engine: a hidden
+    // window with a modal / key-capture overlay open is left alone.
     readonly property bool shortcutsBlocked: aboutDialog.visible
-                                            || mousePageView.hasBlockingDialog
+                                            || (mousePageLoader.item
+                                                ? mousePageLoader.item.hasBlockingDialog
+                                                : false)
 
     function openPage(page) {
         if (root.currentPage === page)
             return
-        root.currentPage = page
+        uiState.currentPage = page
         root.forceActiveFocus(Qt.OtherFocusReason)
     }
 
@@ -264,15 +271,20 @@ ApplicationWindow {
             Layout.fillWidth: true
             Layout.fillHeight: true
 
-            MousePage {
-                id: mousePageView
+            // Pages are loaded only while current so the inactive one's
+            // items, textures and JS heap are released, not merely hidden.
+            Loader {
+                id: mousePageLoader
+                objectName: "mousePageLoader"
                 anchors.fill: parent
+                active: root.currentPage === 0
                 visible: root.currentPage === 0
+                source: "MousePage.qml"
             }
 
             Loader {
                 anchors.fill: parent
-                active: root.currentPage === 1 || item
+                active: root.currentPage === 1
                 visible: root.currentPage === 1
                 source: "ScrollPage.qml"
             }
@@ -316,6 +328,7 @@ ApplicationWindow {
 
     Dialog {
         id: aboutDialog
+        objectName: "aboutDialog"
         parent: Overlay.overlay
         modal: true
         focus: true
@@ -641,66 +654,9 @@ ApplicationWindow {
         }
     }
 
-    // Always-on gesture HUD: a frameless, click-through, top-most window that
-    // flashes what each swipe did -- shows even when the main window is hidden,
-    // so you KNOW a gesture registered (and see failures). Driven by the
-    // always-on backend.gestureFeedback signal (independent of debug mode).
-    Window {
-        id: gestureHud
-        transientParent: null
-        flags: Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
-               | Qt.WindowDoesNotAcceptFocus | Qt.WindowTransparentForInput
-        color: "transparent"
-        width: 480
-        height: 80
-        visible: hudPill.opacity > 0
-        x: Screen.virtualX + Math.round((Screen.width - width) / 2)
-        y: Screen.virtualY + Math.round(Screen.height * 0.74)
-
-        Rectangle {
-            id: hudPill
-            anchors.centerIn: parent
-            width: hudText.implicitWidth + 44
-            height: 48
-            radius: 24
-            opacity: 0
-            color: root.theme.accent
-            Behavior on opacity { NumberAnimation { duration: 160 } }
-
-            Text {
-                id: hudText
-                anchors.centerIn: parent
-                color: "white"
-                font {
-                    family: uiState.fontFamily
-                    pixelSize: 18
-                    bold: true
-                }
-            }
-
-            Timer {
-                id: hudTimer
-                interval: 900
-                onTriggered: hudPill.opacity = 0
-            }
-
-            function flash(msg, status) {
-                hudText.text = msg
-                hudPill.color = status === "failed"
-                    ? "#C0392B"
-                    : (status === "unmapped" ? "#5A5A5A" : root.theme.accent)
-                hudPill.opacity = 0.96
-                hudTimer.restart()
-            }
-        }
-
-        Connections {
-            target: backend
-            function onGestureFeedback(text, status) {
-                hudPill.flash(text, status)
-            }
-        }
-    }
+    // The always-on gesture HUD lives in GestureHud.qml on its own engine
+    // (GestureHudHost in main_qml.py) so it keeps working while this window's
+    // engine is torn down after a hide.
 
     // Hide-to-tray: every "close window" idiom on every supported platform routes through
     // dismiss() so the engine and tray icon keep running. macOS LSUIElement bundles depend
@@ -709,6 +665,13 @@ ApplicationWindow {
     function dismiss() {
         if (!root.visible) {
             return
+        }
+        // With engine teardown armed the selection would be lost anyway, so
+        // drop it now and stop the pulse animation / action picker keeping
+        // the hidden window's render loop busy. In hide-only mode keep it:
+        // re-opening lands on the same hotspot and picker.
+        if (windowTeardownEnabled && mousePageLoader.item) {
+            mousePageLoader.item.clearSelection()
         }
         root.hide()
     }

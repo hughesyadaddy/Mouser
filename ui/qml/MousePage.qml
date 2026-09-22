@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Window
 import QtQuick.Controls
 import QtQuick.Controls.Material
 import QtQuick.Layouts
@@ -380,6 +381,14 @@ Item {
             selectedButtonName = lm.trButton(mapping.name)
             selectedActionId = mapping.actionId
         }
+    }
+
+    // Called from Main.qml dismiss(): a hidden window must not keep a
+    // selected hotspot (pulse animation + action picker) alive.
+    function clearSelection() {
+        selectedButton = ""
+        selectedButtonName = ""
+        selectedActionId = ""
     }
 
     function selectHScroll() {
@@ -991,10 +1000,14 @@ Item {
                             fillMode: Image.PreserveAspectFit
                             width: backend.deviceImageWidth
                             height: backend.deviceImageHeight
+                            // Decode at display size (x DPR) instead of the
+                            // asset's native size: the texture is what the
+                            // window keeps resident, not the file.
+                            sourceSize.width: Math.ceil(width * Screen.devicePixelRatio)
+                            sourceSize.height: Math.ceil(height * Screen.devicePixelRatio)
                             anchors.centerIn: parent
                             visible: backend.mouseConnected
                             smooth: true
-                            mipmap: true
                             asynchronous: true
                             cache: true
 
@@ -1224,7 +1237,7 @@ Item {
                         width: parent.width - 56
                         anchors.horizontalCenter: parent.horizontalCenter
                         height: selectedButton !== ""
-                                ? pickerCol.implicitHeight + 32 : 0
+                                ? (pickerLoader.item ? pickerLoader.item.implicitHeight + 32 : 0) : 0
                         clip: true
                         color: "transparent"
                         visible: height > 0
@@ -1233,563 +1246,573 @@ Item {
                             NumberAnimation { duration: 250; easing.type: Easing.OutQuad }
                         }
 
-                        Column {
-                            id: pickerCol
+                        // The action picker's three ActionChip Repeaters
+                        // (every action x 3 rows) exist only while a button
+                        // is selected instead of being instantiated at page
+                        // load behind a 0 px tall, clipped container.
+                        Loader {
+                            id: pickerLoader
+                            objectName: "pickerLoader"
                             anchors {
                                 left: parent.left; right: parent.right
                                 top: parent.top; topMargin: 16
                             }
-                            spacing: 16
-
-                            Row {
-                                spacing: 12
-
-                                Rectangle {
-                                    width: 6; height: pickerTitleCol.height
-                                    radius: 3; color: theme.accent
-                                    anchors.verticalCenter: parent.verticalCenter
-                                }
-
-                                Column {
-                                    id: pickerTitleCol
-                                    spacing: 2
-
-                                    Text {
-                                        text: selectedButtonName
-                                              ? selectedButtonName + (s["mouse.choose_action_suffix"] || " — Choose Action")
-                                              : ""
-                                        font { family: uiState.fontFamily; pixelSize: 15; bold: true }
-                                        color: theme.textPrimary
-                                    }
-                                    Text {
-                                        text: selectedButton === "hscroll_left"
-                                              ? s["mouse.configure_scroll_actions"]
-                                              : selectedButton === "gesture"
-                                                && backend.supportsGestureDirections
-                                                ? s["mouse.configure_gesture"]
-                                              : s["mouse.select_button_action"]
-                                        font { family: uiState.fontFamily; pixelSize: 12 }
-                                        color: theme.textSecondary
-                                        visible: selectedButton !== ""
-                                    }
-                                }
-                            }
-
-                            // Horizontal scroll: left + right rows
-                            Column {
-                                width: parent.width
-                                spacing: 14
-                                visible: selectedButton === "hscroll_left"
-
-                                Text {
-                                    text: s["mouse.scroll_left"]
-                                    font { family: uiState.fontFamily; pixelSize: 11;
-                                           capitalization: Font.AllUppercase; letterSpacing: 1 }
-                                    color: theme.textDim
-                                }
-
-                                Flow {
-                                    width: parent.width; spacing: 8
-                                    Repeater {
-                                        model: backend.allActions
-                                        delegate: ActionChip {
-                                            actionId: modelData.id
-                                            actionLabel: modelData.id === "__custom__" && isCustomAction(hscrollLeftActionId)
-                                                         ? customLabel(hscrollLeftActionId)
-                                                         : (lm.strings, lm.trAction(modelData.label))
-                                            isCurrent: modelData.id === "__custom__"
-                                                       ? isCustomAction(hscrollLeftActionId)
-                                                       : modelData.id === hscrollLeftActionId
-                                            onPicked: function(aid) {
-                                                if (aid === "__custom__") {
-                                                    keyCaptureDialog.open(selectedProfile, "hscroll_left")
-                                                    return
-                                                }
-                                                backend.setProfileMapping(
-                                                    selectedProfile, "hscroll_left", aid)
-                                            }
-                                        }
-                                    }
-                                }
-
-                                Item { width: 1; height: 4 }
-
-                                Text {
-                                    text: s["mouse.scroll_right"]
-                                    font { family: uiState.fontFamily; pixelSize: 11;
-                                           capitalization: Font.AllUppercase; letterSpacing: 1 }
-                                    color: theme.textDim
-                                }
-
-                                Flow {
-                                    width: parent.width; spacing: 8
-                                    Repeater {
-                                        model: backend.allActions
-                                        delegate: ActionChip {
-                                            actionId: modelData.id
-                                            actionLabel: modelData.id === "__custom__" && isCustomAction(hscrollRightActionId)
-                                                         ? customLabel(hscrollRightActionId)
-                                                         : (lm.strings, lm.trAction(modelData.label))
-                                            isCurrent: modelData.id === "__custom__"
-                                                       ? isCustomAction(hscrollRightActionId)
-                                                       : modelData.id === hscrollRightActionId
-                                            onPicked: function(aid) {
-                                                if (aid === "__custom__") {
-                                                    keyCaptureDialog.open(selectedProfile, "hscroll_right")
-                                                    return
-                                                }
-                                                backend.setProfileMapping(
-                                                    selectedProfile, "hscroll_right", aid)
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            Column {
-                                width: parent.width
-                                spacing: 14
-                                visible: selectedButton === "gesture"
-                                         && backend.supportsGestureDirections
-
-                                Text {
-                                    text: s["mouse.tap_action"]
-                                    font { family: uiState.fontFamily; pixelSize: 11;
-                                           capitalization: Font.AllUppercase; letterSpacing: 1 }
-                                    color: theme.textDim
-                                }
-
-                                ComboBox {
-                                    width: parent.width
-                                    model: backend.allActions
-                                    textRole: "label"
-                                    delegate: actionComboDelegate
-                                    Material.accent: theme.accent
-                                    font { family: uiState.fontFamily; pixelSize: 11 }
-                                    currentIndex: actionIndexForId(gestureTapActionId)
-                                    displayText: isCustomAction(gestureTapActionId)
-                                                 ? customLabel(gestureTapActionId)
-                                                 : (lm.strings, lm.trAction(currentText))
-                                    onActivated: function(index) {
-                                        var aid = backend.allActions[index].id
-                                        if (aid === "__custom__") {
-                                            keyCaptureDialog.open(selectedProfile, "gesture")
-                                            return
-                                        }
-                                        backend.setProfileMapping(selectedProfile, "gesture", aid)
-                                        selectedActionId = aid
-                                    }
-                                }
-
-                                Rectangle {
-                                    width: parent.width
-                                    height: 1
-                                    color: theme.border
-                                }
+                            active: selectedButton !== ""
+                            sourceComponent: Column {
+                                id: pickerCol
+                                width: pickerLoader.width
+                                spacing: 16
 
                                 Row {
-                                    width: parent.width
                                     spacing: 12
 
-                                Text {
-                                    text: s["mouse.threshold"]
-                                    font { family: uiState.fontFamily; pixelSize: 12; bold: true }
-                                    color: theme.textPrimary
-                                }
-
-                                    Text {
-                                        text: (
-                                            gestureThresholdSlider.pressed
-                                            ? Math.round(gestureThresholdSlider.value / 5.0) * 5
-                                            : backend.gestureThreshold
-                                        ) + " px"
-                                        font { family: uiState.fontFamily; pixelSize: 12 }
-                                        color: theme.textSecondary
-                                    }
-                                }
-
-                                WheelSafeSlider {
-                                    id: gestureThresholdSlider
-                                    width: parent.width
-                                    from: 20
-                                    to: 400
-                                    stepSize: 5
-                                    value: backend.gestureThreshold
-                                    accentColor: theme.accent
-                                    accentDimColor: theme.accentDim
-                                    trackColor: theme.border
-                                    onMoved: gestureThresholdSave.restart()
-                                    onPressedChanged: {
-                                        if (!pressed) {
-                                            gestureThresholdSave.stop()
-                                            backend.setGestureThreshold(
-                                                Math.round(value / 5.0) * 5)
-                                        }
-                                    }
-                                }
-
-                                Timer {
-                                    id: gestureThresholdSave
-                                    interval: 250
-                                    repeat: false
-                                    onTriggered: backend.setGestureThreshold(
-                                        Math.round(gestureThresholdSlider.value / 5.0) * 5)
-                                }
-
-                                Text {
-                                    text: s["mouse.swipe_actions"]
-                                    font { family: uiState.fontFamily; pixelSize: 11;
-                                           capitalization: Font.AllUppercase; letterSpacing: 1 }
-                                    color: theme.textDim
-                                }
-
-                                RowLayout {
-                                    width: parent.width
-                                    spacing: 12
-
-                                    Text {
-                                        text: s["mouse.swipe_left"]
-                                        Layout.preferredWidth: 100
-                                        font { family: uiState.fontFamily; pixelSize: 12 }
-                                        color: theme.textPrimary
+                                    Rectangle {
+                                        width: 6; height: pickerTitleCol.height
+                                        radius: 3; color: theme.accent
+                                        anchors.verticalCenter: parent.verticalCenter
                                     }
 
-                                    ComboBox {
-                                        Layout.fillWidth: true
-                                        model: backend.allActions
-                                        textRole: "label"
-                                        delegate: actionComboDelegate
-                                        Material.accent: theme.accent
-                                        font { family: uiState.fontFamily; pixelSize: 11 }
-                                        currentIndex: actionIndexForId(gestureLeftActionId)
-                                        displayText: isCustomAction(gestureLeftActionId)
-                                                     ? customLabel(gestureLeftActionId)
-                                                     : (lm.strings, lm.trAction(currentText))
-                                        onActivated: function(index) {
-                                            var aid = backend.allActions[index].id
-                                            if (aid === "__custom__") {
-                                                keyCaptureDialog.open(selectedProfile, "gesture_left")
-                                                return
-                                            }
-                                            backend.setProfileMapping(
-                                                selectedProfile, "gesture_left", aid)
-                                        }
-                                    }
-                                }
-
-                                RowLayout {
-                                    width: parent.width
-                                    spacing: 12
-
-                                    Text {
-                                        text: s["mouse.swipe_right"]
-                                        Layout.preferredWidth: 100
-                                        font { family: uiState.fontFamily; pixelSize: 12 }
-                                        color: theme.textPrimary
-                                    }
-
-                                    ComboBox {
-                                        Layout.fillWidth: true
-                                        model: backend.allActions
-                                        textRole: "label"
-                                        delegate: actionComboDelegate
-                                        Material.accent: theme.accent
-                                        font { family: uiState.fontFamily; pixelSize: 11 }
-                                        currentIndex: actionIndexForId(gestureRightActionId)
-                                        displayText: isCustomAction(gestureRightActionId)
-                                                     ? customLabel(gestureRightActionId)
-                                                     : (lm.strings, lm.trAction(currentText))
-                                        onActivated: function(index) {
-                                            var aid = backend.allActions[index].id
-                                            if (aid === "__custom__") {
-                                                keyCaptureDialog.open(selectedProfile, "gesture_right")
-                                                return
-                                            }
-                                            backend.setProfileMapping(
-                                                selectedProfile, "gesture_right", aid)
-                                        }
-                                    }
-                                }
-
-                                RowLayout {
-                                    width: parent.width
-                                    spacing: 12
-
-                                    Text {
-                                        text: s["mouse.swipe_up"]
-                                        Layout.preferredWidth: 100
-                                        font { family: uiState.fontFamily; pixelSize: 12 }
-                                        color: theme.textPrimary
-                                    }
-
-                                    ComboBox {
-                                        Layout.fillWidth: true
-                                        model: backend.allActions
-                                        textRole: "label"
-                                        delegate: actionComboDelegate
-                                        Material.accent: theme.accent
-                                        font { family: uiState.fontFamily; pixelSize: 11 }
-                                        currentIndex: actionIndexForId(gestureUpActionId)
-                                        displayText: isCustomAction(gestureUpActionId)
-                                                     ? customLabel(gestureUpActionId)
-                                                     : (lm.strings, lm.trAction(currentText))
-                                        onActivated: function(index) {
-                                            var aid = backend.allActions[index].id
-                                            if (aid === "__custom__") {
-                                                keyCaptureDialog.open(selectedProfile, "gesture_up")
-                                                return
-                                            }
-                                            backend.setProfileMapping(
-                                                selectedProfile, "gesture_up", aid)
-                                        }
-                                    }
-                                }
-
-                                RowLayout {
-                                    width: parent.width
-                                    spacing: 12
-
-                                    Text {
-                                        text: s["mouse.swipe_down"]
-                                        Layout.preferredWidth: 100
-                                        font { family: uiState.fontFamily; pixelSize: 12 }
-                                        color: theme.textPrimary
-                                    }
-
-                                    ComboBox {
-                                        Layout.fillWidth: true
-                                        model: backend.allActions
-                                        textRole: "label"
-                                        delegate: actionComboDelegate
-                                        Material.accent: theme.accent
-                                        font { family: uiState.fontFamily; pixelSize: 11 }
-                                        currentIndex: actionIndexForId(gestureDownActionId)
-                                        displayText: isCustomAction(gestureDownActionId)
-                                                     ? customLabel(gestureDownActionId)
-                                                     : (lm.strings, lm.trAction(currentText))
-                                        onActivated: function(index) {
-                                            var aid = backend.allActions[index].id
-                                            if (aid === "__custom__") {
-                                                keyCaptureDialog.open(selectedProfile, "gesture_down")
-                                                return
-                                            }
-                                            backend.setProfileMapping(
-                                                selectedProfile, "gesture_down", aid)
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Single button: categorized chips
-                            Column {
-                                width: parent.width
-                                spacing: 14
-                                visible: selectedButton !== ""
-                                         && selectedButton !== "hscroll_left"
-                                         && !(selectedButton === "gesture"
-                                              && backend.supportsGestureDirections)
-
-                                Repeater {
-                                    model: backend.actionCategories
-
-                                    delegate: Column {
-                                        width: parent.width
-                                        spacing: 8
+                                    Column {
+                                        id: pickerTitleCol
+                                        spacing: 2
 
                                         Text {
-                                            text: { var _lang = lm.strings; return lm.trCategory(modelData.category) }
-                                            font { family: uiState.fontFamily; pixelSize: 11;
-                                                   capitalization: Font.AllUppercase;
-                                                   letterSpacing: 1 }
-                                            color: theme.textDim
+                                            text: selectedButtonName
+                                                  ? selectedButtonName + (s["mouse.choose_action_suffix"] || " — Choose Action")
+                                                  : ""
+                                            font { family: uiState.fontFamily; pixelSize: 15; bold: true }
+                                            color: theme.textPrimary
                                         }
-
-                                        Flow {
-                                            width: parent.width; spacing: 8
-                                            Repeater {
-                                                model: modelData.actions
-                                                delegate: ActionChip {
-                                                    actionId: modelData.id
-                                                    actionLabel: modelData.id === "__custom__" && isCustomAction(selectedActionId)
-                                                                 ? customLabel(selectedActionId)
-                                                                 : (lm.strings, lm.trAction(modelData.label))
-                                                    isCurrent: modelData.id === "__custom__"
-                                                               ? isCustomAction(selectedActionId)
-                                                               : modelData.id === selectedActionId
-                                                    onPicked: function(aid) {
-                                                        if (aid === "__custom__") {
-                                                            keyCaptureDialog.open(selectedProfile, selectedButton)
-                                                            return
-                                                        }
-                                                        backend.setProfileMapping(
-                                                            selectedProfile,
-                                                            selectedButton, aid)
-                                                        selectedActionId = aid
-                                                    }
-                                                }
-                                            }
+                                        Text {
+                                            text: selectedButton === "hscroll_left"
+                                                  ? s["mouse.configure_scroll_actions"]
+                                                  : selectedButton === "gesture"
+                                                    && backend.supportsGestureDirections
+                                                    ? s["mouse.configure_gesture"]
+                                                  : s["mouse.select_button_action"]
+                                            font { family: uiState.fontFamily; pixelSize: 12 }
+                                            color: theme.textSecondary
+                                            visible: selectedButton !== ""
                                         }
                                     }
                                 }
-                            }
 
-                            // ── DPI Presets editor (when cycle_dpi is selected)
-                            Rectangle {
-                                id: dpiPresetsCard
-                                property int activeSlot: 0
-                                readonly property var slotColors: ["#e8d44d", "#5da5e8", "#e8943a", "#e05daa"]
-                                visible: selectedActionId === "cycle_dpi" && !backend.deviceReadOnly
-                                width: parent.width
-                                height: dpiPresetsCol.implicitHeight + 28
-                                radius: 12
-                                color: Qt.rgba(0.5, 0.5, 0.5, 0.06)
-                                border.width: 1
-                                border.color: theme.border
-
+                                // Horizontal scroll: left + right rows
                                 Column {
-                                    id: dpiPresetsCol
-                                    anchors {
-                                        left: parent.left; right: parent.right
-                                        top: parent.top; margins: 14
-                                    }
+                                    width: parent.width
                                     spacing: 14
+                                    visible: selectedButton === "hscroll_left"
 
                                     Text {
-                                        text: "DPI PRESETS"
+                                        text: s["mouse.scroll_left"]
                                         font { family: uiState.fontFamily; pixelSize: 11;
                                                capitalization: Font.AllUppercase; letterSpacing: 1 }
                                         color: theme.textDim
                                     }
 
-                                    // Slot pills row
-                                    Row {
-                                        spacing: 10
+                                    Flow {
+                                        width: parent.width; spacing: 8
                                         Repeater {
-                                            model: 4
-                                            Rectangle {
-                                                width: slotVal.implicitWidth + 24
-                                                height: 32; radius: 8
-                                                color: dpiPresetsCard.activeSlot === index
-                                                       ? Qt.rgba(0.5, 0.5, 0.5, 0.14)
-                                                       : "transparent"
-                                                border.width: dpiPresetsCard.activeSlot === index ? 2 : 1
-                                                border.color: dpiPresetsCard.slotColors[index]
-
-                                                Text {
-                                                    id: slotVal
-                                                    anchors.centerIn: parent
-                                                    text: {
-                                                        var presets = backend.dpiPresets
-                                                        return presets[index] !== undefined ? presets[index] : "---"
+                                            model: backend.allActions
+                                            delegate: ActionChip {
+                                                actionId: modelData.id
+                                                actionLabel: modelData.id === "__custom__" && isCustomAction(hscrollLeftActionId)
+                                                             ? customLabel(hscrollLeftActionId)
+                                                             : (lm.strings, lm.trAction(modelData.label))
+                                                isCurrent: modelData.id === "__custom__"
+                                                           ? isCustomAction(hscrollLeftActionId)
+                                                           : modelData.id === hscrollLeftActionId
+                                                onPicked: function(aid) {
+                                                    if (aid === "__custom__") {
+                                                        keyCaptureDialog.open(selectedProfile, "hscroll_left")
+                                                        return
                                                     }
-                                                    font { family: uiState.fontFamily; pixelSize: 13; bold: true }
-                                                    color: dpiPresetsCard.slotColors[index]
-                                                }
-
-                                                // Active indicator dot
-                                                Rectangle {
-                                                    width: 5; height: 5; radius: 3
-                                                    anchors { horizontalCenter: parent.horizontalCenter; bottom: parent.bottom; bottomMargin: 2 }
-                                                    color: dpiPresetsCard.slotColors[index]
-                                                    visible: {
-                                                        var presets = backend.dpiPresets
-                                                        return presets[index] !== undefined && presets[index] === backend.dpi
-                                                    }
-                                                }
-
-                                                MouseArea {
-                                                    anchors.fill: parent
-                                                    cursorShape: Qt.PointingHandCursor
-                                                    onClicked: {
-                                                        dpiPresetsCard.activeSlot = index
-                                                        var presets = backend.dpiPresets
-                                                        if (presets[index] !== undefined)
-                                                            dpiPresetSlider.value = presets[index]
-                                                    }
+                                                    backend.setProfileMapping(
+                                                        selectedProfile, "hscroll_left", aid)
                                                 }
                                             }
                                         }
                                     }
 
-                                    // Slider for active slot
-                                    Column {
+                                    Item { width: 1; height: 4 }
+
+                                    Text {
+                                        text: s["mouse.scroll_right"]
+                                        font { family: uiState.fontFamily; pixelSize: 11;
+                                               capitalization: Font.AllUppercase; letterSpacing: 1 }
+                                        color: theme.textDim
+                                    }
+
+                                    Flow {
+                                        width: parent.width; spacing: 8
+                                        Repeater {
+                                            model: backend.allActions
+                                            delegate: ActionChip {
+                                                actionId: modelData.id
+                                                actionLabel: modelData.id === "__custom__" && isCustomAction(hscrollRightActionId)
+                                                             ? customLabel(hscrollRightActionId)
+                                                             : (lm.strings, lm.trAction(modelData.label))
+                                                isCurrent: modelData.id === "__custom__"
+                                                           ? isCustomAction(hscrollRightActionId)
+                                                           : modelData.id === hscrollRightActionId
+                                                onPicked: function(aid) {
+                                                    if (aid === "__custom__") {
+                                                        keyCaptureDialog.open(selectedProfile, "hscroll_right")
+                                                        return
+                                                    }
+                                                    backend.setProfileMapping(
+                                                        selectedProfile, "hscroll_right", aid)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Column {
+                                    width: parent.width
+                                    spacing: 14
+                                    visible: selectedButton === "gesture"
+                                             && backend.supportsGestureDirections
+
+                                    Text {
+                                        text: s["mouse.tap_action"]
+                                        font { family: uiState.fontFamily; pixelSize: 11;
+                                               capitalization: Font.AllUppercase; letterSpacing: 1 }
+                                        color: theme.textDim
+                                    }
+
+                                    ComboBox {
                                         width: parent.width
-                                        spacing: 6
-
-                                        Row {
-                                            spacing: 8
-                                            Rectangle {
-                                                width: 10; height: 10; radius: 5
-                                                color: dpiPresetsCard.slotColors[dpiPresetsCard.activeSlot]
-                                                anchors.verticalCenter: parent.verticalCenter
+                                        model: backend.allActions
+                                        textRole: "label"
+                                        delegate: actionComboDelegate
+                                        Material.accent: theme.accent
+                                        font { family: uiState.fontFamily; pixelSize: 11 }
+                                        currentIndex: actionIndexForId(gestureTapActionId)
+                                        displayText: isCustomAction(gestureTapActionId)
+                                                     ? customLabel(gestureTapActionId)
+                                                     : (lm.strings, lm.trAction(currentText))
+                                        onActivated: function(index) {
+                                            var aid = backend.allActions[index].id
+                                            if (aid === "__custom__") {
+                                                keyCaptureDialog.open(selectedProfile, "gesture")
+                                                return
                                             }
-                                            Text {
-                                                text: "Slot " + (dpiPresetsCard.activeSlot + 1) + ": "
-                                                      + Math.round(dpiPresetSlider.value) + " DPI"
-                                                font { family: uiState.fontFamily; pixelSize: 12; bold: true }
-                                                color: dpiPresetsCard.slotColors[dpiPresetsCard.activeSlot]
+                                            backend.setProfileMapping(selectedProfile, "gesture", aid)
+                                            selectedActionId = aid
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        width: parent.width
+                                        height: 1
+                                        color: theme.border
+                                    }
+
+                                    Row {
+                                        width: parent.width
+                                        spacing: 12
+
+                                    Text {
+                                        text: s["mouse.threshold"]
+                                        font { family: uiState.fontFamily; pixelSize: 12; bold: true }
+                                        color: theme.textPrimary
+                                    }
+
+                                        Text {
+                                            text: (
+                                                gestureThresholdSlider.pressed
+                                                ? Math.round(gestureThresholdSlider.value / 5.0) * 5
+                                                : backend.gestureThreshold
+                                            ) + " px"
+                                            font { family: uiState.fontFamily; pixelSize: 12 }
+                                            color: theme.textSecondary
+                                        }
+                                    }
+
+                                    WheelSafeSlider {
+                                        id: gestureThresholdSlider
+                                        width: parent.width
+                                        from: 20
+                                        to: 400
+                                        stepSize: 5
+                                        value: backend.gestureThreshold
+                                        accentColor: theme.accent
+                                        accentDimColor: theme.accentDim
+                                        trackColor: theme.border
+                                        onMoved: gestureThresholdSave.restart()
+                                        onPressedChanged: {
+                                            if (!pressed) {
+                                                gestureThresholdSave.stop()
+                                                backend.setGestureThreshold(
+                                                    Math.round(value / 5.0) * 5)
                                             }
                                         }
+                                    }
 
-                                        WheelSafeSlider {
-                                            id: dpiPresetSlider
-                                            width: parent.width
-                                            from: backend.deviceDpiMin
-                                            to: backend.deviceDpiMax
-                                            stepSize: 50
-                                            value: {
-                                                var presets = backend.dpiPresets
-                                                var idx = dpiPresetsCard.activeSlot
-                                                return presets[idx] !== undefined ? presets[idx] : 1000
-                                            }
-                                            accentColor: dpiPresetsCard.slotColors[dpiPresetsCard.activeSlot]
-                                            accentDimColor: Qt.rgba(0.5, 0.5, 0.5, 0.12)
-                                            trackColor: theme.border
-                                            onMoved: {
-                                                backend.setDpiPreset(dpiPresetsCard.activeSlot, Math.round(value))
-                                            }
-                                        }
-
-                                        Row {
-                                            width: parent.width
-                                            Text {
-                                                text: backend.deviceDpiMin
-                                                font { family: uiState.fontFamily; pixelSize: 10 }
-                                                color: theme.textDim
-                                            }
-                                            Item { width: parent.width - minDpiLabel.implicitWidth - maxDpiLabel.implicitWidth; height: 1 }
-                                            Text {
-                                                id: maxDpiLabel
-                                                text: backend.deviceDpiMax
-                                                font { family: uiState.fontFamily; pixelSize: 10 }
-                                                color: theme.textDim
-                                            }
-                                            Text {
-                                                id: minDpiLabel
-                                                visible: false
-                                                text: backend.deviceDpiMin
-                                            }
-                                        }
+                                    Timer {
+                                        id: gestureThresholdSave
+                                        interval: 250
+                                        repeat: false
+                                        onTriggered: backend.setGestureThreshold(
+                                            Math.round(gestureThresholdSlider.value / 5.0) * 5)
                                     }
 
                                     Text {
+                                        text: s["mouse.swipe_actions"]
+                                        font { family: uiState.fontFamily; pixelSize: 11;
+                                               capitalization: Font.AllUppercase; letterSpacing: 1 }
+                                        color: theme.textDim
+                                    }
+
+                                    RowLayout {
                                         width: parent.width
-                                        wrapMode: Text.WordWrap
-                                        text: "Press the button to cycle: "
-                                              + (function() {
-                                                  var p = backend.dpiPresets
-                                                  var parts = []
-                                                  for (var i = 0; i < p.length; i++)
-                                                      parts.push(p[i])
-                                                  return parts.join(" \u2192 ")
-                                              })()
-                                        font { family: uiState.fontFamily; pixelSize: 11 }
-                                        color: theme.textSecondary
+                                        spacing: 12
+
+                                        Text {
+                                            text: s["mouse.swipe_left"]
+                                            Layout.preferredWidth: 100
+                                            font { family: uiState.fontFamily; pixelSize: 12 }
+                                            color: theme.textPrimary
+                                        }
+
+                                        ComboBox {
+                                            Layout.fillWidth: true
+                                            model: backend.allActions
+                                            textRole: "label"
+                                            delegate: actionComboDelegate
+                                            Material.accent: theme.accent
+                                            font { family: uiState.fontFamily; pixelSize: 11 }
+                                            currentIndex: actionIndexForId(gestureLeftActionId)
+                                            displayText: isCustomAction(gestureLeftActionId)
+                                                         ? customLabel(gestureLeftActionId)
+                                                         : (lm.strings, lm.trAction(currentText))
+                                            onActivated: function(index) {
+                                                var aid = backend.allActions[index].id
+                                                if (aid === "__custom__") {
+                                                    keyCaptureDialog.open(selectedProfile, "gesture_left")
+                                                    return
+                                                }
+                                                backend.setProfileMapping(
+                                                    selectedProfile, "gesture_left", aid)
+                                            }
+                                        }
+                                    }
+
+                                    RowLayout {
+                                        width: parent.width
+                                        spacing: 12
+
+                                        Text {
+                                            text: s["mouse.swipe_right"]
+                                            Layout.preferredWidth: 100
+                                            font { family: uiState.fontFamily; pixelSize: 12 }
+                                            color: theme.textPrimary
+                                        }
+
+                                        ComboBox {
+                                            Layout.fillWidth: true
+                                            model: backend.allActions
+                                            textRole: "label"
+                                            delegate: actionComboDelegate
+                                            Material.accent: theme.accent
+                                            font { family: uiState.fontFamily; pixelSize: 11 }
+                                            currentIndex: actionIndexForId(gestureRightActionId)
+                                            displayText: isCustomAction(gestureRightActionId)
+                                                         ? customLabel(gestureRightActionId)
+                                                         : (lm.strings, lm.trAction(currentText))
+                                            onActivated: function(index) {
+                                                var aid = backend.allActions[index].id
+                                                if (aid === "__custom__") {
+                                                    keyCaptureDialog.open(selectedProfile, "gesture_right")
+                                                    return
+                                                }
+                                                backend.setProfileMapping(
+                                                    selectedProfile, "gesture_right", aid)
+                                            }
+                                        }
+                                    }
+
+                                    RowLayout {
+                                        width: parent.width
+                                        spacing: 12
+
+                                        Text {
+                                            text: s["mouse.swipe_up"]
+                                            Layout.preferredWidth: 100
+                                            font { family: uiState.fontFamily; pixelSize: 12 }
+                                            color: theme.textPrimary
+                                        }
+
+                                        ComboBox {
+                                            Layout.fillWidth: true
+                                            model: backend.allActions
+                                            textRole: "label"
+                                            delegate: actionComboDelegate
+                                            Material.accent: theme.accent
+                                            font { family: uiState.fontFamily; pixelSize: 11 }
+                                            currentIndex: actionIndexForId(gestureUpActionId)
+                                            displayText: isCustomAction(gestureUpActionId)
+                                                         ? customLabel(gestureUpActionId)
+                                                         : (lm.strings, lm.trAction(currentText))
+                                            onActivated: function(index) {
+                                                var aid = backend.allActions[index].id
+                                                if (aid === "__custom__") {
+                                                    keyCaptureDialog.open(selectedProfile, "gesture_up")
+                                                    return
+                                                }
+                                                backend.setProfileMapping(
+                                                    selectedProfile, "gesture_up", aid)
+                                            }
+                                        }
+                                    }
+
+                                    RowLayout {
+                                        width: parent.width
+                                        spacing: 12
+
+                                        Text {
+                                            text: s["mouse.swipe_down"]
+                                            Layout.preferredWidth: 100
+                                            font { family: uiState.fontFamily; pixelSize: 12 }
+                                            color: theme.textPrimary
+                                        }
+
+                                        ComboBox {
+                                            Layout.fillWidth: true
+                                            model: backend.allActions
+                                            textRole: "label"
+                                            delegate: actionComboDelegate
+                                            Material.accent: theme.accent
+                                            font { family: uiState.fontFamily; pixelSize: 11 }
+                                            currentIndex: actionIndexForId(gestureDownActionId)
+                                            displayText: isCustomAction(gestureDownActionId)
+                                                         ? customLabel(gestureDownActionId)
+                                                         : (lm.strings, lm.trAction(currentText))
+                                            onActivated: function(index) {
+                                                var aid = backend.allActions[index].id
+                                                if (aid === "__custom__") {
+                                                    keyCaptureDialog.open(selectedProfile, "gesture_down")
+                                                    return
+                                                }
+                                                backend.setProfileMapping(
+                                                    selectedProfile, "gesture_down", aid)
+                                            }
+                                        }
                                     }
                                 }
-                            }
 
-                            Item { width: 1; height: 8 }
+                                // Single button: categorized chips
+                                Column {
+                                    width: parent.width
+                                    spacing: 14
+                                    visible: selectedButton !== ""
+                                             && selectedButton !== "hscroll_left"
+                                             && !(selectedButton === "gesture"
+                                                  && backend.supportsGestureDirections)
+
+                                    Repeater {
+                                        model: backend.actionCategories
+
+                                        delegate: Column {
+                                            width: parent.width
+                                            spacing: 8
+
+                                            Text {
+                                                text: { var _lang = lm.strings; return lm.trCategory(modelData.category) }
+                                                font { family: uiState.fontFamily; pixelSize: 11;
+                                                       capitalization: Font.AllUppercase;
+                                                       letterSpacing: 1 }
+                                                color: theme.textDim
+                                            }
+
+                                            Flow {
+                                                width: parent.width; spacing: 8
+                                                Repeater {
+                                                    model: modelData.actions
+                                                    delegate: ActionChip {
+                                                        actionId: modelData.id
+                                                        actionLabel: modelData.id === "__custom__" && isCustomAction(selectedActionId)
+                                                                     ? customLabel(selectedActionId)
+                                                                     : (lm.strings, lm.trAction(modelData.label))
+                                                        isCurrent: modelData.id === "__custom__"
+                                                                   ? isCustomAction(selectedActionId)
+                                                                   : modelData.id === selectedActionId
+                                                        onPicked: function(aid) {
+                                                            if (aid === "__custom__") {
+                                                                keyCaptureDialog.open(selectedProfile, selectedButton)
+                                                                return
+                                                            }
+                                                            backend.setProfileMapping(
+                                                                selectedProfile,
+                                                                selectedButton, aid)
+                                                            selectedActionId = aid
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // ── DPI Presets editor (when cycle_dpi is selected)
+                                Rectangle {
+                                    id: dpiPresetsCard
+                                    property int activeSlot: 0
+                                    readonly property var slotColors: ["#e8d44d", "#5da5e8", "#e8943a", "#e05daa"]
+                                    visible: selectedActionId === "cycle_dpi" && !backend.deviceReadOnly
+                                    width: parent.width
+                                    height: dpiPresetsCol.implicitHeight + 28
+                                    radius: 12
+                                    color: Qt.rgba(0.5, 0.5, 0.5, 0.06)
+                                    border.width: 1
+                                    border.color: theme.border
+
+                                    Column {
+                                        id: dpiPresetsCol
+                                        anchors {
+                                            left: parent.left; right: parent.right
+                                            top: parent.top; margins: 14
+                                        }
+                                        spacing: 14
+
+                                        Text {
+                                            text: "DPI PRESETS"
+                                            font { family: uiState.fontFamily; pixelSize: 11;
+                                                   capitalization: Font.AllUppercase; letterSpacing: 1 }
+                                            color: theme.textDim
+                                        }
+
+                                        // Slot pills row
+                                        Row {
+                                            spacing: 10
+                                            Repeater {
+                                                model: 4
+                                                Rectangle {
+                                                    width: slotVal.implicitWidth + 24
+                                                    height: 32; radius: 8
+                                                    color: dpiPresetsCard.activeSlot === index
+                                                           ? Qt.rgba(0.5, 0.5, 0.5, 0.14)
+                                                           : "transparent"
+                                                    border.width: dpiPresetsCard.activeSlot === index ? 2 : 1
+                                                    border.color: dpiPresetsCard.slotColors[index]
+
+                                                    Text {
+                                                        id: slotVal
+                                                        anchors.centerIn: parent
+                                                        text: {
+                                                            var presets = backend.dpiPresets
+                                                            return presets[index] !== undefined ? presets[index] : "---"
+                                                        }
+                                                        font { family: uiState.fontFamily; pixelSize: 13; bold: true }
+                                                        color: dpiPresetsCard.slotColors[index]
+                                                    }
+
+                                                    // Active indicator dot
+                                                    Rectangle {
+                                                        width: 5; height: 5; radius: 3
+                                                        anchors { horizontalCenter: parent.horizontalCenter; bottom: parent.bottom; bottomMargin: 2 }
+                                                        color: dpiPresetsCard.slotColors[index]
+                                                        visible: {
+                                                            var presets = backend.dpiPresets
+                                                            return presets[index] !== undefined && presets[index] === backend.dpi
+                                                        }
+                                                    }
+
+                                                    MouseArea {
+                                                        anchors.fill: parent
+                                                        cursorShape: Qt.PointingHandCursor
+                                                        onClicked: {
+                                                            dpiPresetsCard.activeSlot = index
+                                                            var presets = backend.dpiPresets
+                                                            if (presets[index] !== undefined)
+                                                                dpiPresetSlider.value = presets[index]
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        // Slider for active slot
+                                        Column {
+                                            width: parent.width
+                                            spacing: 6
+
+                                            Row {
+                                                spacing: 8
+                                                Rectangle {
+                                                    width: 10; height: 10; radius: 5
+                                                    color: dpiPresetsCard.slotColors[dpiPresetsCard.activeSlot]
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                }
+                                                Text {
+                                                    text: "Slot " + (dpiPresetsCard.activeSlot + 1) + ": "
+                                                          + Math.round(dpiPresetSlider.value) + " DPI"
+                                                    font { family: uiState.fontFamily; pixelSize: 12; bold: true }
+                                                    color: dpiPresetsCard.slotColors[dpiPresetsCard.activeSlot]
+                                                }
+                                            }
+
+                                            WheelSafeSlider {
+                                                id: dpiPresetSlider
+                                                width: parent.width
+                                                from: backend.deviceDpiMin
+                                                to: backend.deviceDpiMax
+                                                stepSize: 50
+                                                value: {
+                                                    var presets = backend.dpiPresets
+                                                    var idx = dpiPresetsCard.activeSlot
+                                                    return presets[idx] !== undefined ? presets[idx] : 1000
+                                                }
+                                                accentColor: dpiPresetsCard.slotColors[dpiPresetsCard.activeSlot]
+                                                accentDimColor: Qt.rgba(0.5, 0.5, 0.5, 0.12)
+                                                trackColor: theme.border
+                                                onMoved: {
+                                                    backend.setDpiPreset(dpiPresetsCard.activeSlot, Math.round(value))
+                                                }
+                                            }
+
+                                            Row {
+                                                width: parent.width
+                                                Text {
+                                                    text: backend.deviceDpiMin
+                                                    font { family: uiState.fontFamily; pixelSize: 10 }
+                                                    color: theme.textDim
+                                                }
+                                                Item { width: parent.width - minDpiLabel.implicitWidth - maxDpiLabel.implicitWidth; height: 1 }
+                                                Text {
+                                                    id: maxDpiLabel
+                                                    text: backend.deviceDpiMax
+                                                    font { family: uiState.fontFamily; pixelSize: 10 }
+                                                    color: theme.textDim
+                                                }
+                                                Text {
+                                                    id: minDpiLabel
+                                                    visible: false
+                                                    text: backend.deviceDpiMin
+                                                }
+                                            }
+                                        }
+
+                                        Text {
+                                            width: parent.width
+                                            wrapMode: Text.WordWrap
+                                            text: "Press the button to cycle: "
+                                                  + (function() {
+                                                      var p = backend.dpiPresets
+                                                      var parts = []
+                                                      for (var i = 0; i < p.length; i++)
+                                                          parts.push(p[i])
+                                                      return parts.join(" \u2192 ")
+                                                  })()
+                                            font { family: uiState.fontFamily; pixelSize: 11 }
+                                            color: theme.textSecondary
+                                        }
+                                    }
+                                }
+
+                                Item { width: 1; height: 8 }
+                            }
                         }
                     }
 
@@ -1863,280 +1886,290 @@ Item {
                         }
                     }
 
-                    Rectangle {
+                    // Debug card exists only while debug mode is on; its
+                    // log/gesture views are not kept warm behind visible:false.
+                    Loader {
+                        id: debugCardLoader
+                        objectName: "debugCardLoader"
                         width: parent.width - 56
+                        height: item ? item.height : 0
                         anchors.horizontalCenter: parent.horizontalCenter
-                        height: debugCol.implicitHeight + 24
-                        radius: 14
-                        color: theme.bgCard
-                        border.width: 1
-                        border.color: theme.border
-                        visible: backend.debugMode
+                        active: backend.debugMode
+                        visible: active
+                        sourceComponent: Rectangle {
+                            width: parent.width
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            height: debugCol.implicitHeight + 24
+                            radius: 14
+                            color: theme.bgCard
+                            border.width: 1
+                            border.color: theme.border
 
-                        Column {
-                            id: debugCol
-                            anchors.fill: parent
-                            anchors.margins: 16
-                            spacing: 12
-
-                            RowLayout {
-                                width: parent.width
+                            Column {
+                                id: debugCol
+                                anchors.fill: parent
+                                anchors.margins: 16
                                 spacing: 12
 
-                                Column {
-                                    Layout.fillWidth: true
-                                    spacing: 3
+                                RowLayout {
+                                    width: parent.width
+                                    spacing: 12
 
-                                    Text {
-                                        text: s["mouse.debug_events"]
-                                        font { family: uiState.fontFamily; pixelSize: 14; bold: true }
-                                        color: theme.textPrimary
+                                    Column {
+                                        Layout.fillWidth: true
+                                        spacing: 3
+
+                                        Text {
+                                            text: s["mouse.debug_events"]
+                                            font { family: uiState.fontFamily; pixelSize: 14; bold: true }
+                                            color: theme.textPrimary
+                                        }
+
+                                        Text {
+                                            text: s["mouse.debug_events_desc"]
+                                            font { family: uiState.fontFamily; pixelSize: 11 }
+                                            color: theme.textSecondary
+                                        }
                                     }
 
-                                    Text {
-                                        text: s["mouse.debug_events_desc"]
-                                        font { family: uiState.fontFamily; pixelSize: 11 }
-                                        color: theme.textSecondary
-                                    }
-                                }
-
-                                Switch {
-                                    checked: backend.debugEventsEnabled
-                                    text: checked ? s["mouse.on"] : s["mouse.off"]
-                                    Material.accent: theme.accent
-                                    onToggled: backend.setDebugEventsEnabled(checked)
-                                }
-
-                                Switch {
-                                    checked: backend.recordMode
-                                    text: checked ? s["mouse.rec"] : s["mouse.record"]
-                                    Material.accent: "#e46f4e"
-                                    onToggled: backend.setRecordMode(checked)
-                                }
-
-                                Rectangle {
-                                    Layout.preferredWidth: clearText.implicitWidth + 20
-                                    Layout.preferredHeight: 28
-                                    radius: 8
-                                    color: clearMa.containsMouse
-                                           ? Qt.rgba(1, 1, 1, 0.08)
-                                           : Qt.rgba(1, 1, 1, 0.04)
-
-                                    Text {
-                                        id: clearText
-                                        anchors.centerIn: parent
-                                        text: s["mouse.clear"]
-                                        font { family: uiState.fontFamily; pixelSize: 11; bold: true }
-                                        color: theme.textPrimary
+                                    Switch {
+                                        checked: backend.debugEventsEnabled
+                                        text: checked ? s["mouse.on"] : s["mouse.off"]
+                                        Material.accent: theme.accent
+                                        onToggled: backend.setDebugEventsEnabled(checked)
                                     }
 
-                                    MouseArea {
-                                        id: clearMa
-                                        anchors.fill: parent
-                                        hoverEnabled: true
-                                        cursorShape: Qt.PointingHandCursor
-                                        onClicked: backend.clearDebugLog()
-                                    }
-                                }
-
-                                Rectangle {
-                                    Layout.preferredWidth: clearRecText.implicitWidth + 20
-                                    Layout.preferredHeight: 28
-                                    radius: 8
-                                    color: clearRecMa.containsMouse
-                                           ? Qt.rgba(1, 1, 1, 0.08)
-                                           : Qt.rgba(1, 1, 1, 0.04)
-
-                                    Text {
-                                        id: clearRecText
-                                        anchors.centerIn: parent
-                                        text: s["mouse.clear_rec"]
-                                        font { family: uiState.fontFamily; pixelSize: 11; bold: true }
-                                        color: theme.textPrimary
+                                    Switch {
+                                        checked: backend.recordMode
+                                        text: checked ? s["mouse.rec"] : s["mouse.record"]
+                                        Material.accent: "#e46f4e"
+                                        onToggled: backend.setRecordMode(checked)
                                     }
 
-                                    MouseArea {
-                                        id: clearRecMa
-                                        anchors.fill: parent
-                                        hoverEnabled: true
-                                        cursorShape: Qt.PointingHandCursor
-                                        onClicked: backend.clearGestureRecords()
+                                    Rectangle {
+                                        Layout.preferredWidth: clearText.implicitWidth + 20
+                                        Layout.preferredHeight: 28
+                                        radius: 8
+                                        color: clearMa.containsMouse
+                                               ? Qt.rgba(1, 1, 1, 0.08)
+                                               : Qt.rgba(1, 1, 1, 0.04)
+
+                                        Text {
+                                            id: clearText
+                                            anchors.centerIn: parent
+                                            text: s["mouse.clear"]
+                                            font { family: uiState.fontFamily; pixelSize: 11; bold: true }
+                                            color: theme.textPrimary
+                                        }
+
+                                        MouseArea {
+                                            id: clearMa
+                                            anchors.fill: parent
+                                            hoverEnabled: true
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: backend.clearDebugLog()
+                                        }
                                     }
-                                }
 
-                                Rectangle {
-                                    Layout.preferredWidth: copyDevInfoText.implicitWidth + 20
-                                    Layout.preferredHeight: 28
-                                    radius: 8
-                                    color: copyDevInfoMa.containsMouse
-                                           ? Qt.rgba(1, 1, 1, 0.08)
-                                           : Qt.rgba(1, 1, 1, 0.04)
+                                    Rectangle {
+                                        Layout.preferredWidth: clearRecText.implicitWidth + 20
+                                        Layout.preferredHeight: 28
+                                        radius: 8
+                                        color: clearRecMa.containsMouse
+                                               ? Qt.rgba(1, 1, 1, 0.08)
+                                               : Qt.rgba(1, 1, 1, 0.04)
 
-                                    Text {
-                                        id: copyDevInfoText
-                                        anchors.centerIn: parent
-                                        text: "Copy device info"
-                                        font { family: uiState.fontFamily; pixelSize: 11; bold: true }
-                                        color: theme.textPrimary
+                                        Text {
+                                            id: clearRecText
+                                            anchors.centerIn: parent
+                                            text: s["mouse.clear_rec"]
+                                            font { family: uiState.fontFamily; pixelSize: 11; bold: true }
+                                            color: theme.textPrimary
+                                        }
+
+                                        MouseArea {
+                                            id: clearRecMa
+                                            anchors.fill: parent
+                                            hoverEnabled: true
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: backend.clearGestureRecords()
+                                        }
                                     }
 
-                                    MouseArea {
-                                        id: copyDevInfoMa
-                                        anchors.fill: parent
-                                        hoverEnabled: true
-                                        cursorShape: Qt.PointingHandCursor
-                                        onClicked: {
-                                            var info = backend.dumpDeviceInfo()
-                                            if (info) {
-                                                backend.copyToClipboard(info)
-                                                backend.statusMessage("Device info copied to clipboard")
-                                            } else {
-                                                backend.statusMessage("No device connected")
+                                    Rectangle {
+                                        Layout.preferredWidth: copyDevInfoText.implicitWidth + 20
+                                        Layout.preferredHeight: 28
+                                        radius: 8
+                                        color: copyDevInfoMa.containsMouse
+                                               ? Qt.rgba(1, 1, 1, 0.08)
+                                               : Qt.rgba(1, 1, 1, 0.04)
+
+                                        Text {
+                                            id: copyDevInfoText
+                                            anchors.centerIn: parent
+                                            text: "Copy device info"
+                                            font { family: uiState.fontFamily; pixelSize: 11; bold: true }
+                                            color: theme.textPrimary
+                                        }
+
+                                        MouseArea {
+                                            id: copyDevInfoMa
+                                            anchors.fill: parent
+                                            hoverEnabled: true
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: {
+                                                var info = backend.dumpDeviceInfo()
+                                                if (info) {
+                                                    backend.copyToClipboard(info)
+                                                    backend.statusMessage("Device info copied to clipboard")
+                                                } else {
+                                                    backend.statusMessage("No device connected")
+                                                }
                                             }
                                         }
                                     }
                                 }
-                            }
 
-                            Rectangle {
-                                width: parent.width
-                                radius: 10
-                                color: Qt.rgba(1, 1, 1, 0.03)
-                                border.width: 1
-                                border.color: theme.border
-                                height: monitorCol.implicitHeight + 20
+                                Rectangle {
+                                    width: parent.width
+                                    radius: 10
+                                    color: Qt.rgba(1, 1, 1, 0.03)
+                                    border.width: 1
+                                    border.color: theme.border
+                                    height: monitorCol.implicitHeight + 20
 
-                                Column {
-                                    id: monitorCol
-                                    anchors.fill: parent
-                                    anchors.margins: 10
-                                    spacing: 8
-
-                                    Text {
-                                        text: s["mouse.live_gesture_monitor"]
-                                        font { family: uiState.fontFamily; pixelSize: 11; bold: true }
-                                        color: theme.textPrimary
-                                    }
-
-                                    Row {
+                                    Column {
+                                        id: monitorCol
+                                        anchors.fill: parent
+                                        anchors.margins: 10
                                         spacing: 8
 
-                                        Rectangle {
-                                            width: activeText.implicitWidth + 16
-                                            height: 24
-                                            radius: 12
-                                            color: backend.gestureActive
-                                                   ? Qt.rgba(0.89, 0.45, 0.25, 0.18)
-                                                   : Qt.rgba(1, 1, 1, 0.05)
+                                        Text {
+                                            text: s["mouse.live_gesture_monitor"]
+                                            font { family: uiState.fontFamily; pixelSize: 11; bold: true }
+                                            color: theme.textPrimary
+                                        }
 
-                                            Text {
-                                                id: activeText
-                                                anchors.centerIn: parent
-                                                text: backend.gestureActive ? s["mouse.held"] : s["mouse.idle"]
-                                                font { family: uiState.fontFamily; pixelSize: 11; bold: true }
-                                                color: backend.gestureActive ? "#f39c6b" : theme.textSecondary
+                                        Row {
+                                            spacing: 8
+
+                                            Rectangle {
+                                                width: activeText.implicitWidth + 16
+                                                height: 24
+                                                radius: 12
+                                                color: backend.gestureActive
+                                                       ? Qt.rgba(0.89, 0.45, 0.25, 0.18)
+                                                       : Qt.rgba(1, 1, 1, 0.05)
+
+                                                Text {
+                                                    id: activeText
+                                                    anchors.centerIn: parent
+                                                    text: backend.gestureActive ? s["mouse.held"] : s["mouse.idle"]
+                                                    font { family: uiState.fontFamily; pixelSize: 11; bold: true }
+                                                    color: backend.gestureActive ? "#f39c6b" : theme.textSecondary
+                                                }
+                                            }
+
+                                            Rectangle {
+                                                width: moveText.implicitWidth + 16
+                                                height: 24
+                                                radius: 12
+                                                color: backend.gestureMoveSeen
+                                                       ? Qt.rgba(0, 0.83, 0.67, 0.12)
+                                                       : Qt.rgba(1, 1, 1, 0.05)
+
+                                                Text {
+                                                    id: moveText
+                                                    anchors.centerIn: parent
+                                                    text: backend.gestureMoveSeen ? s["mouse.move_seen"] : s["mouse.no_move"]
+                                                    font { family: uiState.fontFamily; pixelSize: 11; bold: true }
+                                                    color: backend.gestureMoveSeen ? theme.accent : theme.textSecondary
+                                                }
                                             }
                                         }
 
-                                        Rectangle {
-                                            width: moveText.implicitWidth + 16
-                                            height: 24
-                                            radius: 12
-                                            color: backend.gestureMoveSeen
-                                                   ? Qt.rgba(0, 0.83, 0.67, 0.12)
-                                                   : Qt.rgba(1, 1, 1, 0.05)
+                                        Text {
+                                            text: "Source: "
+                                                  + (backend.gestureMoveSource ? backend.gestureMoveSource : "n/a")
+                                                  + " | dx: " + backend.gestureMoveDx
+                                                  + " | dy: " + backend.gestureMoveDy
+                                            font { family: "Menlo"; pixelSize: 11 }
+                                            color: theme.textSecondary
+                                        }
 
-                                            Text {
-                                                id: moveText
-                                                anchors.centerIn: parent
-                                                text: backend.gestureMoveSeen ? s["mouse.move_seen"] : s["mouse.no_move"]
-                                                font { family: uiState.fontFamily; pixelSize: 11; bold: true }
-                                                color: backend.gestureMoveSeen ? theme.accent : theme.textSecondary
+                                        Text {
+                                            text: backend.gestureStatus
+                                            font { family: uiState.fontFamily; pixelSize: 11 }
+                                            color: theme.textPrimary
+                                            wrapMode: Text.Wrap
+                                        }
+                                    }
+                                }
+
+                                Rectangle {
+                                    width: parent.width
+                                    height: 160
+                                    radius: 10
+                                    color: Qt.rgba(0, 0, 0, 0.18)
+                                    border.width: 1
+                                    border.color: theme.border
+
+                                    ScrollView {
+                                        anchors.fill: parent
+                                        anchors.margins: 1
+                                        clip: true
+
+                                        TextArea {
+                                            id: debugLogArea
+                                            text: backend.debugLog.length
+                                                  ? backend.debugLog
+                                                  : s["mouse.debug_placeholder"]
+                                            readOnly: true
+                                            wrapMode: TextEdit.NoWrap
+                                            selectByMouse: true
+                                            color: backend.debugLog.length
+                                                   ? theme.textPrimary
+                                                   : theme.textSecondary
+                                            font.pixelSize: 11
+                                            font.family: "Menlo"
+                                            background: null
+                                            padding: 10
+
+                                            onTextChanged: {
+                                                cursorPosition = length
                                             }
                                         }
                                     }
-
-                                    Text {
-                                        text: "Source: "
-                                              + (backend.gestureMoveSource ? backend.gestureMoveSource : "n/a")
-                                              + " | dx: " + backend.gestureMoveDx
-                                              + " | dy: " + backend.gestureMoveDy
-                                        font { family: "Menlo"; pixelSize: 11 }
-                                        color: theme.textSecondary
-                                    }
-
-                                    Text {
-                                        text: backend.gestureStatus
-                                        font { family: uiState.fontFamily; pixelSize: 11 }
-                                        color: theme.textPrimary
-                                        wrapMode: Text.Wrap
-                                    }
                                 }
-                            }
 
-                            Rectangle {
-                                width: parent.width
-                                height: 160
-                                radius: 10
-                                color: Qt.rgba(0, 0, 0, 0.18)
-                                border.width: 1
-                                border.color: theme.border
+                                Rectangle {
+                                    width: parent.width
+                                    height: 180
+                                    radius: 10
+                                    color: Qt.rgba(0, 0, 0, 0.18)
+                                    border.width: 1
+                                    border.color: theme.border
 
-                                ScrollView {
-                                    anchors.fill: parent
-                                    anchors.margins: 1
-                                    clip: true
+                                    ScrollView {
+                                        anchors.fill: parent
+                                        anchors.margins: 1
+                                        clip: true
 
-                                    TextArea {
-                                        id: debugLogArea
-                                        text: backend.debugLog.length
-                                              ? backend.debugLog
-                                              : s["mouse.debug_placeholder"]
-                                        readOnly: true
-                                        wrapMode: TextEdit.NoWrap
-                                        selectByMouse: true
-                                        color: backend.debugLog.length
-                                               ? theme.textPrimary
-                                               : theme.textSecondary
-                                        font.pixelSize: 11
-                                        font.family: "Menlo"
-                                        background: null
-                                        padding: 10
-
-                                        onTextChanged: {
-                                            cursorPosition = length
+                                        TextArea {
+                                            text: backend.gestureRecords.length
+                                                  ? backend.gestureRecords
+                                                  : s["mouse.gesture_placeholder"]
+                                            readOnly: true
+                                            wrapMode: TextEdit.Wrap
+                                            selectByMouse: true
+                                            color: backend.gestureRecords.length
+                                                   ? theme.textPrimary
+                                                   : theme.textSecondary
+                                            font.pixelSize: 11
+                                            font.family: "Menlo"
+                                            background: null
+                                            padding: 10
                                         }
-                                    }
-                                }
-                            }
-
-                            Rectangle {
-                                width: parent.width
-                                height: 180
-                                radius: 10
-                                color: Qt.rgba(0, 0, 0, 0.18)
-                                border.width: 1
-                                border.color: theme.border
-
-                                ScrollView {
-                                    anchors.fill: parent
-                                    anchors.margins: 1
-                                    clip: true
-
-                                    TextArea {
-                                        text: backend.gestureRecords.length
-                                              ? backend.gestureRecords
-                                              : s["mouse.gesture_placeholder"]
-                                        readOnly: true
-                                        wrapMode: TextEdit.Wrap
-                                        selectByMouse: true
-                                        color: backend.gestureRecords.length
-                                               ? theme.textPrimary
-                                               : theme.textSecondary
-                                        font.pixelSize: 11
-                                        font.family: "Menlo"
-                                        background: null
-                                        padding: 10
                                     }
                                 }
                             }
