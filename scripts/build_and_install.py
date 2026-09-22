@@ -365,6 +365,109 @@ def resolve_macos_sign_identity() -> str:
     return identity
 
 
+# --- macOS bundle signature walk ---------------------------------------------
+# Every Mach-O in the BUILT bundle (dist/Mouser.app, never the installed copy)
+# must carry a real signature from the fleet team, none may be ad-hoc, and
+# the first-party binaries (Contents/MacOS/*) must run under the hardened
+# runtime (build_macos_app.sh signs with --options runtime and the
+# entitlements in build_resources/Mouser.entitlements, which grant PyInstaller
+# the allow-unsigned-executable-memory / allow-jit it needs). The same walk
+# lives in deskflow's scripts/install-macos.sh and tools/fleet-health.
+DEFAULT_EXPECT_TEAM = "J5KPG8ZR5C"
+_CD_FLAGS = re.compile(r"^CodeDirectory .*flags=0x[0-9a-fA-F]+\(([^)]*)\)", re.M)
+
+
+def expected_team_id() -> str:
+    return os.environ.get("MOUSER_EXPECT_TEAM", "").strip() or DEFAULT_EXPECT_TEAM
+
+
+def bundle_machos(app: Path) -> list[Path]:
+    """Contents/MacOS/* plus the dylibs/executables under Contents/Frameworks
+    (Resources/Headers skipped), sorted; same enumeration as fleet-health."""
+    found: list[Path] = []
+    macos = app / "Contents" / "MacOS"
+    if macos.is_dir():
+        found += [p for p in macos.rglob("*") if p.is_file()]
+    frameworks = app / "Contents" / "Frameworks"
+    if frameworks.is_dir():
+        for p in frameworks.rglob("*"):
+            if not p.is_file():
+                continue
+            parts = p.relative_to(frameworks).parts
+            if "Resources" in parts or "Headers" in parts:
+                continue
+            if p.suffix == ".dylib" or os.access(p, os.X_OK):
+                found.append(p)
+    return sorted(set(found))
+
+
+def codesign_info(path: Path) -> str:
+    """``codesign -dvvv`` text (it prints to stderr); raises on failure."""
+    proc = subprocess.run(
+        ["codesign", "-dvvv", str(path)], capture_output=True, text=True, check=False
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"codesign -dvvv failed for {path}: {(proc.stderr or proc.stdout).strip()}")
+    return proc.stderr + proc.stdout
+
+
+def is_first_party(app: Path, path: Path) -> bool:
+    try:
+        return path.relative_to(app).parts[:2] == ("Contents", "MacOS")
+    except ValueError:
+        return False
+
+
+def verify_macos_bundle_signatures(app: Path, *, expect_team: str | None = None) -> dict[str, int]:
+    """Fail unless every Mach-O is non-adhoc, team-signed and (first-party) hardened.
+
+    Returns the summary counts and prints ``sign: total=N apple=N adhoc=N hardened=N``.
+    """
+    team = expect_team or expected_team_id()
+    machos = bundle_machos(app)
+    counts = {"total": 0, "apple": 0, "adhoc": 0, "hardened": 0}
+    problems: list[str] = []
+    for bin_path in machos:
+        counts["total"] += 1
+        rel = bin_path.relative_to(app)
+        try:
+            info = codesign_info(bin_path)
+        except RuntimeError as exc:
+            problems.append(str(exc))
+            continue
+        if re.search(r"^Signature=adhoc", info, re.M):
+            counts["adhoc"] += 1
+            problems.append(f"{rel}: Signature=adhoc (ad-hoc signed)")
+            continue
+        if not re.search(r"^Authority=", info, re.M):
+            problems.append(f"{rel}: no Authority= (unsigned or ad-hoc)")
+            continue
+        m = re.search(r"^TeamIdentifier=(.*)$", info, re.M)
+        actual = m.group(1).strip() if m else ""
+        if not re.fullmatch(r"[A-Z0-9]+", actual):
+            problems.append(f"{rel}: no TeamIdentifier= (not a Developer certificate)")
+            continue
+        if actual != team:
+            problems.append(f"{rel}: TeamIdentifier={actual} != expected {team} (MOUSER_EXPECT_TEAM)")
+            continue
+        counts["apple"] += 1
+        flags = _CD_FLAGS.search(info)
+        hardened = bool(flags and "runtime" in flags.group(1).split(","))
+        if hardened:
+            counts["hardened"] += 1
+        elif is_first_party(app, bin_path):
+            problems.append(f"{rel}: not signed with the hardened runtime (CodeDirectory flags lack 'runtime')")
+    print("sign: total={total} apple={apple} adhoc={adhoc} hardened={hardened}".format(**counts))
+    if counts["total"] == 0:
+        fail(f"No Mach-O found under {app}/Contents/MacOS -- not a built bundle")
+    if problems:
+        fail(
+            f"{len(problems)} Mach-O(s) in {app} failed the signature gate:\n  " + "\n  ".join(problems)
+        )
+    print(f"Signature gate OK: team {team}, {counts['hardened']} hardened")
+    return counts
+
+
 def app_version() -> str:
     from core.version import APP_VERSION
 
@@ -414,6 +517,15 @@ def build_and_install_macos(*, dry_run: bool = False) -> None:
 
     if not build_output.is_dir():
         fail(f"Build output not found: {build_output}")
+
+    # Gate the BUILT bundle before the running app is stopped: an ad-hoc,
+    # foreign-team or unhardened Mach-O anywhere in dist/ never reaches
+    # /Applications (its signature would reset the TCC grants on install).
+    if shutil.which("codesign"):
+        run_command(["codesign", "--verify", "--deep", "--strict", "--verbose=2", build_output])
+        verify_macos_bundle_signatures(build_output)
+    else:
+        fail("codesign not available; refusing to install an unverified bundle")
 
     print(f"Installing to {install_path}")
     # Use ditto rather than shutil.copytree: copytree does not preserve the

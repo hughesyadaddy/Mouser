@@ -1,8 +1,10 @@
+import io
 import os
 import stat
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -241,7 +243,8 @@ class BuildAndInstallTests(unittest.TestCase):
         with mock.patch.object(installer, "stop_running_instances") as stop, \
                 mock.patch.object(installer, "resolve_python", return_value=(Path("/py"), "test")), \
                 mock.patch.object(installer, "verify_python_provenance"):
-            with mock.patch.object(installer, "resolve_macos_sign_identity", return_value="SIGN"):
+            with mock.patch.object(installer, "resolve_macos_sign_identity", return_value="SIGN"), \
+                    mock.patch.object(installer, "verify_macos_bundle_signatures"):
                 with mock.patch.object(installer, "run_command"):
                     with mock.patch.object(installer, "restart_enabled", return_value=False):
                         with tempfile.TemporaryDirectory() as tmp:
@@ -341,6 +344,171 @@ class BuildAndInstallTests(unittest.TestCase):
             self.assertTrue((install_root / "Mouser.exe").is_file())
             self.assertTrue((install_root / "_internal").is_dir())
             self.assertTrue((install_root / windows_install.UNINSTALL_SCRIPT_NAME).is_file())
+
+
+SIGNED_INFO = """Executable={path}
+Identifier=io.github.hughesyadaddy.mouser
+Format=Mach-O thin (arm64)
+CodeDirectory v=20500 size=1234 flags=0x10000(runtime) hashes=30+7 location=embedded
+Signature size=4795
+Authority=Apple Development: Alex Hughes (J5KPG8ZR5C)
+Authority=Apple Worldwide Developer Relations Certification Authority
+Authority=Apple Root CA
+TeamIdentifier=J5KPG8ZR5C
+"""
+
+UNHARDENED_INFO = SIGNED_INFO.replace("flags=0x10000(runtime)", "flags=0x0(none)")
+
+ADHOC_INFO = """Executable={path}
+Identifier=Mouser
+CodeDirectory v=20400 size=1234 flags=0x2(adhoc) hashes=30+7 location=embedded
+Signature=adhoc
+TeamIdentifier=not set
+"""
+
+OTHER_TEAM_INFO = SIGNED_INFO.replace("TeamIdentifier=J5KPG8ZR5C", "TeamIdentifier=ZZZZ999999")
+
+
+def make_fake_bundle(root: Path) -> Path:
+    """dist/Mouser.app with the PyInstaller layout: MacOS binary, framework
+    binary, dylib, .so extension (executable) plus Resources/Headers noise."""
+    app = root / "dist" / installer.MACOS_APP_NAME
+    (app / "Contents" / "MacOS").mkdir(parents=True)
+    exe = app / "Contents" / "MacOS" / "Mouser"
+    exe.write_bytes(b"\xcf\xfa\xed\xfe")
+    exe.chmod(0o755)
+    fw = app / "Contents" / "Frameworks"
+    (fw / "QtCore.framework" / "Versions" / "A" / "Resources").mkdir(parents=True)
+    (fw / "QtCore.framework" / "Versions" / "A" / "Headers").mkdir(parents=True)
+    qt = fw / "QtCore.framework" / "Versions" / "A" / "QtCore"
+    qt.write_bytes(b"\xcf\xfa\xed\xfe")
+    qt.chmod(0o755)
+    (fw / "QtCore.framework" / "Versions" / "A" / "Resources" / "Info.plist").write_text("plist")
+    (fw / "QtCore.framework" / "Versions" / "A" / "Headers" / "q.h").write_text("h")
+    (fw / "libcrypto.3.dylib").write_bytes(b"\xcf\xfa\xed\xfe")
+    so = fw / "_ssl.cpython-313-darwin.so"
+    so.write_bytes(b"\xcf\xfa\xed\xfe")
+    so.chmod(0o755)
+    (app / "Contents" / "Resources").mkdir()
+    (app / "Contents" / "Resources" / "icon.icns").write_text("icon")
+    return app
+
+
+class BundleSignatureWalkTests(unittest.TestCase):
+    """verify_macos_bundle_signatures walks EVERY Mach-O of the built bundle."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.app = make_fake_bundle(self.root)
+        self.enterContext(mock.patch.dict(os.environ, {}, clear=False))
+        os.environ.pop("MOUSER_EXPECT_TEAM", None)
+
+    def _walk(self, info_for):
+        with mock.patch.object(installer, "codesign_info", side_effect=lambda p: info_for(p).format(path=p)), \
+                redirect_stdout(io.StringIO()) as out:
+            counts = installer.verify_macos_bundle_signatures(self.app)
+        return counts, out.getvalue().splitlines()
+
+    def _walk_fails(self, info_for):
+        with self.assertRaises(SystemExit) as ctx, redirect_stderr(io.StringIO()) as err:
+            self._walk(info_for)
+        self.assertNotEqual(ctx.exception.code, 0)
+        return err.getvalue()
+
+    def test_enumerates_macos_frameworks_dylibs_and_so_but_not_resources(self):
+        rel = sorted(str(p.relative_to(self.app)) for p in installer.bundle_machos(self.app))
+        self.assertEqual(
+            rel,
+            [
+                "Contents/Frameworks/QtCore.framework/Versions/A/QtCore",
+                "Contents/Frameworks/_ssl.cpython-313-darwin.so",
+                "Contents/Frameworks/libcrypto.3.dylib",
+                "Contents/MacOS/Mouser",
+            ],
+        )
+
+    def test_all_signed_hardened_passes_with_summary(self):
+        counts, msgs = self._walk(lambda p: SIGNED_INFO)
+        self.assertEqual(counts, {"total": 4, "apple": 4, "adhoc": 0, "hardened": 4})
+        self.assertIn("sign: total=4 apple=4 adhoc=0 hardened=4", msgs)
+
+    def test_adhoc_macho_anywhere_fails(self):
+        err = self._walk_fails(lambda p: ADHOC_INFO if p.name == "libcrypto.3.dylib" else SIGNED_INFO)
+        self.assertIn("Contents/Frameworks/libcrypto.3.dylib: Signature=adhoc", err)
+
+    def test_unhardened_first_party_binary_fails(self):
+        err = self._walk_fails(lambda p: UNHARDENED_INFO if p.name == "Mouser" else SIGNED_INFO)
+        self.assertIn("Contents/MacOS/Mouser: not signed with the hardened runtime", err)
+
+    def test_unhardened_framework_is_accepted(self):
+        counts, _ = self._walk(lambda p: UNHARDENED_INFO if p.name == "QtCore" else SIGNED_INFO)
+        self.assertEqual(counts["hardened"], 3)
+        self.assertEqual(counts["apple"], 4)
+
+    def test_other_team_fails_and_env_overrides_expected_team(self):
+        err = self._walk_fails(lambda p: OTHER_TEAM_INFO if p.name == "QtCore" else SIGNED_INFO)
+        self.assertIn("TeamIdentifier=ZZZZ999999 != expected J5KPG8ZR5C", err)
+        os.environ["MOUSER_EXPECT_TEAM"] = "ZZZZ999999"
+        err = self._walk_fails(lambda p: OTHER_TEAM_INFO if p.name == "QtCore" else SIGNED_INFO)
+        self.assertIn("Contents/MacOS/Mouser: TeamIdentifier=J5KPG8ZR5C != expected ZZZZ999999", err)
+
+    def test_codesign_failure_on_one_binary_fails(self):
+        def info(p):
+            if p.name == "Mouser":
+                raise RuntimeError("codesign -dvvv failed for x: code object is not signed at all")
+            return SIGNED_INFO
+
+        err = self._walk_fails(info)
+        self.assertIn("code object is not signed at all", err)
+
+    def test_empty_bundle_fails(self):
+        shutil_rm = __import__("shutil").rmtree
+        shutil_rm(self.app / "Contents" / "MacOS")
+        shutil_rm(self.app / "Contents" / "Frameworks")
+        err = self._walk_fails(lambda p: SIGNED_INFO)
+        self.assertIn("No Mach-O found", err)
+
+    def test_build_and_install_gates_dist_before_stopping_or_installing(self):
+        """The walk runs on dist/ after the build and before ctl stop / ditto."""
+        calls = []
+        install_dir = self.root / "Applications"
+        install_dir.mkdir()
+
+        def fake_run(args, **kwargs):
+            calls.append(" ".join(str(a) for a in args))
+
+        with mock.patch.object(installer, "resolve_macos_sign_identity", return_value="A" * 40), \
+                mock.patch.object(installer, "resolve_python", return_value=(Path("/py"), "test")), \
+                mock.patch.object(installer, "verify_python_provenance"), \
+                mock.patch.object(installer, "run_command", side_effect=fake_run), \
+                mock.patch.object(installer, "stop_running_instances", side_effect=lambda: calls.append("stop")), \
+                mock.patch.object(installer, "sync_login_startup_after_install"), \
+                mock.patch.object(installer, "restart_enabled", return_value=False), \
+                mock.patch.object(installer, "ROOT", self.root), \
+                mock.patch.object(installer.shutil, "which", return_value="/usr/bin/codesign"), \
+                mock.patch.object(installer, "codesign_info", side_effect=lambda p: ADHOC_INFO.format(path=p)), \
+                mock.patch.dict(os.environ, {"MOUSER_INSTALL_DIR": str(install_dir)}), \
+                mock.patch("builtins.print"), redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                installer.build_and_install_macos()
+        self.assertTrue(any("build_macos_app.sh" in c for c in calls))
+        self.assertTrue(any(c.startswith("codesign --verify --deep --strict") and "dist" in c for c in calls))
+        self.assertNotIn("stop", calls)
+        self.assertFalse(any(c.startswith("ditto") for c in calls))
+        self.assertFalse((install_dir / installer.MACOS_APP_NAME).exists())
+
+    def test_build_script_signs_with_hardened_runtime_and_pyinstaller_entitlements(self):
+        script = (ROOT / "build_macos_app.sh").read_text(encoding="utf-8")
+        sign_call = script[script.index("sign_with_identity()"):]
+        self.assertIn("--options runtime", sign_call)
+        self.assertIn('--entitlements "$ENTITLEMENTS"', sign_call)
+        nested = script[script.index("sign_nested_code()"):script.index("verify_bundle()")]
+        self.assertIn("--options runtime", nested)
+        ent = (ROOT / "build_resources" / "Mouser.entitlements").read_text(encoding="utf-8")
+        self.assertIn("com.apple.security.cs.allow-unsigned-executable-memory", ent)
+        self.assertIn("com.apple.security.cs.allow-jit", ent)
 
 
 class WindowsInstallTests(unittest.TestCase):
