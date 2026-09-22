@@ -237,6 +237,16 @@ PRESENT_BACKOFF_MAX_S = 30.0
 #: openable, so keep polling promptly.
 PRESENT_BACKOFF_UNCACHED_MAX_S = 5.0
 
+# Candidate enumeration (hidapi enumerate + IOHIDManagerCopyDevices) is
+# memoised for this long. Nothing can change the candidate set faster
+# than a device-arrival/removal callback, and both invalidate the memo,
+# so back-to-back connect attempts inside the window reuse the last scan.
+VENDOR_INFOS_MEMO_S = 1.0
+
+# CFRunLoopRunInMode result meaning "no sources or timers in this mode":
+# the call returns immediately instead of waiting out its timeout.
+_K_CF_RUN_LOOP_RUN_FINISHED = 1
+
 # Slow safety-net poll while nothing is enumerated at all, on platforms
 # where a device-arrival notification (IOKit matching callback on
 # macOS, WM_DEVICECHANGE on Windows) wakes the loop early. Platforms
@@ -1108,10 +1118,19 @@ if _MAC_NATIVE_OK:
             if not self._manager:
                 time.sleep(seconds)
                 return
+            started = time.monotonic()
             with _AutoreleasePool():
-                _cf.CFRunLoopRunInMode(
+                rc = _cf.CFRunLoopRunInMode(
                     _K_CF_RUN_LOOP_DEFAULT_MODE, float(seconds), True
                 )
+            if rc == _K_CF_RUN_LOOP_RUN_FINISHED:
+                # No sources are scheduled in this mode (manager not yet
+                # scheduled, or unscheduled on close): CFRunLoopRunInMode
+                # returns immediately instead of waiting, which would turn
+                # every caller's wait loop into a busy-spin. Sleep the rest.
+                remaining = float(seconds) - (time.monotonic() - started)
+                if remaining > 0:
+                    time.sleep(remaining)
 
         def _copy_device_refs(self):
             """Return the current matched IOHIDDeviceRefs (borrowed; valid
@@ -1557,6 +1576,17 @@ class HidGestureListener:
         self._deskflow_control_lock = threading.Lock()
         self._deskflow_attach_ready = None
         self._pending_decode_update = None
+        # Attach generation: bumped by every request_deskflow_attach /
+        # clear_deskflow_attach that changes the pending request. The main
+        # loop records the generation it last acted on; _wait_reconnect only
+        # ends early when a *newer* request exists. (It used to return
+        # instantly whenever an attach was pending at all, so a read-only
+        # session that died with the request still queued reconnected in a
+        # tight loop -- thousands of cycles per second.)
+        self._attach_gen = 0
+        self._attach_gen_seen = 0
+        # (timestamp, infos) memo for _vendor_hid_infos; see VENDOR_INFOS_MEMO_S.
+        self._vendor_infos_memo = None
         # Reconnect-storm protection: when a session dies from consecutive
         # HID++ request timeouts (device asleep / power-cycled), back off
         # exponentially instead of hammering open/probe/timeout loops that
@@ -1628,6 +1658,7 @@ class HidGestureListener:
                 return True
             self._deskflow_attach = request
             self._deskflow_attach_ready = ready
+            self._attach_gen += 1
         if self._connected:
             self._reconnect_requested = True
         return ready.wait(timeout=5.0)
@@ -1647,6 +1678,7 @@ class HidGestureListener:
             self._deskflow_attach = None
             self._deskflow_attach_ready = None
             self._pending_decode_update = None
+            self._attach_gen += 1
         self._deskflow_readonly = False
         self._deskflow_paused = False
         from core.hid_deskflow_backend import flush_deskflow_sink
@@ -1820,6 +1852,7 @@ class HidGestureListener:
         self._last_arrival_clear = now
         self._reprog_negative_cache.clear()
         self._last_failed_scan = None
+        self._vendor_infos_memo = None
         self._device_arrival.set()
 
     def _on_iokit_device_arrival(self):
@@ -1834,6 +1867,7 @@ class HidGestureListener:
         periodic re-announce would otherwise defeat).
         """
         self._last_failed_scan = None
+        self._vendor_infos_memo = None
         self._device_arrival.set()
         now = time.time()
         if now - self._last_arrival_clear < ARRIVAL_CLEAR_MIN_INTERVAL_S:
@@ -1846,6 +1880,7 @@ class HidGestureListener:
         enumeration-skip is no longer valid. Does not clear the negative
         cache (a removal brings nothing new to probe)."""
         self._last_failed_scan = None
+        self._vendor_infos_memo = None
 
     def _mac_manager(self):
         """Lazily create the long-lived IOKit manager (listener thread)."""
@@ -3344,15 +3379,18 @@ class HidGestureListener:
         opens the in-process sink (Tier 1.5 hidapi shim). While a Deskflow
         attach is pending, skip USB probing so KVM ingress connects promptly.
         """
-        attach = self._deskflow_attach
+        with self._deskflow_control_lock:
+            attach = self._deskflow_attach
+            self._attach_gen_seen = self._attach_gen
         if attach is not None:
             if self._try_connect_deskflow(attach):
                 return True
             # A rejected attach (bad decode, closed sink) is permanent for
-            # this request; leaving it pending makes _wait_reconnect return
-            # instantly and the outer loop spins. Deskflow re-announces.
+            # this request; leaving it pending would make _wait_reconnect
+            # treat it as new forever. Deskflow re-announces. Compare by
+            # content: a re-announced identical request is a fresh dict.
             with self._deskflow_control_lock:
-                if self._deskflow_attach is attach:
+                if self._deskflow_attach == attach:
                     self._deskflow_attach = None
                     self._deskflow_attach_ready = None
         if self._should_skip_enumeration():
@@ -3361,12 +3399,30 @@ class HidGestureListener:
             # removal callback has fired since.
             self._last_scan_had_candidates = True
             return False
-        infos = self._vendor_hid_infos(self._mac_manager())
+        infos = self._enumerate_candidates()
         if infos:
             if self._try_connect_usb(infos):
                 return True
             self._note_failed_scan(infos)
         return False
+
+    def _enumerate_candidates(self):
+        """``_vendor_hid_infos`` memoised for ``VENDOR_INFOS_MEMO_S``.
+
+        A device-arrival or removal callback invalidates the memo (and
+        a pending arrival event bypasses it), so a cached scan can only be
+        served while the candidate set provably has not changed."""
+        now = time.time()
+        memo = self._vendor_infos_memo
+        if (
+            memo is not None
+            and not self._device_arrival.is_set()
+            and 0.0 <= now - memo[0] < VENDOR_INFOS_MEMO_S
+        ):
+            return list(memo[1])
+        infos = self._vendor_hid_infos(self._mac_manager()) or []
+        self._vendor_infos_memo = (now, list(infos))
+        return infos
 
     def _should_skip_enumeration(self):
         """Inside the negative-cache TTL after a scan where every candidate
@@ -3835,19 +3891,37 @@ class HidGestureListener:
                   f"reconnect backoff {self._reconnect_backoff_s:.0f} s")
         return max(2.0, self._reconnect_backoff_s)
 
+    def _readonly_retry_delay(self, session_healthy):
+        """Delay before re-opening the Deskflow sink after a read-only
+        session ended. Uses the present-but-not-connectable ladder
+        (1 s -> 30 s): the sink is always "present", and a session that
+        died without ever delivering a report (closed/idle sink) must not
+        be rebuilt in a tight loop. A healthy session resets the ladder.
+        """
+        if session_healthy:
+            self._present_backoff_s = 0.0
+            return PRESENT_BACKOFF_MIN_S
+        self._present_backoff_s = min(
+            PRESENT_BACKOFF_MAX_S,
+            max(PRESENT_BACKOFF_MIN_S, self._present_backoff_s * 2),
+        )
+        return self._present_backoff_s
+
     def _wait_reconnect(self, delay_s):
         """Interruptible wait before the next connect attempt.
 
-        Ends early when the listener stops, a Deskflow attach arrives, or
-        a device-arrival event fires. The event is only consumed (cleared)
-        here -- never pre-cleared -- so an arrival that fired during
-        session teardown still cuts the wait short instead of being lost.
-        Consuming an arrival also resets the backoff.
+        Ends early when the listener stops, a *new* Deskflow attach request
+        (or clear) arrives -- one with a generation the main loop has not
+        acted on yet -- or a device-arrival event fires. The event is only
+        consumed (cleared) here -- never pre-cleared -- so an arrival that
+        fired during session teardown still cuts the wait short instead of
+        being lost. Consuming an arrival also resets the backoff.
         """
         deadline = time.time() + delay_s
         manager = self._iokit_manager
+        gen_seen = self._attach_gen_seen
         while self._running and time.time() < deadline:
-            if self._deskflow_attach is not None:
+            if self._attach_gen != gen_seen:
                 return
             if self._device_arrival.is_set():
                 self._device_arrival.clear()
@@ -3930,7 +4004,11 @@ class HidGestureListener:
                 self._log_retry(present, delay)
                 self._wait_reconnect(delay)
                 continue
-            self._present_backoff_s = 0.0
+            if not self._deskflow_readonly:
+                # The read-only ladder resets on a healthy session instead
+                # (opening the sink always succeeds, so a connect proves
+                # nothing).
+                self._present_backoff_s = 0.0
             self._enumeration_skips = 0
             self._last_retry_log_delay = None
             self._last_logged_scan_digest = None
@@ -4015,9 +4093,14 @@ class HidGestureListener:
             _timed_out_disconnect = (
                 self._consecutive_request_timeouts >= _CONSECUTIVE_TIMEOUT_RECONNECT
             )
-            _session_healthy = (
-                _session_got_data
-                or time.time() - _session_started >= HEALTHY_SESSION_S
+            # Consecutive HID++ timeouts are unhealthy regardless of session
+            # age: a sleeping mouse answers nothing for ~45 s before the
+            # third timeout, so the age test alone called the session
+            # healthy, reset the backoff to 2 s and re-ran the full
+            # candidate re-probe every ~47 s for as long as it slept.
+            _session_healthy = _session_got_data or (
+                not _timed_out_disconnect
+                and time.time() - _session_started >= HEALTHY_SESSION_S
             )
 
             # Cleanup before potential reconnect
@@ -4088,6 +4171,9 @@ class HidGestureListener:
                         pass
 
             if self._running:
-                delay = self._update_reconnect_backoff(
-                    _session_healthy, _timed_out_disconnect)
+                if _was_readonly:
+                    delay = self._readonly_retry_delay(_session_healthy)
+                else:
+                    delay = self._update_reconnect_backoff(
+                        _session_healthy, _timed_out_disconnect)
                 self._wait_reconnect(delay)
