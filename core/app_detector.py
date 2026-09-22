@@ -186,6 +186,14 @@ elif sys.platform == "darwin":
     from core import macos_frontmost as _frontmost
 
     def _autoreleased(fn):
+        """Run ``fn`` inside an NSAutoreleasePool.
+
+        The detector thread is a plain Python thread with no pool of its
+        own; the AX / libproc / plist reads behind _deliver and _idle_check
+        produce autoreleased temporaries that would otherwise accumulate
+        for the process lifetime (defense in depth: the frontmost helpers
+        pool internally today, but a future PyObjC call here must not
+        depend on that)."""
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             with _objc.autorelease_pool():
@@ -354,6 +362,10 @@ if sys.platform != "darwin":
     _pid_cached = None
     _evict_pid = None
 
+    def _autoreleased(fn):
+        """No-op off macOS (see the darwin branch)."""
+        return fn
+
 #: Queue wait per loop turn in _run_observer; the idle watchdog fires after
 #: FALLBACK_POLL_INTERVAL of these without an event. Patched down in tests.
 IDLE_TICK_S = 1.0
@@ -438,6 +450,7 @@ class AppDetector:
         if pid == self._last_pid:
             self._last_pid = None
 
+    @_autoreleased
     def _deliver(self, item):
         """Funnel for every source (activation pid, idle AX pid, poll exe).
 
@@ -466,6 +479,7 @@ class AppDetector:
         except Exception:
             pass
 
+    @_autoreleased
     def _idle_check(self):
         """Watchdog tick: AX pid compare only; resolves nothing unless the
         pid actually changed (the observer missed a switch)."""
