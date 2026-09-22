@@ -225,9 +225,9 @@ class SelfWatchdog:
         self._last_empty_reads = 0
         self._last_tap_reenables = 0
         # Python-tap pass-through guard no-ops (mouse_hook_macos.MouseHook
-        # .passthrough_leaked_total): each one is a CGEvent leaked for good.
-        self._last_passthrough_leaked = 0
-        self._passthrough_leaked_delta = 0
+        # .passthrough_guard_skipped_total): each one is a CGEvent leaked for good.
+        self._last_passthrough_skipped = 0
+        self._passthrough_skipped_delta = 0
         self._hot_ticks = 0
         self._late_ticks = 0
         self._tap_reenable_window = deque(maxlen=int(3600 / tick_s) or 1)
@@ -269,10 +269,10 @@ class SelfWatchdog:
         tap_per_hour = sum(self._tap_reenable_window)
 
         leaked = getattr(
-            self._mouse_hook(), "passthrough_leaked_total", self._last_passthrough_leaked
+            self._mouse_hook(), "passthrough_guard_skipped_total", self._last_passthrough_skipped
         )
-        self._passthrough_leaked_delta = leaked - self._last_passthrough_leaked
-        self._last_passthrough_leaked = leaked
+        self._passthrough_skipped_delta = leaked - self._last_passthrough_skipped
+        self._last_passthrough_skipped = leaked
 
         if cpu_ratio > CPU_TRIP_RATIO and empty_delta >= SPIN_EMPTY_READS_PER_TICK:
             self._hot_ticks += 1
@@ -307,12 +307,12 @@ class SelfWatchdog:
         # the PyObjC trampoline path; see mouse_hook_macos.MouseHook.tap_kind).
         tap_kind = getattr(self._mouse_hook(), "tap_kind", None) or "unknown"
         context = ""
-        if self._passthrough_leaked_delta > 0:
+        if self._passthrough_skipped_delta > 0:
             # Not a trip reason of its own, but if the guard is leaving
             # proxies behind while something trips, say so on the line.
             context = (
-                f" passthrough_leaked=+{self._passthrough_leaked_delta}"
-                f"/{self._last_passthrough_leaked}"
+                f" passthrough_guard_skipped=+{self._passthrough_skipped_delta}"
+                f"/{self._last_passthrough_skipped}"
             )
         self._log(
             "[Watchdog] trip "
@@ -376,14 +376,14 @@ class SelfWatchdog:
         return reasons
 
     def _passthrough_counters(self) -> str:
-        """`` passthrough_leaked=N passthrough_released=M`` when the hook
+        """`` passthrough_guard_skipped=N passthrough_released=M`` when the hook
         exposes the Python-tap guard counters (macOS), else empty."""
         hook = self._mouse_hook()
-        leaked = getattr(hook, "passthrough_leaked_total", None)
+        leaked = getattr(hook, "passthrough_guard_skipped_total", None)
         released = getattr(hook, "passthrough_released_total", None)
         if leaked is None and released is None:
             return ""
-        return f" passthrough_leaked={leaked or 0} passthrough_released={released or 0}"
+        return f" passthrough_guard_skipped={leaked or 0} passthrough_released={released or 0}"
 
     def _exit_for_respawn(self, reasons, now: float | None = None) -> None:
         if not self._exit_enabled():

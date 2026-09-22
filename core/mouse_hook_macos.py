@@ -281,7 +281,7 @@ class MouseHook(BaseMouseHook):
         #: shape) -- each of those is one CGEvent leaked for good. Both
         #: are exposed by status() for the self-check watchdog.
         self.passthrough_released_total = 0
-        self.passthrough_leaked_total = 0
+        self.passthrough_guard_skipped_total = 0
         self._passthrough_leak_logged = False
         #: Native-tap ring drops observed by the drain thread (lifetime).
         self.native_drop_total = 0
@@ -549,15 +549,15 @@ class MouseHook(BaseMouseHook):
             else:
                 # Not the trampoline-only shape: leave it alone (a leak,
                 # never a use-after-free) but count it, and say so once.
-                self.passthrough_leaked_total += 1
+                self.passthrough_guard_skipped_total += 1
                 if not self._passthrough_leak_logged:
                     self._passthrough_leak_logged = True
                     _log.warning(
-                        "[MouseHook] pass-through guard no-op: CGEvent proxy "
-                        f"refcount={refcount} (expected "
-                        f"{_LEAKED_PASSTHROUGH_REFCOUNT}); the reference was "
-                        "left leaked. Further no-ops are counted in "
-                        "passthrough_leaked_total without logging."
+                        f"[MouseHook] pass-through guard skipped (refcount="
+                        f"{refcount}, expected {_LEAKED_PASSTHROUGH_REFCOUNT}); "
+                        "the CGEvent proxy was left leaked. Further skips are "
+                        "counted in passthrough_guard_skipped_total without "
+                        "logging."
                     )
         self._prev_passthrough = None
         return released
@@ -568,7 +568,7 @@ class MouseHook(BaseMouseHook):
         return {
             "tap_kind": self.tap_kind,
             "passthrough_released_total": self.passthrough_released_total,
-            "passthrough_leaked_total": self.passthrough_leaked_total,
+            "passthrough_guard_skipped_total": self.passthrough_guard_skipped_total,
             "tap_reenable_total": self.tap_reenable_total,
             "native_drop_total": self.native_drop_total,
         }
@@ -999,9 +999,10 @@ class MouseHook(BaseMouseHook):
                     f"{'enabled' if self._tap_wanted else 'idle'}",
                     flush=True,
                 )
-            # Read the listener at fire time: it is replaced on every
-            # attach_hid_gesture, and a closure over the one that existed at
-            # start() would reconnect a stopped listener instead.
+            # Read the listener at fire time: _start_hid_listener replaces
+            # it on every hook (re)start, and a closure over the one that
+            # existed when the observers were registered would reconnect a
+            # stopped listener instead.
             hg = self._hid_gesture
             if hg and reconnect:
                 hg.force_reconnect()

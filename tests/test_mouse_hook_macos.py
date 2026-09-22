@@ -161,11 +161,11 @@ class PassthroughGuardCountersTests(_MacOSHookCase):
                 hook._prev_passthrough = proxy
                 self.assertFalse(hook._drop_prev_passthrough())
         decref.assert_not_called()
-        self.assertEqual(hook.passthrough_leaked_total, 3)
+        self.assertEqual(hook.passthrough_guard_skipped_total, 3)
         self.assertEqual(hook.passthrough_released_total, 0)
         self.assertEqual(len(logs.records), 1)
-        self.assertIn("refcount=", logs.records[0].getMessage())
-        self.assertIn("passthrough_leaked_total", logs.records[0].getMessage())
+        self.assertIn("guard skipped (refcount=", logs.records[0].getMessage())
+        self.assertIn("passthrough_guard_skipped_total", logs.records[0].getMessage())
 
     def test_release_counts(self):
         hook = self._hook()
@@ -179,17 +179,17 @@ class PassthroughGuardCountersTests(_MacOSHookCase):
             self.assertTrue(hook._drop_prev_passthrough())
         decref.assert_called_once()
         self.assertEqual(hook.passthrough_released_total, 1)
-        self.assertEqual(hook.passthrough_leaked_total, 0)
+        self.assertEqual(hook.passthrough_guard_skipped_total, 0)
 
     def test_status_exposes_counters_next_to_tap_kind(self):
         hook = self._hook()
         hook.tap_kind = "python"
-        hook.passthrough_leaked_total = 2
+        hook.passthrough_guard_skipped_total = 2
         hook.passthrough_released_total = 5
         hook.native_drop_total = 1
         status = hook.status()
         self.assertEqual(status["tap_kind"], "python")
-        self.assertEqual(status["passthrough_leaked_total"], 2)
+        self.assertEqual(status["passthrough_guard_skipped_total"], 2)
         self.assertEqual(status["passthrough_released_total"], 5)
         self.assertEqual(status["native_drop_total"], 1)
         self.assertIn("tap_reenable_total", status)
