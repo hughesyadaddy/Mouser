@@ -21,7 +21,9 @@ build/
 # Per-machine / per-user dev-environment pins. These commonly carry
 # signing identities, API keys, install dirs, or runtime versions that
 # are local to a single developer's setup.
-.python-version
+# .python-version is committed: it pins the interpreter minor that
+# scripts/build_and_install.py verify_python_provenance enforces.
+!.python-version
 .tool-versions
 .envrc
 .env

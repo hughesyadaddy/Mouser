@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -161,25 +162,119 @@ def require_pyinstaller(python: Path, source: str) -> None:
     )
 
 
-def log_python_provenance(python: Path, source: str) -> None:
-    version = subprocess.check_output(
-        [str(python), "-c", "import platform; print(platform.python_version())"],
+#: Packages whose installed version must match requirements.lock exactly.
+#: pyobjc-core carries the CGEventTap trampoline whose leak the hook's
+#: deferred-release guard is calibrated against (refcount == 3); PySide6 is
+#: the other large native ABI the packaged app depends on.
+PROVENANCE_PACKAGES_ALL = ("PySide6",)
+PROVENANCE_PACKAGES_DARWIN = ("pyobjc-core",)
+
+_PROVENANCE_PROBE = """\
+import json, platform, sys
+from importlib import metadata
+info = {
+    "python_version": platform.python_version(),
+    "minor": list(sys.version_info[:2]),
+    "machine": platform.machine() or "unknown",
+    "packages": {},
+}
+try:
+    import PyInstaller
+    info["pyinstaller"] = PyInstaller.__version__
+except Exception as exc:
+    info["pyinstaller"] = f"unavailable ({exc})"
+for name in sys.argv[1:]:
+    try:
+        info["packages"][name] = metadata.version(name)
+    except metadata.PackageNotFoundError:
+        info["packages"][name] = None
+print(json.dumps(info))
+"""
+
+
+def required_python_minor(root: Path | None = None) -> tuple[int, int]:
+    """``(major, minor)`` from ``.python-version`` (e.g. ``3.13``)."""
+    text = ((root or ROOT) / ".python-version").read_text(encoding="utf-8").strip()
+    match = re.match(r"^(\d+)\.(\d+)", text)
+    if not match:
+        fail(f".python-version is malformed: {text!r}")
+    return int(match.group(1)), int(match.group(2))
+
+
+def locked_versions(root: Path | None = None) -> dict[str, str]:
+    """``{normalized_name: version}`` from ``requirements.lock``."""
+    versions: dict[str, str] = {}
+    for raw in ((root or ROOT) / "requirements.lock").read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, sep, version = line.partition("==")
+        if sep:
+            versions[_normalize_package_name(name)] = version.strip()
+    return versions
+
+
+def _normalize_package_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name.strip()).lower()
+
+
+def provenance_skip_allowed() -> bool:
+    """``MOUSER_SKIP_PROVENANCE=1`` is honoured only off macOS (CI/Linux)."""
+    return os.environ.get("MOUSER_SKIP_PROVENANCE") == "1" and sys.platform != "darwin"
+
+
+def verify_python_provenance(python: Path, source: str) -> None:
+    """Log the interpreter and refuse to build from the wrong one.
+
+    Fails (nonzero exit) when the interpreter's minor version differs from
+    ``.python-version`` or when an installed pyobjc-core (macOS) / PySide6
+    version differs from ``requirements.lock``. A seat whose .venv drifted
+    (hackintosh was 3.12) must be rebuilt, not packaged.
+    """
+    if os.environ.get("MOUSER_SKIP_PROVENANCE") == "1" and sys.platform == "darwin":
+        print("MOUSER_SKIP_PROVENANCE is ignored on macOS; verifying anyway")
+    if provenance_skip_allowed():
+        print(f"Using Python: {python} (source: {source}); provenance check skipped "
+              "(MOUSER_SKIP_PROVENANCE=1)")
+        return
+    packages = list(PROVENANCE_PACKAGES_ALL)
+    if sys.platform == "darwin":
+        packages += list(PROVENANCE_PACKAGES_DARWIN)
+    raw = subprocess.check_output(
+        [str(python), "-c", _PROVENANCE_PROBE, *packages],
         cwd=ROOT,
         text=True,
     ).strip()
-    machine = subprocess.check_output(
-        [str(python), "-c", "import platform; print(platform.machine() or 'unknown')"],
-        cwd=ROOT,
-        text=True,
-    ).strip()
-    pyinstaller_version = subprocess.check_output(
-        [str(python), "-c", "import PyInstaller; print(PyInstaller.__version__)"],
-        cwd=ROOT,
-        text=True,
-    ).strip()
+    info = json.loads(raw.splitlines()[-1])
     print(f"Using Python: {python} (source: {source})")
-    print(f"Python version: {version} ({machine})")
-    print(f"PyInstaller version: {pyinstaller_version}")
+    print(f"Python version: {info['python_version']} ({info['machine']})")
+    print(f"PyInstaller version: {info['pyinstaller']}")
+    for name in packages:
+        print(f"{name} version: {info['packages'].get(name)}")
+
+    problems: list[str] = []
+    required = required_python_minor()
+    if tuple(info["minor"]) != required:
+        problems.append(
+            f"Python {info['python_version']} but .python-version requires "
+            f"{required[0]}.{required[1]}.x"
+        )
+    locked = locked_versions()
+    for name in packages:
+        want = locked.get(_normalize_package_name(name))
+        have = info["packages"].get(name)
+        if want is None:
+            problems.append(f"{name} is not pinned in requirements.lock")
+        elif have != want:
+            problems.append(f"{name} {have or 'not installed'} but requirements.lock pins {want}")
+    if problems:
+        fail(
+            "Python provenance mismatch for "
+            f"{python} (source: {source}):\n  - "
+            + "\n  - ".join(problems)
+            + "\nRebuild the environment with the pinned interpreter and "
+            f"`{python} -m pip install -r {ROOT / 'requirements.lock'}`."
+        )
 
 
 def resolve_install_dir(default: Path | None = None) -> Path:
@@ -302,6 +397,12 @@ def build_and_install_macos(*, dry_run: bool = False) -> None:
         print_macos_plan(sign_identity, install_path)
         return
 
+    # Same resolution order as build_macos_app.sh (MOUSER_PYTHON, VIRTUAL_ENV,
+    # repo .venv, PATH), so the interpreter verified here is the one that
+    # packages the app.
+    python, source = resolve_python()
+    verify_python_provenance(python, source)
+
     env = os.environ.copy()
     env["MOUSER_SIGN_IDENTITY"] = sign_identity
 
@@ -378,7 +479,7 @@ def build_and_install_windows(*, dry_run: bool = False) -> None:
     run_command([python, "-m", "pip", "install", "-r", ROOT / "requirements.txt"])
 
     require_pyinstaller(python, source)
-    log_python_provenance(python, source)
+    verify_python_provenance(python, source)
 
     print("[*] Verifying hidapi import...")
     probe = subprocess.run(

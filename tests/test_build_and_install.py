@@ -18,6 +18,138 @@ def normalize_path(path: Path) -> str:
     return os.path.normpath(str(path)).replace("\\", "/")
 
 
+def _probe_output(*, minor=(3, 13), version="3.13.2", pyobjc="12.1", pyside="6.11.0"):
+    import json
+
+    return json.dumps(
+        {
+            "python_version": version,
+            "minor": list(minor),
+            "machine": "arm64",
+            "pyinstaller": "6.20.0",
+            "packages": {"PySide6": pyside, "pyobjc-core": pyobjc},
+        }
+    )
+
+
+class PythonProvenanceTests(unittest.TestCase):
+    """verify_python_provenance refuses a drifted interpreter or ABI."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        (self.root / ".python-version").write_text("3.13\n", encoding="utf-8")
+        (self.root / "requirements.lock").write_text(
+            "# frozen\npyobjc-core==12.1\nPySide6==6.11.0\nshiboken6==6.11.0\n",
+            encoding="utf-8",
+        )
+        self.enterContext(mock.patch.object(installer, "ROOT", self.root))
+        self.enterContext(mock.patch.dict(os.environ, {}, clear=False))
+        os.environ.pop("MOUSER_SKIP_PROVENANCE", None)
+        self.python = Path("/venv/bin/python")
+
+    def _verify(self, output, *, platform="darwin"):
+        with mock.patch.object(installer.sys, "platform", platform), mock.patch(
+            "scripts.build_and_install.subprocess.check_output", return_value=output
+        ) as probe, mock.patch("builtins.print") as fake_print:
+            installer.verify_python_provenance(self.python, "test")
+        return probe, [c.args[0] for c in fake_print.call_args_list if c.args]
+
+    def test_lock_and_python_version_are_parsed(self):
+        self.assertEqual(installer.required_python_minor(), (3, 13))
+        self.assertEqual(
+            installer.locked_versions(),
+            {"pyobjc-core": "12.1", "pyside6": "6.11.0", "shiboken6": "6.11.0"},
+        )
+
+    def test_matching_environment_passes_and_logs(self):
+        probe, msgs = self._verify(_probe_output())
+        self.assertIn(str(self.python), probe.call_args.args[0][0])
+        self.assertIn("PySide6", probe.call_args.args[0])
+        self.assertIn("pyobjc-core", probe.call_args.args[0])
+        self.assertTrue(any("Python version: 3.13.2" in m for m in msgs))
+        self.assertTrue(any("pyobjc-core version: 12.1" in m for m in msgs))
+
+    def test_wrong_python_minor_fails(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self._verify(_probe_output(minor=(3, 12), version="3.12.8"))
+        self.assertNotEqual(ctx.exception.code, 0)
+
+    def test_wrong_pyobjc_core_fails_on_macos(self):
+        with self.assertRaises(SystemExit):
+            self._verify(_probe_output(pyobjc="11.1"))
+
+    def test_missing_pyobjc_core_fails_on_macos(self):
+        with self.assertRaises(SystemExit):
+            self._verify(_probe_output(pyobjc=None))
+
+    def test_wrong_pyside_fails_everywhere(self):
+        with self.assertRaises(SystemExit):
+            self._verify(_probe_output(pyside="6.12.0"), platform="win32")
+
+    def test_pyobjc_is_not_probed_off_macos(self):
+        probe, _ = self._verify(_probe_output(pyobjc=None), platform="win32")
+        self.assertNotIn("pyobjc-core", probe.call_args.args[0])
+
+    def test_failure_message_names_every_problem_and_the_lock(self):
+        failures = []
+
+        def fake_fail(message, *, code=1):
+            failures.append(message)
+            raise SystemExit(code)
+
+        with mock.patch.object(installer, "fail", side_effect=fake_fail), \
+                self.assertRaises(SystemExit):
+            self._verify(_probe_output(minor=(3, 12), version="3.12.8", pyside="6.9.0"))
+        text = "\n".join(failures)
+        self.assertIn("3.12.8", text)
+        self.assertIn("PySide6 6.9.0", text)
+        self.assertIn("requirements.lock", text)
+
+    def test_skip_override_only_applies_off_macos(self):
+        os.environ["MOUSER_SKIP_PROVENANCE"] = "1"
+        probe, msgs = self._verify(_probe_output(minor=(3, 12)), platform="linux")
+        probe.assert_not_called()
+        self.assertTrue(any("skipped" in m for m in msgs))
+        with self.assertRaises(SystemExit):
+            _, msgs = self._verify(_probe_output(minor=(3, 12)), platform="darwin")
+
+    def test_skip_override_is_reported_as_ignored_on_macos(self):
+        os.environ["MOUSER_SKIP_PROVENANCE"] = "1"
+        _, msgs = self._verify(_probe_output(), platform="darwin")
+        self.assertTrue(any("ignored on macOS" in m for m in msgs))
+
+    def test_macos_build_verifies_before_running_the_build_script(self):
+        calls = []
+        with mock.patch.object(installer, "resolve_macos_sign_identity", return_value="A" * 40), \
+                mock.patch.object(installer, "resolve_install_dir", return_value=self.root), \
+                mock.patch.object(installer, "resolve_python", return_value=(self.python, "test")), \
+                mock.patch.object(installer, "verify_python_provenance",
+                                  side_effect=lambda *a: calls.append("verify")), \
+                mock.patch.object(installer, "run_command",
+                                  side_effect=lambda *a, **k: calls.append("build")), \
+                mock.patch("builtins.print"):
+            with self.assertRaises(SystemExit):  # dist/Mouser.app never appears
+                installer.build_and_install_macos()
+        self.assertEqual(calls, ["verify", "build"])
+
+    def test_real_repo_pins_are_consistent(self):
+        """The committed .python-version and requirements.lock agree with the
+        pinned lines in requirements.txt (pyobjc 12.1)."""
+        with mock.patch.object(installer, "ROOT", ROOT):
+            self.assertEqual(installer.required_python_minor(), (3, 13))
+            locked = installer.locked_versions()
+        self.assertEqual(locked["pyobjc-core"], "12.1")
+        self.assertEqual(locked["pyobjc-framework-quartz"], "12.1")
+        self.assertEqual(locked["pyobjc-framework-cocoa"], "12.1")
+        self.assertEqual(locked["pyside6"], "6.11.0")
+        requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+        self.assertIn("pyobjc-framework-Quartz==12.1", requirements)
+        self.assertIn("pyobjc-framework-Cocoa==12.1", requirements)
+        self.assertIn('python-version: "3.13"', (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
+
+
 class BuildAndInstallTests(unittest.TestCase):
     def test_resolve_macos_sign_identity_requires_team_or_identity(self):
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -88,7 +220,9 @@ class BuildAndInstallTests(unittest.TestCase):
         # resolves the real DEFAULT_MACOS_INSTALL_DIR (/Applications) and
         # shutil.rmtree()s whatever's already there when it isn't overridden.
         # Without this, this test deletes the real, installed /Applications/Mouser.app.
-        with mock.patch.object(installer, "stop_running_instances") as stop:
+        with mock.patch.object(installer, "stop_running_instances") as stop, \
+                mock.patch.object(installer, "resolve_python", return_value=(Path("/py"), "test")), \
+                mock.patch.object(installer, "verify_python_provenance"):
             with mock.patch.object(installer, "resolve_macos_sign_identity", return_value="SIGN"):
                 with mock.patch.object(installer, "run_command"):
                     with mock.patch.object(installer, "restart_enabled", return_value=False):
@@ -156,7 +290,7 @@ class BuildAndInstallTests(unittest.TestCase):
                         return_value=(python, "test"),
                     ):
                         with mock.patch.object(installer, "require_pyinstaller"):
-                            with mock.patch.object(installer, "log_python_provenance"):
+                            with mock.patch.object(installer, "verify_python_provenance"):
                                 with mock.patch.object(
                                     installer,
                                     "run_command",
