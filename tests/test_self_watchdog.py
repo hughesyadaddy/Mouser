@@ -10,7 +10,7 @@ class _Fixture:
         self.now = 1000.0
         self.cpu = 0.0
         self.hg = SimpleNamespace(empty_read_total=0)
-        self.hook = SimpleNamespace(tap_reenable_total=0)
+        self.hook = SimpleNamespace(tap_reenable_total=0, tap_kind="native")
         self.reconnects = 0
         self.exits = []
         self.logs = []
@@ -145,6 +145,19 @@ class SelfWatchdogTests(unittest.TestCase):
         self.assertEqual(fx.tick(late=3600.0), [])
         self.assertEqual(fx.tick(late=3600.0), [])
         self.assertEqual(fx.reconnects, 0)
+
+    def test_trip_line_names_the_live_tap_kind(self):
+        fx = _Fixture()
+        fx.hook.tap_kind = "python"
+        fx.tick(tap_reenables=11)
+        self.assertEqual(len(fx.logs), 1)
+        self.assertIn(" tap=python ", fx.logs[0])
+
+    def test_trip_line_says_unknown_without_a_tap_kind(self):
+        fx = _Fixture()
+        fx.hook = SimpleNamespace(tap_reenable_total=0)
+        fx.tick(tap_reenables=11)
+        self.assertIn(" tap=unknown ", fx.logs[0])
 
     def test_missing_counters_do_not_trip(self):
         wd = SelfWatchdog(

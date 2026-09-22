@@ -2,6 +2,7 @@
 macOS mouse hook implementation.
 """
 
+import ctypes
 import functools
 import queue
 import sys
@@ -37,6 +38,29 @@ def _autoreleased(fn):
         with objc.autorelease_pool():
             return fn(*args, **kwargs)
     return wrapper
+
+
+# Raw CPython refcount release, used only by the deferred-release guard in
+# ``MouseHook._drop_prev_passthrough`` (see the comment there).
+_Py_DecRef = ctypes.pythonapi.Py_DecRef
+_Py_DecRef.argtypes = [ctypes.py_object]
+_Py_DecRef.restype = None
+
+#: Refcount the guard requires before it releases the previous pass-through
+#: event: the ``_prev_passthrough`` attribute, ``sys.getrefcount``'s own
+#: argument, and the reference PyObjC's trampoline leaked. Any other holder
+#: raises the count and disables the guard for that event (leak, never a
+#: double free).
+_LEAKED_PASSTHROUGH_REFCOUNT = 3
+
+
+def _is_bridge_proxy(obj) -> bool:
+    """True only for a PyObjC ObjC/CF proxy (``objc.CGEventRef`` etc.).
+
+    Test fakes (``MagicMock``, ``SimpleNamespace``, plain objects) live in
+    other modules, so the deferred-release guard is a no-op for them.
+    """
+    return type(obj).__module__.split(".")[0] == "objc"
 
 
 _BTN_MIDDLE = 2
@@ -203,6 +227,14 @@ class MouseHook(BaseMouseHook):
         # Native CGEventTap callback (native/mac/mouser_tap.m); None means
         # the Python callback is in the input path.
         self._native = None
+        #: Which CGEventTap callback is live: "native" (mouser_tap.m),
+        #: "python" (DEGRADED: PyObjC trampoline, see _drop_prev_passthrough),
+        #: or None while stopped. Read by the self-check watchdog log line.
+        self.tap_kind = None
+        # The CGEvent proxy returned by the previous Python-tap callback,
+        # held until the next callback entry so its leaked reference can be
+        # released once the trampoline is provably done with it.
+        self._prev_passthrough = None
         self._native_drain_thread = None
         self._native_filter_state = None
         self._native_filter_lock = threading.Lock()
@@ -396,6 +428,79 @@ class MouseHook(BaseMouseHook):
 
     @_autoreleased
     def _event_tap_callback(self, proxy, event_type, cg_event, refcon):
+        """CGEventTap entry point for both the main and the motion tap.
+
+        Wraps :meth:`_tap_callback_body` with the deferred-release guard:
+        the *previous* pass-through event is released here, at the next
+        entry, and the current one is remembered whenever the body passes
+        it through. Never release before returning -- PyObjC's trampoline
+        still converts the returned proxy after this frame is gone.
+        """
+        self._drop_prev_passthrough()
+        result = self._tap_callback_body(proxy, event_type, cg_event, refcon)
+        if result is not None:
+            self._prev_passthrough = result
+        return result
+
+    def _drop_prev_passthrough(self) -> bool:
+        """Release the reference PyObjC leaked for the last pass-through.
+
+        PyObjC bug (pyobjc-framework-Quartz 12.1, ``Modules/_callbacks.m``
+        ``m_CGEventTapCallBack``, lines 1181-1193): the trampoline calls the
+        Python callback with ``PyObject_CallFunction(..., "NNNO", ...)`` --
+        the args tuple *steals* ``py_event`` and is freed after the call --
+        then converts the result::
+
+            PyObject* result = PyObject_CallFunction(PyTuple_GetItem(info, 0),
+                                                     "NNNO", py_proxy, py_type,
+                                                     py_event, PyTuple_GetItem(info, 1));
+            if (result == NULL) { PyObjCErr_ToObjCWithGILState(&state); }
+            if (PyObjC_PythonToObjC(@encode(CGEventRef), result, &event) < 0) {
+                PyObjCErr_ToObjCWithGILState(&state);
+            }
+            PyGILState_Release(state);
+            return event;
+
+        There is no ``Py_DECREF(result)`` on the success path. Returning
+        ``cg_event`` hands back a *new* reference to the proxy, so the
+        proxy (and the CFRetain it holds on the CGEvent, plus the
+        CGSEventAppendix/HIDEvent payload) leaks once per pass-through:
+        ~11/s, ~1.8 GB in 81 h measured. ``return None`` does not leak
+        (``None`` is immortal). Filed upstream: see
+        ``docs/upstream/pyobjc-cgeventtap-leak.md``.
+
+        Why the count is exactly 3: at the next callback entry the previous
+        event's args tuple is gone, so the only references left are (1) this
+        object's ``_prev_passthrough`` attribute, (2) the temporary
+        ``sys.getrefcount`` argument, and (3) the reference the trampoline
+        never released. If anything else legitimately holds the proxy the
+        count is 4 or more and we leave it alone (a leak, never a
+        use-after-free). If upstream adds the DECREF the count is 2 and
+        this is a no-op, so the guard is version-independent.
+
+        Why it is deferred: releasing inside the callback before ``return``
+        would free the proxy while the trampoline still dereferences
+        ``result`` (use-after-free). By the next entry the trampoline has
+        returned and ``event`` has been handed to the window server.
+
+        Only PyObjC proxies are ever touched (``_is_bridge_proxy``); the
+        test fakes are plain Python objects and pass straight through.
+        Returns True when a reference was released.
+        """
+        if self._prev_passthrough is None:
+            return False
+        released = False
+        if (
+            sys.platform == "darwin"
+            and _is_bridge_proxy(self._prev_passthrough)
+            and sys.getrefcount(self._prev_passthrough) == _LEAKED_PASSTHROUGH_REFCOUNT
+        ):
+            _Py_DecRef(self._prev_passthrough)
+            released = True
+        self._prev_passthrough = None
+        return released
+
+    def _tap_callback_body(self, proxy, event_type, cg_event, refcon):
         # The CGEventTap continues to fire briefly after ``stop()`` sets
         # ``_running = False`` -- macOS does not synchronously drain
         # in-flight callbacks before disabling the tap. Drop the event
@@ -922,11 +1027,13 @@ class MouseHook(BaseMouseHook):
 
     def _start_tap(self, event_mask, motion_mask):
         native = NativeTap.load()
+        reason = NativeTap.last_error or "dylib not loaded"
         if native is not None:
             self._native = native
             self._push_native_filter()
             native.set_enabled(self._tap_wanted)
             if native.start():
+                self.tap_kind = "native"
                 print(f"[MouseHook] CGEventTap created (native tap: {native.path})", flush=True)
                 self._native_drain_thread = threading.Thread(
                     target=self._native_drain_worker,
@@ -935,10 +1042,24 @@ class MouseHook(BaseMouseHook):
                 )
                 self._native_drain_thread.start()
                 return True
+            reason = f"native tap start failed ({native.path})"
             print("[MouseHook] Native tap start failed -- using Python tap")
             self._native = None
             self._native_filter_state = None
-        return self._start_python_tap(event_mask, motion_mask)
+        if not self._start_python_tap(event_mask, motion_mask):
+            return False
+        # Mouser is not launchd-managed (tools/fleet-health), so refusing to
+        # start would be a dead seat; run degraded and say so loudly. The
+        # Python tap leaks through PyObjC's trampoline unless
+        # _drop_prev_passthrough can reclaim each event (see its docstring).
+        self.tap_kind = "python"
+        print(
+            "[MouseHook] DEGRADED: python tap in use "
+            f"(native tap unavailable: {reason})",
+            flush=True,
+        )
+        self._emit_status(f"Degraded: Python event tap in use ({reason})")
+        return True
 
     def _start_python_tap(self, event_mask, motion_mask):
         ready = threading.Event()
@@ -1053,6 +1174,10 @@ class MouseHook(BaseMouseHook):
         self._scroll_monitor_applied = None
         self._scroll_prefetch = None
         self._stop_tap()
+        # The tap thread has been joined (or the native tap stopped), so the
+        # trampoline is done with the last pass-through: reclaim it now.
+        self._drop_prev_passthrough()
+        self.tap_kind = None
 
         if self._dispatch_thread:
             self._dispatch_thread.join(timeout=1)

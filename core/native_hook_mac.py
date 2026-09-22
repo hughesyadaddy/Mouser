@@ -347,15 +347,27 @@ class NativeTap:
         self._lib = lib
         self.path = path
 
+    #: Why the most recent :meth:`load` returned ``None`` (one line, for the
+    #: hook's DEGRADED log); ``None`` after a successful load.
+    last_error = None
+
+    @classmethod
+    def _unavailable(cls, reason):
+        cls.last_error = reason
+        return None
+
     @classmethod
     def load(cls, path=None):
         """A ready tap, or ``None`` when the native path is unavailable.
-        Never raises: every failure means "keep the Python callback"."""
+        Never raises: every failure means "keep the Python callback" and
+        is recorded in :attr:`last_error`."""
         if sys.platform != "darwin":
-            return None
+            return cls._unavailable(f"not macOS ({sys.platform})")
         path = path or _resolve_dylib_path()
         if path is None:
-            return None
+            return cls._unavailable(
+                f"{DYLIB_NAME} not found in {candidate_paths()}"
+            )
         try:
             lib = ctypes.CDLL(path)
             cls._declare(lib)
@@ -365,7 +377,9 @@ class NativeTap:
                     f"[MouseHook] Ignoring {path}: ABI {abi}, expected "
                     f"{ABI_VERSION} -- rebuild native/mac"
                 )
-                return None
+                return cls._unavailable(
+                    f"{path}: ABI {abi}, expected {ABI_VERSION}"
+                )
             for name, size in (
                 ("mouser_tap_event_size", ctypes.sizeof(NativeTapEvent)),
                 ("mouser_tap_fields_size", ctypes.sizeof(_CTapFields)),
@@ -377,13 +391,16 @@ class NativeTap:
                         f"[MouseHook] Ignoring {path}: {name} is {got} bytes, "
                         f"expected {size}"
                     )
-                    return None
+                    return cls._unavailable(
+                        f"{path}: {name} is {got} bytes, expected {size}"
+                    )
         except OSError as exc:
             print(f"[MouseHook] Could not load {path}: {exc}")
-            return None
+            return cls._unavailable(f"could not load {path}: {exc}")
         except AttributeError as exc:
             print(f"[MouseHook] {path} is missing an export: {exc}")
-            return None
+            return cls._unavailable(f"{path} is missing an export: {exc}")
+        cls.last_error = None
         return cls(lib, path)
 
     @staticmethod
