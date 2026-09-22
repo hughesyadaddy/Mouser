@@ -1300,9 +1300,17 @@ class MainWindowHost(QObject):
     providers) lives on this object and is dropped to ``None`` *before*
     ``engine.deleteLater()`` so nothing outside can hold a dangling wrapper.
     Callers must never cache the value of ``window()``; look it up each time.
+
+    Teardown is OFF by default (``teardown_enabled`` / ``MOUSER_QML_TEARDOWN=1``).
+    Measured on macOS 26.6 / PySide6 6.11 (docs/memory-qml-teardown.md): every
+    native QQuickWindow creation leaks ~11.8 MB (one display-sized drawable)
+    regardless of RHI backend or render loop, so re-creating the window after
+    each hide grows the process by ~12 MB per open/close forever, while a plain
+    hide is flat. The mechanism stays in place for a Qt that fixes that leak.
     """
 
     TEARDOWN_DELAY_MS = 30_000
+    TEARDOWN_ENV = "MOUSER_QML_TEARDOWN"
 
     windowCreated = Signal(object)
     windowVisibilityChanged = Signal(object)
@@ -1317,9 +1325,11 @@ class MainWindowHost(QObject):
         launch_hidden: bool = False,
         teardown_delay_ms: "int | None" = None,
         teardown_blocked=None,
+        teardown_enabled: bool = True,
         parent=None,
     ):
         super().__init__(parent)
+        self._teardown_enabled = bool(teardown_enabled)
         self._qml_path = qml_path
         self._context_properties = dict(context_properties)
         self._image_providers = dict(image_providers or {})
@@ -1350,6 +1360,18 @@ class MainWindowHost(QObject):
     @property
     def teardown_count(self) -> int:
         return self._teardown_count
+
+    @property
+    def teardown_enabled(self) -> bool:
+        return self._teardown_enabled
+
+    @classmethod
+    def teardown_enabled_from_env(cls) -> bool:
+        return os.environ.get(cls.TEARDOWN_ENV, "").strip() == "1"
+
+    def _arm(self) -> None:
+        if self._teardown_enabled:
+            self._timer.start()
 
     def teardown_pending(self) -> bool:
         return self._timer.isActive()
@@ -1412,7 +1434,7 @@ class MainWindowHost(QObject):
         if window is not None:
             window.hide()
         if self._engine is not None and not self.is_visible():
-            self._timer.start()
+            self._arm()
 
     def teardown(self, *, force: bool = False) -> bool:
         """Delete the engine now. Returns True when it was released.
@@ -1426,7 +1448,7 @@ class MainWindowHost(QObject):
             if self.is_visible():
                 return False
             if self._teardown_is_blocked():
-                self._timer.start()
+                self._arm()
                 return False
         self._release()
         return True
@@ -1483,7 +1505,7 @@ class MainWindowHost(QObject):
         if self._engine is None:
             return
         if visibility == QWindow.Visibility.Hidden:
-            self._timer.start()
+            self._arm()
         else:
             self._timer.stop()
         self.windowVisibilityChanged.emit(visibility)
@@ -1520,6 +1542,14 @@ class GestureHudHost(QObject):
 
     def window(self):
         return self._window
+
+    def release(self) -> None:
+        """Delete the HUD engine (process shutdown only)."""
+        engine = self._engine
+        self._engine = None
+        self._window = None
+        if engine is not None:
+            engine.deleteLater()
 
 
 
@@ -1813,9 +1843,14 @@ def main():
             "systemicons": SystemIconProvider,
         },
         launch_hidden=launch_hidden,
+        teardown_enabled=MainWindowHost.teardown_enabled_from_env(),
         parent=app,
     )
     app._mouser_window_host = host
+    print(
+        "[Mouser] Settings window engine teardown: "
+        + ("enabled" if host.teardown_enabled else "disabled (hide only)")
+    )
 
     def show_main_window():
         def _present():
@@ -2043,6 +2078,12 @@ def main():
         sys.exit(app.exec())
     finally:
         engine.stop()
+        # Drop both QML engines before the context objects they bind to
+        # (backend / uiState / lm) go away with the interpreter, otherwise
+        # every binding re-evaluates against null on the way out.
+        host.teardown(force=True)
+        hud_host.release()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         if sys.platform == "darwin":
             _teardown_native_macos_status_item()
         if single_server is not None:

@@ -7,13 +7,16 @@ defaults) and prints ``phys_footprint`` after each lifecycle step:
 
     baseline -> hud -> shown -> hidden -> torn down -> re-shown -> torn down
 
-No tray, no hooks, no installed app. Defaults to the ``offscreen`` platform;
-``--platform cocoa`` renders through Metal for real numbers (a window appears
-on screen for a few seconds). ``--vmmap`` also diffs ``vmmap --summary`` of
-this pid between "shown" and "torn down" (macOS only) and lists the
-``CG image`` region so display-sized bitmaps can be attributed.
+No tray, no hooks, no installed app, and ALWAYS the ``offscreen`` platform
+(never a cocoa window: it steals focus on the seat). Offscreen renders in
+software, so absolute numbers are lower than the real Metal path; they are
+valid for relative before/after comparisons only -- see
+docs/memory-qml-teardown.md for the one-off cocoa reference numbers.
+``--vmmap`` also diffs ``vmmap --summary`` of this pid between "shown" and
+"torn down" (macOS only).
 
-    QSG_INFO=1 tools/measure_qml_teardown.py --platform cocoa --vmmap
+    tools/measure_qml_teardown.py --cycles 3 --vmmap
+    tools/measure_qml_teardown.py --qml-dir /path/to/old/qml   # A/B
 """
 
 from __future__ import annotations
@@ -31,11 +34,11 @@ from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+os.environ["QT_QPA_PLATFORM"] = "offscreen"  # before any PySide6 import
 
 
 def _parse_args():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--platform", default=os.environ.get("QT_QPA_PLATFORM", "offscreen"))
     ap.add_argument("--settle", type=float, default=1.5, help="seconds to pump events per step")
     ap.add_argument("--vmmap", action="store_true", help="diff vmmap --summary shown vs torn down")
     ap.add_argument("--cycles", type=int, default=2, help="show/hide/teardown cycles")
@@ -117,7 +120,7 @@ def _vmmap_regions(summary: str) -> dict[str, tuple[float, float]]:
 
 def main() -> int:
     args = _parse_args()
-    os.environ["QT_QPA_PLATFORM"] = args.platform
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"  # never a real window
 
     from PySide6.QtCore import QCoreApplication
     from PySide6.QtWidgets import QApplication

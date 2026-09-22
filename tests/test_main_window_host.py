@@ -394,6 +394,28 @@ class MainWindowHostLiveTests(unittest.TestCase):
         self.assertIsNotNone(self.host.engine())
         self.assertEqual(self.host.teardown_count, 0)
 
+    def test_teardown_disabled_never_arms_timer(self):
+        host = self._make_host(teardown_enabled=False)
+        self._extra_hosts.append(host)
+        host.show()
+        _pump(100)
+        host.hide()
+        self.assertFalse(host.teardown_pending())
+        _pump(250)
+        self.assertIsNotNone(host.engine(), "hide-only mode keeps the engine")
+        # An explicit call still works (process shutdown path).
+        self.assertTrue(host.teardown(force=True))
+        self.assertIsNone(host.engine())
+
+    def test_teardown_env_switch(self):
+        with patch.dict(os.environ, {main_qml.MainWindowHost.TEARDOWN_ENV: "1"}):
+            self.assertTrue(main_qml.MainWindowHost.teardown_enabled_from_env())
+        with patch.dict(os.environ, {main_qml.MainWindowHost.TEARDOWN_ENV: ""}):
+            self.assertFalse(main_qml.MainWindowHost.teardown_enabled_from_env())
+        env = {k: v for k, v in os.environ.items() if k != main_qml.MainWindowHost.TEARDOWN_ENV}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertFalse(main_qml.MainWindowHost.teardown_enabled_from_env())
+
     def test_teardown_while_visible_is_refused(self):
         self.host.show()
         _pump(100)
@@ -445,6 +467,18 @@ class MainWindowHostLiveTests(unittest.TestCase):
             self.backend.setDebugMode(False)
             _pump(50)
         self.assertIsNone(card.property("item"))
+
+    def test_hud_host_release_drops_engine(self):
+        hud = main_qml.GestureHudHost(
+            qml_path=str(QML_DIR / "GestureHud.qml"),
+            context_properties=self.context,
+        )
+        self.assertIsNotNone(hud.window())
+        hud.release()
+        self.assertIsNone(hud.engine())
+        self.assertIsNone(hud.window())
+        self.assertEqual(_qml_refs(hud), [])
+        _pump(50)
 
     def test_quit_filter_rebinds_across_teardown(self):
         filt = main_qml._MacOSQuitToTrayFilter(None)
