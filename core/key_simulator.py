@@ -1012,17 +1012,28 @@ elif sys.platform == "darwin":
     def send_key_press(vk):
         send_key_combo([vk])
 
+    def _media_key_events(key_id):
+        """Build the (down, up) CGEvents for a media key via NSEvent
+        (Fn-key based) without posting them. Split from _send_media_key so
+        the event creation can be exercised (and its autorelease behaviour
+        measured) without injecting input.
+
+        The NSEvent -> CGEvent conversion produces autoreleased temporaries
+        (~1 KB per call): callers on pool-less threads must run inside
+        ``_autoreleased``."""
+        ev_down = _AppKit.NSEvent.otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2_(
+            14, (0, 0), 0xa00, 0, 0, None, 8, (key_id << 16) | (0xa << 8), -1
+        )
+        ev_up = _AppKit.NSEvent.otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2_(
+            14, (0, 0), 0xb00, 0, 0, None, 8, (key_id << 16) | (0xb << 8), -1
+        )
+        return ev_down.CGEvent(), ev_up.CGEvent()
+
+    @_autoreleased
     def _send_media_key(key_id):
         """Send a media key event via NSEvent (Fn-key based)."""
         try:
-            ev_down = _AppKit.NSEvent.otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2_(
-                14, (0, 0), 0xa00, 0, 0, None, 8, (key_id << 16) | (0xa << 8), -1
-            )
-            ev_up = _AppKit.NSEvent.otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2_(
-                14, (0, 0), 0xb00, 0, 0, None, 8, (key_id << 16) | (0xb << 8), -1
-            )
-            cg_down = ev_down.CGEvent()
-            cg_up = ev_up.CGEvent()
+            cg_down, cg_up = _media_key_events(key_id)
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, cg_down)
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, cg_up)
         except Exception as e:

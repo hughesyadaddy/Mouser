@@ -8,6 +8,64 @@ from unittest.mock import call, patch
 from core import key_simulator
 
 
+@unittest.skipUnless(
+    sys.platform == "darwin" and getattr(key_simulator, "_AppKit", None) is not None,
+    "macOS PyObjC only",
+)
+class MacOSMediaKeyAutoreleaseTests(unittest.TestCase):
+    """M5 audit R3-9: _send_media_key runs on pool-less threads (HID gesture,
+    dispatch worker) and its NSEvent -> CGEvent conversion autoreleases
+    ~1 KB per call. The probe creates the events on a pool-less thread and
+    never posts them."""
+
+    ITERS = 2000
+
+    @staticmethod
+    def _rss_bytes():
+        import resource
+        # ru_maxrss is a high-water mark; ps gives the live RSS.
+        out = os.popen(f"ps -o rss= -p {os.getpid()}").read().strip()
+        return int(out) * 1024 if out else resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+    def test_send_media_key_is_wrapped_in_a_pool(self):
+        if key_simulator._objc is None:
+            self.skipTest("objc unavailable")
+        self.assertTrue(hasattr(key_simulator._send_media_key, "__wrapped__"))
+
+    def test_event_creation_in_pool_does_not_grow_rss(self):
+        import threading
+
+        if key_simulator._objc is None:
+            self.skipTest("objc unavailable")
+        pooled = key_simulator._autoreleased(key_simulator._media_key_events)
+        go, done, stay = threading.Event(), threading.Event(), threading.Event()
+        rss = {}
+
+        def body():
+            for _ in range(50):          # warm-up: lazy class loads
+                pooled(key_simulator._NX_MUTE)
+            rss["before"] = self._rss_bytes()
+            go.set()
+            for _ in range(self.ITERS):
+                pooled(key_simulator._NX_MUTE)
+            rss["after"] = self._rss_bytes()   # thread still alive: no exit drain
+            done.set()
+            stay.wait()
+
+        thread = threading.Thread(target=body, name="MediaKeyProbe")
+        thread.start()
+        self.assertTrue(done.wait(30))
+        stay.set()
+        thread.join(5)
+        growth = rss["after"] - rss["before"]
+        # Pool-less this is ~1 KB/iter (~2 MB over ITERS); pooled it is
+        # noise. Allow 128 B/iter of jitter.
+        self.assertLessEqual(
+            growth, 128 * self.ITERS,
+            f"RSS grew {growth} B over {self.ITERS} pooled iterations",
+        )
+
+
 class KeySimulatorActionTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform in ("darwin", "win32"), "desktop switching actions are platform-specific")
     def test_desktop_switch_actions_exist(self):
