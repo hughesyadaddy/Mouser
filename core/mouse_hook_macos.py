@@ -1173,17 +1173,24 @@ class MouseHook(BaseMouseHook):
         self._connected_device = None
         self._scroll_monitor_applied = None
         self._scroll_prefetch = None
-        self._stop_tap()
-        # The tap thread has been joined (or the native tap stopped), so the
-        # trampoline is done with the last pass-through: reclaim it now.
-        self._drop_prev_passthrough()
+        if self._stop_tap():
+            # The tap thread is gone (or the tap was native), so no callback
+            # can race the refcount check: reclaim the last pass-through.
+            self._drop_prev_passthrough()
+        else:
+            # A wedged tap thread may still be inside the callback; a second
+            # check-and-decref here could double free. Leave the one event
+            # (the leak is one proxy, never a crash).
+            print("[MouseHook] tap thread still alive; leaving last pass-through event")
         self.tap_kind = None
 
         if self._dispatch_thread:
             self._dispatch_thread.join(timeout=1)
             self._dispatch_thread = None
 
-    def _stop_tap(self):
+    def _stop_tap(self) -> bool:
+        """Tear the tap down. Returns True when no callback can still be
+        running (native tap stopped, or the Python tap thread joined)."""
         native = self._native
         if native is not None:
             # Drain first: it pushes filters on every tick, and nothing may
@@ -1197,19 +1204,22 @@ class MouseHook(BaseMouseHook):
             self._native = None
             self._native_filter_state = None
             print("[MouseHook] CGEventTap disabled and removed (native tap)", flush=True)
-            return
+            return True
         loop = self._tap_loop
         if loop is not None:
             Quartz.CFRunLoopStop(loop)
         thread = self._tap_thread
+        thread_gone = True
         if thread is not None:
             thread.join(timeout=TAP_THREAD_JOIN_S)
             self._tap_thread = None
             if thread.is_alive():
+                thread_gone = False
                 print("[MouseHook] Tap thread did not exit; disabling tap from caller")
         # No-op when the tap thread already tore down; the fallback for a
         # wedged thread or a tap that was never given one.
         self._teardown_python_tap()
+        return thread_gone
 
     # ── hook state (enable / disable without recreating the tap) ────
 

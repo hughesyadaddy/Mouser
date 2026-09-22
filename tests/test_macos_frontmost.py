@@ -57,6 +57,39 @@ class BundleIdResolutionTests(unittest.TestCase):
         self.paths[11] = helper_exe
         self.assertEqual(fm.bundle_id_for_pid(11), "com.example.outer.helper")
 
+    def test_ios_on_mac_wrapper_layout_resolves_the_inner_bundle(self):
+        """iPhone/iPad apps on Apple Silicon: Foo.app/Wrapper/Bar.app/Info.plist
+        (no Contents/). NSRunningApplication reported the inner id."""
+        inner = os.path.join(self.tmp.name, "USCG Exam Prep.app", "Wrapper", "USCG.app")
+        os.makedirs(inner)
+        with open(os.path.join(inner, "Info.plist"), "wb") as fh:
+            plistlib.dump({"CFBundleIdentifier": "com.codanyon.uscgexamprep"}, fh)
+        exe = os.path.join(inner, "USCG")
+        open(exe, "wb").close()
+        self.paths[10] = exe
+        self.assertEqual(fm.bundle_id_for_pid(10), "com.codanyon.uscgexamprep")
+
+    def test_xpc_service_and_app_extension_keep_their_own_ids(self):
+        outer, _ = self._bundle("Outer", "com.example.outer")
+        for suffix, ident in ((".xpc", "com.example.outer.xpc"), (".appex", "com.example.outer.ext")):
+            bundle = os.path.join(outer, "Contents", "PlugIns", f"Helper{suffix}")
+            os.makedirs(os.path.join(bundle, "Contents", "MacOS"))
+            with open(os.path.join(bundle, "Contents", "Info.plist"), "wb") as fh:
+                plistlib.dump({"CFBundleIdentifier": ident}, fh)
+            exe = os.path.join(bundle, "Contents", "MacOS", "Helper")
+            open(exe, "wb").close()
+            self.paths[20] = exe
+            self.assertEqual(fm.bundle_id_for_pid(20), ident)
+
+    def test_has_pid_tracks_eviction(self):
+        _, exe = self._bundle("A", "com.example.a")
+        self.paths[10] = exe
+        self.assertFalse(fm.has_pid(10))
+        fm.bundle_id_for_pid(10)
+        self.assertTrue(fm.has_pid(10))
+        fm.evict(10)
+        self.assertFalse(fm.has_pid(10))
+
     def test_bare_executable_falls_back_to_basename(self):
         exe = os.path.join(self.tmp.name, "python3.13")
         with open(exe, "wb") as fh:
@@ -172,6 +205,16 @@ class LiveMacOSTests(unittest.TestCase):
     """Real ctypes calls. AX needs an Accessibility grant for this
     interpreter, so only the CGWindowList fallback and libproc are asserted;
     the AX path must simply not raise."""
+
+    @unittest.skipUnless(
+        os.path.isdir("/Applications/USCG Exam Prep.app"), "iOS-on-Mac app not installed"
+    )
+    def test_installed_ios_app_resolves_to_its_bundle_id(self):
+        with patch.object(fm, "_proc_pidpath", lambda pid: (
+            "/Applications/USCG Exam Prep.app/Wrapper/USCG.app/USCG"
+        )):
+            self.assertEqual(fm.bundle_id_for_pid(77), "com.codanyon.uscgexamprep")
+        fm.evict(77)
 
     def test_focused_pid_and_self_resolution(self):
         libs = fm._get_libs()

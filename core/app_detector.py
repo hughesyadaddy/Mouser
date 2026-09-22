@@ -200,6 +200,12 @@ elif sys.platform == "darwin":
         """Bundle id (else executable basename) for *pid*; LRU-cached."""
         return _frontmost.bundle_id_for_pid(pid)
 
+    def _pid_cached(pid: int) -> bool:
+        return _frontmost.has_pid(pid)
+
+    def _evict_pid(pid: int) -> None:
+        _frontmost.evict(pid)
+
     def _read_foreground_pid() -> int | None:
         """Frontmost pid via AX / CGWindowList -- no LaunchServices."""
         return _frontmost.focused_pid()
@@ -224,17 +230,20 @@ elif sys.platform == "darwin":
         pid = int(app.processIdentifier())
         return pid if pid > 0 else None
 
-    def _install_activation_observer(handler):
+    def _install_activation_observer(handler, on_terminate=None):
         """Observe NSWorkspaceDidActivateApplicationNotification.
 
         ``handler(pid)`` is invoked from the notification's posting thread
         (the main run loop) with the activated app's pid; the detector
         thread resolves it. A second observer on
-        NSWorkspaceDidTerminateApplicationNotification evicts the pid from
-        the identifier cache. Returns a zero-arg ``remove`` callable. Raises
-        when the observers cannot be installed so the caller can fall back
-        to polling.
+        NSWorkspaceDidTerminateApplicationNotification calls
+        ``on_terminate(pid)`` (default: evict the pid from the identifier
+        cache). Returns a zero-arg ``remove`` callable. Raises when the
+        observers cannot be installed so the caller can fall back to
+        polling.
         """
+        if on_terminate is None:
+            on_terminate = _evict_pid
         from AppKit import NSWorkspace
 
         center = NSWorkspace.sharedWorkspace().notificationCenter()
@@ -257,7 +266,7 @@ elif sys.platform == "darwin":
                 except Exception:
                     pid = None
                 if pid is not None:
-                    _frontmost.evict(pid)
+                    on_terminate(pid)
 
         activate_token = center.addObserverForName_object_queue_usingBlock_(
             _ACTIVATE_NOTIFICATION, None, None, _on_activate,
@@ -342,6 +351,12 @@ FALLBACK_POLL_INTERVAL = 30.0
 if sys.platform != "darwin":
     _identifier_for_pid = None
     _read_foreground_pid = None
+    _pid_cached = None
+    _evict_pid = None
+
+#: Queue wait per loop turn in _run_observer; the idle watchdog fires after
+#: FALLBACK_POLL_INTERVAL of these without an event. Patched down in tests.
+IDLE_TICK_S = 1.0
 
 
 class AppDetector:
@@ -396,7 +411,7 @@ class AppDetector:
         if install is None:
             return None
         try:
-            return install(self._events.put)
+            return install(self._events.put, self._on_terminated)
         except Exception as exc:
             print(
                 f"[AppDetect] activation observer unavailable ({exc!r}); "
@@ -414,17 +429,30 @@ class AppDetector:
         except Exception:
             return None
 
+    def _on_terminated(self, pid: int):
+        """Terminate notification: forget the pid everywhere. The kernel may
+        hand the same pid to the next launched app, so the dedupe in
+        _deliver must not swallow that app's first activation."""
+        if _evict_pid is not None:
+            _evict_pid(pid)
+        if pid == self._last_pid:
+            self._last_pid = None
+
     def _deliver(self, item):
         """Funnel for every source (activation pid, idle AX pid, poll exe).
 
         A pid equal to the last delivered one is dropped before any
-        resolution, so repeated activations of the same app cost nothing.
+        resolution, so repeated activations of the same app cost nothing --
+        but only while its cache entry still exists: an evicted pid (app
+        terminated) is always re-resolved in case the pid was reused.
         """
         try:
             if item is None:
                 return
             if isinstance(item, int):
-                if item == self._last_pid:
+                if item == self._last_pid and (
+                    _pid_cached is None or _pid_cached(item)
+                ):
                     return
                 exe = _identifier_for_pid(item) if _identifier_for_pid else None
                 if not exe:
@@ -453,9 +481,9 @@ class AppDetector:
         idle = 0.0
         while not self._stop.is_set():
             try:
-                item = self._events.get(timeout=1.0)
+                item = self._events.get(timeout=IDLE_TICK_S)
             except queue.Empty:
-                idle += 1.0
+                idle += IDLE_TICK_S
                 if idle >= FALLBACK_POLL_INTERVAL:
                     idle = 0.0
                     self._idle_check()

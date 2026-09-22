@@ -229,20 +229,39 @@ def _proc_pidpath(pid: int) -> str | None:
     return buf.value[:length].decode("utf-8", "surrogateescape")
 
 
+#: Bundle kinds that carry their own CFBundleIdentifier. The innermost one
+#: wins, matching NSRunningApplication.bundleIdentifier() for helpers, XPC
+#: services and app extensions.
+_BUNDLE_SUFFIXES = (".app", ".xpc", ".appex")
+
+
+def _bundle_identifier(bundle: str) -> str | None:
+    """CFBundleIdentifier of *bundle*: ``Contents/Info.plist`` (macOS layout),
+    else ``Info.plist`` at the bundle root (iOS-on-Mac apps live in
+    ``Foo.app/Wrapper/Bar.app/Info.plist`` with no ``Contents/``)."""
+    for plist in (
+        os.path.join(bundle, "Contents", "Info.plist"),
+        os.path.join(bundle, "Info.plist"),
+    ):
+        try:
+            with open(plist, "rb") as fh:
+                ident = plistlib.load(fh).get("CFBundleIdentifier")
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            continue
+        if ident:
+            return str(ident)
+    return None
+
+
 def _resolve_bundle_id(path: str) -> str:
-    """``CFBundleIdentifier`` of the nearest enclosing ``*.app``, else the
-    executable basename."""
+    """``CFBundleIdentifier`` of the innermost enclosing bundle
+    (``*.app`` / ``*.xpc`` / ``*.appex``), else the executable basename."""
     parent = os.path.dirname(path)
     while parent and parent != os.path.dirname(parent):
-        if parent.endswith(".app"):
-            plist = os.path.join(parent, "Contents", "Info.plist")
-            try:
-                with open(plist, "rb") as fh:
-                    ident = plistlib.load(fh).get("CFBundleIdentifier")
-            except (OSError, ValueError, plistlib.InvalidFileException):
-                ident = None
+        if parent.endswith(_BUNDLE_SUFFIXES):
+            ident = _bundle_identifier(parent)
             if ident:
-                return str(ident)
+                return ident
             break
         parent = os.path.dirname(parent)
     return os.path.basename(path)
@@ -262,18 +281,25 @@ def bundle_id_for_pid(pid: int) -> str | None:
     except OSError:
         mtime = 0.0
     key = (pid, path, mtime)
+    # Resolve under the lock: a concurrent miss for the same key (detector
+    # thread + idle watchdog) must not parse the plist twice.
     with _lru_lock:
         ident = _lru.get(key)
         if ident is not None:
             _lru.move_to_end(key)
             return ident
-    ident = _resolve_bundle_id(path)
-    with _lru_lock:
+        ident = _resolve_bundle_id(path)
         _lru[key] = ident
-        _lru.move_to_end(key)
         while len(_lru) > LRU_SIZE:
             _lru.popitem(last=False)
     return ident
+
+
+def has_pid(pid: int) -> bool:
+    """True while any cached entry for *pid* exists (i.e. it has not been
+    evicted by a terminate notification or aged out)."""
+    with _lru_lock:
+        return any(k[0] == pid for k in _lru)
 
 
 def evict(pid: int) -> None:

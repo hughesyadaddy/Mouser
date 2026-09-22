@@ -265,6 +265,80 @@ class AppDetectorMacOSTests(unittest.TestCase):
         self.assertEqual(self.frontmost_module.cache_size(), 0)
         self.assertEqual(_FakeRunningApp.ls_calls, 0)
 
+    def test_terminate_clears_last_pid_so_a_reused_pid_is_delivered(self):
+        """A terminates on pid 500, B launches and gets pid 500: B's first
+        activation must not be deduplicated against A."""
+        center = _FakeNotificationCenter()
+        module, _ = self._darwin_module(center)
+        app_a = self._app(500, "A", "com.a")
+        self.focused[0] = 500
+        collector = _Collector()
+        detector = module.AppDetector(collector)
+        detector.start()
+        self.addCleanup(detector.stop)
+        self.assertTrue(collector.wait(1))
+
+        center.post(_TERMINATE, app_a)
+        self.assertIsNone(detector._last_pid)
+        self.assertEqual(self.frontmost_module.cache_size(), 0)
+        center.post(_ACTIVATE, self._app(500, "B", "com.b"))
+        self.assertTrue(collector.wait(2))
+        self.assertEqual(collector.seen, ["com.a", "com.b"])
+        self.assertEqual(_FakeRunningApp.ls_calls, 0)
+
+    def test_evicted_pid_is_re_resolved_even_without_the_terminate_path(self):
+        """Reviewer reproducer: eviction alone (no detector-side notification)
+        must also defeat the dedupe."""
+        center = _FakeNotificationCenter()
+        module, _ = self._darwin_module(center)
+        seen = []
+        detector = module.AppDetector(seen.append)
+        with patch.object(module, "_identifier_for_pid",
+                          side_effect=lambda pid: {500: "com.a", 501: "com.b"}.get(pid)):
+            detector._deliver(500)
+            self.frontmost_module.evict(500)
+            with patch.object(module, "_identifier_for_pid", return_value="com.b"):
+                detector._deliver(500)
+        self.assertEqual(seen, ["com.a", "com.b"])
+
+    def test_same_pid_still_cached_is_deduplicated(self):
+        center = _FakeNotificationCenter()
+        module, _ = self._darwin_module(center)
+        self._app(500, "A", "com.a")
+        seen = []
+        detector = module.AppDetector(seen.append)
+        detector._deliver(500)
+        resolves = self.resolve_calls
+        for _ in range(100):
+            detector._deliver(500)
+        self.assertEqual(seen, ["com.a"])
+        self.assertEqual(self.resolve_calls, resolves)
+
+    def test_run_observer_idle_branch_fires_the_ax_watchdog(self):
+        """Drive the real _run_observer loop through idle >= FALLBACK_POLL_INTERVAL."""
+        center = _FakeNotificationCenter()
+        module, workspace = self._darwin_module(center)
+        self._app(100, "a", "a.b")
+        self._app(200, "b", "b.c")
+        self.focused[0] = 100
+        collector = _Collector()
+        detector = module.AppDetector(collector)
+        with patch.object(module, "IDLE_TICK_S", 0.005), \
+                patch.object(module, "FALLBACK_POLL_INTERVAL", 0.02):
+            detector.start()
+            self.addCleanup(detector.stop)
+            self.assertTrue(collector.wait(1))
+            threading.Event().wait(0.2)
+            # Several watchdog reads happened, nothing was resolved again.
+            self.assertGreaterEqual(self.focused_calls, 4)
+            self.assertEqual(self.resolve_calls, 1)
+            # A switch the observer never reported is picked up by the watchdog.
+            self.focused[0] = 200
+            self.assertTrue(collector.wait(2))
+        self.assertEqual(collector.seen, ["a.b", "b.c"])
+        self.assertEqual(workspace.frontmost_calls, 0)
+        self.assertEqual(_FakeRunningApp.ls_calls, 0)
+
     def test_stop_removes_both_observers(self):
         center = _FakeNotificationCenter()
         module, _ = self._darwin_module(center)

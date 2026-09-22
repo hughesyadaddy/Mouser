@@ -104,6 +104,9 @@ class PythonProvenanceTests(unittest.TestCase):
             self._verify(_probe_output(minor=(3, 12), version="3.12.8", pyside="6.9.0"))
         text = "\n".join(failures)
         self.assertIn("3.12.8", text)
+        # The hint names the *required* interpreter, not the running one.
+        self.assertIn("python3.13 -m venv", text)
+        self.assertNotIn("python3.12", text)
         self.assertIn("PySide6 6.9.0", text)
         self.assertIn("requirements.lock", text)
 
@@ -133,6 +136,21 @@ class PythonProvenanceTests(unittest.TestCase):
             with self.assertRaises(SystemExit):  # dist/Mouser.app never appears
                 installer.build_and_install_macos()
         self.assertEqual(calls, ["verify", "build"])
+
+    def test_windows_build_verifies_before_cleanup_and_pip(self):
+        """A wrong interpreter must fail with the old install untouched."""
+        with mock.patch.object(windows_install, "resolve_install_scope", return_value="user"), \
+                mock.patch.object(installer, "resolve_python", return_value=(self.python, "test")), \
+                mock.patch.object(installer, "verify_python_provenance",
+                                  side_effect=SystemExit(1)), \
+                mock.patch.object(windows_install, "cleanup_all_windows_installs") as cleanup, \
+                mock.patch.object(installer, "run_command") as run_command, \
+                mock.patch.dict(os.environ, {"MOUSER_INSTALL_DIR": str(self.root / "i")}), \
+                mock.patch("builtins.print"):
+            with self.assertRaises(SystemExit):
+                installer.build_and_install_windows()
+        cleanup.assert_not_called()
+        run_command.assert_not_called()
 
     def test_real_repo_pins_are_consistent(self):
         """The committed .python-version and requirements.lock agree with the

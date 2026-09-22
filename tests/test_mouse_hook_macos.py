@@ -876,10 +876,55 @@ class DeferredReleaseGuardTests(_MacOSHookCase):
         hook._prev_passthrough = self.cg_event
         with patch.object(hook, "_unregister_wake_observer"), \
                 patch.object(hook, "_stop_hid_listener"), \
-                patch.object(hook, "_stop_tap"):
+                patch.object(hook, "_stop_tap", return_value=True):
             hook.stop()
         self.assertIsNone(hook._prev_passthrough)
         self.assertIsNone(hook.tap_kind)
+
+    def test_stop_with_a_wedged_tap_thread_does_not_touch_the_event(self):
+        """A tap thread still alive after the join may be inside the
+        callback; a second check-and-decref would race it (double free)."""
+        hook = self._hook()
+        hook.tap_kind = "python"
+        hook._prev_passthrough = self.cg_event
+        with patch.object(hook, "_unregister_wake_observer"), \
+                patch.object(hook, "_stop_hid_listener"), \
+                patch.object(hook, "_stop_tap", return_value=False), \
+                patch.object(hook, "_drop_prev_passthrough") as drop, \
+                patch("builtins.print"):
+            hook.stop()
+        drop.assert_not_called()
+        self.assertIs(hook._prev_passthrough, self.cg_event)
+        self.assertIsNone(hook.tap_kind)
+
+    def test_stop_tap_reports_a_wedged_python_thread(self):
+        hook = self._hook()
+        hook._tap = None
+        hook._tap_loop = None
+        hook._native = None
+        wedged = SimpleNamespace(join=lambda timeout: None, is_alive=lambda: True)
+        hook._tap_thread = wedged
+        with patch.object(hook, "_teardown_python_tap"), patch("builtins.print"):
+            self.assertFalse(hook._stop_tap())
+        self.assertIsNone(hook._tap_thread)
+
+    def test_stop_tap_reports_a_joined_python_thread(self):
+        hook = self._hook()
+        hook._tap = None
+        hook._tap_loop = None
+        hook._native = None
+        hook._tap_thread = SimpleNamespace(join=lambda timeout: None, is_alive=lambda: False)
+        with patch.object(hook, "_teardown_python_tap"), patch("builtins.print"):
+            self.assertTrue(hook._stop_tap())
+
+    def test_stop_tap_native_is_always_safe(self):
+        hook = self._hook()
+        native = MagicMock(name="native")
+        native.stop.return_value = True
+        hook._native = native
+        hook._native_drain_thread = None
+        with patch("builtins.print"):
+            self.assertTrue(hook._stop_tap())
 
 
 @unittest.skipUnless(sys.platform == "darwin", "needs a real PyObjC CGEventRef proxy")

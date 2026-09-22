@@ -268,12 +268,15 @@ def verify_python_provenance(python: Path, source: str) -> None:
         elif have != want:
             problems.append(f"{name} {have or 'not installed'} but requirements.lock pins {want}")
     if problems:
+        want = f"{required[0]}.{required[1]}"
         fail(
             "Python provenance mismatch for "
             f"{python} (source: {source}):\n  - "
             + "\n  - ".join(problems)
-            + "\nRebuild the environment with the pinned interpreter and "
-            f"`{python} -m pip install -r {ROOT / 'requirements.lock'}`."
+            + f"\nRebuild the environment with a Python {want} interpreter, e.g.\n"
+            f"  python{want} -m venv {ROOT / '.venv'} && "
+            f"{ROOT / '.venv' / 'bin' / 'python'} -m pip install -r "
+            f"{ROOT / 'requirements.lock'}"
         )
 
 
@@ -470,16 +473,19 @@ def build_and_install_windows(*, dry_run: bool = False) -> None:
         print_windows_plan(install_path, scope)
         return
 
+    # Verify the interpreter before anything destructive (uninstalling the
+    # current app, mutating its environment with pip): a wrong Python must
+    # fail with the old install still in place.
+    python, source = resolve_python()
+    verify_python_provenance(python, source)
+
     print("[*] Cleaning previous Windows installs...")
     cleanup_all_windows_installs()
-
-    python, source = resolve_python()
 
     print("[*] Installing requirements...")
     run_command([python, "-m", "pip", "install", "-r", ROOT / "requirements.txt"])
 
     require_pyinstaller(python, source)
-    verify_python_provenance(python, source)
 
     print("[*] Verifying hidapi import...")
     probe = subprocess.run(
