@@ -391,6 +391,17 @@ def make_fake_bundle(root: Path) -> Path:
     so.chmod(0o755)
     (app / "Contents" / "Resources").mkdir()
     (app / "Contents" / "Resources" / "icon.icns").write_text("icon")
+    # Qt plugins + Resources: a dylib each, an extension-less Mach-O helper and
+    # an executable shell script (not a Mach-O, must be skipped).
+    (app / "Contents" / "PlugIns" / "imageformats").mkdir(parents=True)
+    (app / "Contents" / "PlugIns" / "imageformats" / "libqbad.dylib").write_bytes(b"\xcf\xfa\xed\xfe")
+    (app / "Contents" / "Resources" / "libres.dylib").write_bytes(b"\xcf\xfa\xed\xfe")
+    helper = app / "Contents" / "Resources" / "mouser_helper"
+    helper.write_bytes(b"\xca\xfe\xba\xbe")
+    helper.chmod(0o755)
+    script = app / "Contents" / "Resources" / "postinstall.sh"
+    script.write_text("#!/bin/sh\n")
+    script.chmod(0o755)
     return app
 
 
@@ -426,13 +437,24 @@ class BundleSignatureWalkTests(unittest.TestCase):
                 "Contents/Frameworks/_ssl.cpython-313-darwin.so",
                 "Contents/Frameworks/libcrypto.3.dylib",
                 "Contents/MacOS/Mouser",
+                "Contents/PlugIns/imageformats/libqbad.dylib",
+                "Contents/Resources/libres.dylib",
+                "Contents/Resources/mouser_helper",
             ],
         )
 
+    def test_adhoc_plugin_or_resources_dylib_fails(self):
+        def info(p):
+            return ADHOC_INFO if p.name in ("libqbad.dylib", "libres.dylib") else SIGNED_INFO
+
+        err = self._walk_fails(info)
+        self.assertIn("Contents/PlugIns/imageformats/libqbad.dylib: Signature=adhoc", err)
+        self.assertIn("Contents/Resources/libres.dylib: Signature=adhoc", err)
+
     def test_all_signed_hardened_passes_with_summary(self):
         counts, msgs = self._walk(lambda p: SIGNED_INFO)
-        self.assertEqual(counts, {"total": 4, "apple": 4, "adhoc": 0, "hardened": 4})
-        self.assertIn("sign: total=4 apple=4 adhoc=0 hardened=4", msgs)
+        self.assertEqual(counts, {"total": 7, "apple": 7, "adhoc": 0, "hardened": 7})
+        self.assertIn("sign: total=7 apple=7 adhoc=0 hardened=7", msgs)
 
     def test_adhoc_macho_anywhere_fails(self):
         err = self._walk_fails(lambda p: ADHOC_INFO if p.name == "libcrypto.3.dylib" else SIGNED_INFO)
@@ -444,8 +466,8 @@ class BundleSignatureWalkTests(unittest.TestCase):
 
     def test_unhardened_framework_is_accepted(self):
         counts, _ = self._walk(lambda p: UNHARDENED_INFO if p.name == "QtCore" else SIGNED_INFO)
-        self.assertEqual(counts["hardened"], 3)
-        self.assertEqual(counts["apple"], 4)
+        self.assertEqual(counts["hardened"], 6)
+        self.assertEqual(counts["apple"], 7)
 
     def test_other_team_fails_and_env_overrides_expected_team(self):
         err = self._walk_fails(lambda p: OTHER_TEAM_INFO if p.name == "QtCore" else SIGNED_INFO)
@@ -467,6 +489,8 @@ class BundleSignatureWalkTests(unittest.TestCase):
         shutil_rm = __import__("shutil").rmtree
         shutil_rm(self.app / "Contents" / "MacOS")
         shutil_rm(self.app / "Contents" / "Frameworks")
+        shutil_rm(self.app / "Contents" / "PlugIns")
+        shutil_rm(self.app / "Contents" / "Resources")
         err = self._walk_fails(lambda p: SIGNED_INFO)
         self.assertIn("No Mach-O found", err)
 

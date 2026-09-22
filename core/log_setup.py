@@ -15,6 +15,12 @@ DEFAULT_LOG_LEVEL = "INFO"
 
 
 def _get_log_dir() -> str:
+    # MOUSER_LOG_DIR: test runs point this at a tmp dir (tests/support) so a
+    # suite that imports main_qml never redirects stdout into the real seat
+    # log -- deskflow's native-tap deploy gate greps that log.
+    override = os.environ.get("MOUSER_LOG_DIR", "").strip()
+    if override:
+        return override
     if sys.platform == "darwin":
         return os.path.join(os.path.expanduser("~"), "Library", "Logs", "Mouser")
     elif sys.platform == "linux":

@@ -10,6 +10,11 @@ from core import log_setup
 
 
 class GetLogDirTests(unittest.TestCase):
+    def setUp(self):
+        # tests/support points MOUSER_LOG_DIR at a tmp dir for the whole run;
+        # these cases test the per-platform defaults underneath it.
+        self.enterContext(patch.dict(os.environ, {"MOUSER_LOG_DIR": ""}))
+
     def test_darwin_returns_library_logs_mouser(self):
         with patch.object(sys, "platform", "darwin"):
             result = log_setup._get_log_dir()
@@ -67,6 +72,14 @@ class _LoggingCase(unittest.TestCase):
 
 
 class SetupLoggingTests(_LoggingCase):
+    def test_mouser_log_dir_env_overrides_the_platform_dir(self):
+        with patch.dict(os.environ, {"MOUSER_LOG_DIR": self.tmp}):
+            self.assertEqual(log_setup._get_log_dir(), self.tmp)
+            path = log_setup.setup_logging()
+        self.assertEqual(path, os.path.join(self.tmp, "mouser.log"))
+        with patch.dict(os.environ, {"MOUSER_LOG_DIR": ""}):
+            self.assertNotEqual(log_setup._get_log_dir(), self.tmp)
+
     def test_creates_log_file_on_startup(self):
         with patch.object(log_setup, "_get_log_dir", return_value=self.tmp):
             path = log_setup.setup_logging()

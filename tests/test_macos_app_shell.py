@@ -4,6 +4,7 @@ import unittest
 import ctypes
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
+import tests.support  # noqa: E402,F401  (offscreen Qt, tmp MOUSER_LOG_DIR before main_qml import)
 
 try:
     import main_qml

@@ -27,6 +27,8 @@ from pathlib import Path
 
 import pytest
 
+import tests.support  # noqa: E402,F401  (offscreen Qt + MOUSER_LOG_DIR -> tmp for the whole session)
+
 _REAL_MOUSER_APP = Path("/Applications/Mouser.app")
 
 

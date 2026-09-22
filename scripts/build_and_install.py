@@ -381,9 +381,28 @@ def expected_team_id() -> str:
     return os.environ.get("MOUSER_EXPECT_TEAM", "").strip() or DEFAULT_EXPECT_TEAM
 
 
+_MACHO_MAGICS = {
+    b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",  # MH_MAGIC / swapped
+    b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",  # MH_MAGIC_64 / swapped
+    b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",  # FAT
+}
+
+
+def is_macho(path: Path) -> bool:
+    """True when the file starts with a Mach-O / fat magic (scripts are not)."""
+    try:
+        with path.open("rb") as fh:
+            return fh.read(4) in _MACHO_MAGICS
+    except OSError:
+        return False
+
+
 def bundle_machos(app: Path) -> list[Path]:
-    """Contents/MacOS/* plus the dylibs/executables under Contents/Frameworks
-    (Resources/Headers skipped), sorted; same enumeration as fleet-health."""
+    """Every Mach-O in the bundle: Contents/MacOS/*, the dylibs/executables
+    under Contents/Frameworks (framework Resources/Headers skipped), and every
+    dylib or executable Mach-O under Contents/PlugIns (Qt platform, imageformats,
+    tls plugins) and Contents/Resources. Same enumeration as deskflow's
+    tools/fleet-health and scripts/install-macos.sh."""
     found: list[Path] = []
     macos = app / "Contents" / "MacOS"
     if macos.is_dir():
@@ -397,6 +416,14 @@ def bundle_machos(app: Path) -> list[Path]:
             if "Resources" in parts or "Headers" in parts:
                 continue
             if p.suffix == ".dylib" or os.access(p, os.X_OK):
+                found.append(p)
+    for tree in (app / "Contents" / "PlugIns", app / "Contents" / "Resources"):
+        if not tree.is_dir():
+            continue
+        for p in tree.rglob("*"):
+            if not p.is_file():
+                continue
+            if p.suffix == ".dylib" or (os.access(p, os.X_OK) and is_macho(p)):
                 found.append(p)
     return sorted(set(found))
 
