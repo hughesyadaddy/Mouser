@@ -89,6 +89,10 @@ class RemoteForwarder:
         self._decode_only = bool(decode_only)
         self._last_sent_decode = None
         self._sock = None
+        # The socket being dialled/handshaken, published under _send_lock
+        # before the hello round-trip so stop() can shut it down; _send()
+        # never uses it (nothing may be written before the hello reply).
+        self._dial_sock = None
         self._send_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._connected = False
@@ -232,6 +236,11 @@ class RemoteForwarder:
             sock = socket.create_connection((host, self._port), timeout=3)
         except OSError:
             return None
+        with self._send_lock:
+            if self._stopped.is_set():
+                sock.close()
+                return None
+            self._dial_sock = sock
         try:
             sock.sendall(json.dumps({
                 "type": "hello",
@@ -244,25 +253,35 @@ class RemoteForwarder:
             reply_line = reader.readline(MAX_LINE_BYTES)
             reply = json.loads(reply_line) if reply_line else None
             if not (isinstance(reply, dict) and reply.get("ok")):
-                print(f"[RemoteForward] bridge rejected hello: {reply!r}")
+                if not self._stopped.is_set():
+                    print(f"[RemoteForward] bridge rejected hello: {reply!r}")
                 reader.close()
-                sock.close()
+                self._close_dial_sock(sock)
                 return None
             sock.settimeout(None)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             self._reader = reader
             return sock
         except (OSError, ValueError) as exc:
-            print(f"[RemoteForward] bridge handshake failed: {exc}")
-            try:
-                sock.close()
-            except OSError:
-                pass
+            if not self._stopped.is_set():
+                print(f"[RemoteForward] bridge handshake failed: {exc}")
+            self._close_dial_sock(sock)
             return None
+
+    def _close_dial_sock(self, sock):
+        with self._send_lock:
+            if self._dial_sock is sock:
+                self._dial_sock = None
+        try:
+            sock.close()
+        except OSError:
+            pass
 
     def _session(self, sock):
         with self._send_lock:
             self._sock = sock
+            if self._dial_sock is sock:
+                self._dial_sock = None
         with self._state_lock:
             self._connected = True
         self._emit_status("Connected to KVM bridge")
@@ -333,18 +352,18 @@ class RemoteForwarder:
         """Thread-safe socket teardown; never touches the reader (owned by
         the forwarder thread)."""
         with self._send_lock:
-            sock = self._sock
+            socks = [s for s in (self._sock, self._dial_sock) if s is not None]
             self._sock = None
-        if sock is None:
-            return
-        try:
-            sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        try:
-            sock.close()
-        except OSError:
-            pass
+            self._dial_sock = None
+        for sock in socks:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     # ── status plumbing ───────────────────────────────────────────
 

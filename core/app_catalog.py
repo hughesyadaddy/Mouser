@@ -17,6 +17,7 @@ import shutil
 import posixpath
 import sys
 import threading
+import time
 from pathlib import Path
 
 if sys.platform == "win32":
@@ -331,6 +332,14 @@ WINDOWS_UNINSTALL_KEYS = [
 
 _CATALOG_LOCK = threading.Lock()
 _CATALOG_CACHE: list[dict] | None = None
+#: monotonic time of the last full catalog walk (None = never).
+_CATALOG_BUILT_AT: float | None = None
+#: ``refresh=True`` re-walks /Applications (or the registry / desktop
+#: files) at most this often. The Add-Profile picker asks for a refresh on
+#: every open; a walk costs a transient few MB and hundreds of bundle
+#: plist reads, and the installed-app set does not change per open. An
+#: explicit user rescan passes ``force=True`` to bypass the throttle.
+CATALOG_REFRESH_MIN_INTERVAL_S = 600.0
 
 
 def _dedupe_keep_order(values):
@@ -862,11 +871,23 @@ def _build_catalog():
     return []
 
 
-def get_app_catalog(refresh: bool = False):
-    global _CATALOG_CACHE
+def get_app_catalog(refresh: bool = False, *, force: bool = False):
+    """Installed-app catalog (list of entry dicts, copies).
+
+    ``refresh=True`` re-walks the platform's app locations, throttled to
+    once per ``CATALOG_REFRESH_MIN_INTERVAL_S``; ``force=True`` (explicit
+    user rescan) always re-walks.
+    """
+    global _CATALOG_CACHE, _CATALOG_BUILT_AT
     with _CATALOG_LOCK:
-        if refresh or _CATALOG_CACHE is None:
+        now = time.monotonic()
+        stale = (
+            _CATALOG_BUILT_AT is None
+            or now - _CATALOG_BUILT_AT >= CATALOG_REFRESH_MIN_INTERVAL_S
+        )
+        if _CATALOG_CACHE is None or force or (refresh and stale):
             _CATALOG_CACHE = _build_catalog()
+            _CATALOG_BUILT_AT = now
         return [dict(entry) for entry in _CATALOG_CACHE]
 
 

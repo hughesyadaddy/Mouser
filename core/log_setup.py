@@ -3,6 +3,7 @@ log_setup.py — Redirect all print() output to a rotating log file.
 
 Call setup_logging() once, early in main_qml.py, before Qt and core imports.
 """
+import collections
 import io
 import json
 import logging
@@ -12,6 +13,28 @@ import sys
 import threading
 
 DEFAULT_LOG_LEVEL = "INFO"
+
+#: After the first occurrence, a repeated Qt/QML message is logged again
+#: only every this many repeats (with its running count).
+QT_MESSAGE_REPEAT_EVERY = 100
+#: Distinct dedupe keys kept; the oldest is evicted past this.
+QT_MESSAGE_MAX_KEYS = 1000
+#: Without a source location the key is this prefix of the message text.
+QT_MESSAGE_KEY_CHARS = 120
+
+# QtMsgType -> logging level, by enum name (PySide6 exposes an IntEnum)
+# and by raw value (Qt: Debug=0, Warning=1, Critical=2, Fatal=3, Info=4).
+_QT_LEVEL_BY_NAME = {
+    "QtDebugMsg": logging.DEBUG,
+    "QtInfoMsg": logging.INFO,
+    "QtWarningMsg": logging.WARNING,
+    "QtCriticalMsg": logging.ERROR,
+    "QtFatalMsg": logging.CRITICAL,
+}
+_QT_LEVEL_BY_VALUE = {
+    0: logging.DEBUG, 1: logging.WARNING, 2: logging.ERROR,
+    3: logging.CRITICAL, 4: logging.INFO,
+}
 
 
 def _get_log_dir() -> str:
@@ -100,10 +123,106 @@ class _StreamToLogger:
         return False
 
 
-def setup_logging() -> str:
+def _qt_level(mode) -> int:
+    name = getattr(mode, "name", None)
+    if name in _QT_LEVEL_BY_NAME:
+        return _QT_LEVEL_BY_NAME[name]
+    try:
+        return _QT_LEVEL_BY_VALUE.get(int(mode), logging.WARNING)
+    except (TypeError, ValueError):
+        return logging.WARNING
+
+
+class QtMessageBridge:
+    """``qInstallMessageHandler`` target: routes Qt/QML messages into the
+    Python logger with per-message dedupe.
+
+    Without this, QML warnings (binding loops, ``TypeError: Cannot read
+    property ... of null`` on teardown, etc.) go to stderr -> launchd's
+    unrotated err.log, and a warning that fires per frame writes without
+    bound. Each distinct message text is logged on its first occurrence
+    and then every ``repeat_every``-th occurrence with its running count.
+    """
+
+    def __init__(self, logger: logging.Logger | None = None,
+                 repeat_every: int = QT_MESSAGE_REPEAT_EVERY,
+                 max_keys: int = QT_MESSAGE_MAX_KEYS):
+        self._logger = logger or logging.getLogger("qt")
+        self._repeat_every = max(1, int(repeat_every))
+        self._max_keys = max(1, int(max_keys))
+        # Bounded: keyed by (file, line) when Qt gives a source location,
+        # else by a prefix of the text (messages that embed a changing
+        # value would otherwise grow the dict without limit).
+        self._counts: "collections.OrderedDict[tuple, int]" = collections.OrderedDict()
+        self._lock = threading.Lock()
+
+    @property
+    def counts(self) -> dict:
+        with self._lock:
+            return dict(self._counts)
+
+    @staticmethod
+    def _key(context, text):
+        file = getattr(context, "file", None)
+        if file:
+            return (str(file), int(getattr(context, "line", 0) or 0))
+        return (text[:QT_MESSAGE_KEY_CHARS],)
+
+    def __call__(self, mode, context, message) -> None:
+        try:
+            text = str(message)
+            key = self._key(context, text)
+            with self._lock:
+                count = self._counts.pop(key, 0) + 1
+                self._counts[key] = count           # most recent last
+                while len(self._counts) > self._max_keys:
+                    self._counts.popitem(last=False)
+            if count != 1 and count % self._repeat_every != 0:
+                return
+            where = ""
+            file = getattr(context, "file", None)
+            if file:
+                where = f" ({file}:{getattr(context, 'line', 0)})"
+            suffix = f" [repeated x{count}]" if count > 1 else ""
+            self._logger.log(_qt_level(mode), f"[Qt] {text}{where}{suffix}")
+        except Exception:  # noqa: BLE001 - never raise into Qt
+            pass
+
+
+_QT_BRIDGE: QtMessageBridge | None = None
+
+
+def install_qt_message_handler(install=None, logger=None):
+    """Install a :class:`QtMessageBridge` via ``qInstallMessageHandler``.
+
+    ``install`` overrides the installer (tests pass a fake); by default
+    PySide6 is imported here -- lazily, never at module import, so the
+    non-Qt entry points that use this module stay Qt-free. Returns the
+    bridge, or None when PySide6 is unavailable.
+    """
+    global _QT_BRIDGE
+    if install is None:
+        try:
+            from PySide6.QtCore import qInstallMessageHandler as install
+        except Exception:  # noqa: BLE001 - ImportError or a broken Qt install
+            return None
+    bridge = QtMessageBridge(logger=logger)
+    try:
+        install(bridge)
+    except Exception:  # noqa: BLE001 - never fail startup over the bridge
+        return None
+    _QT_BRIDGE = bridge
+    return bridge
+
+
+def setup_logging(qt_messages: bool = True) -> str:
     """
     Configure rotating file log and redirect stdout to it.
     Returns the log file path. Idempotent (safe to call multiple times).
+
+    ``qt_messages`` also routes Qt/QML warnings into the same log (see
+    :class:`QtMessageBridge`); PySide6 is imported lazily for that and its
+    absence is tolerated.
 
     Only sys.stdout is redirected (all app output uses print()). sys.stderr
     is left untouched to avoid a recursion: logging handler errors call
@@ -150,5 +269,8 @@ def setup_logging() -> str:
     # StreamHandler uses sys.__stdout__ (original), not sys.stdout, so
     # redirecting sys.stdout here does not create a circular loop.
     sys.stdout = _StreamToLogger(root, logging.INFO)
+
+    if qt_messages:
+        install_qt_message_handler()
 
     return log_path

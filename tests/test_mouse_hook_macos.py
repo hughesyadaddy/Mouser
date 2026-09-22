@@ -136,6 +136,119 @@ class _MacOSHookCase(unittest.TestCase):
         return self.quartz.CGEventGetLocation.call_count
 
 
+class PassthroughGuardCountersTests(_MacOSHookCase):
+    """M5 audit R2-5: the guard's no-op path (proxy held by someone else,
+    refcount not the trampoline-only shape) used to be silent. It now
+    counts, logs once, and both outcomes are exposed via status()."""
+
+    @staticmethod
+    def _objc_named_fake():
+        fake = type("FakeProxy", (), {})
+        fake.__module__ = "objc.fake"     # _is_bridge_proxy -> True
+        return fake()
+
+    def test_no_op_counts_and_logs_once(self):
+        hook = self._hook()
+        keep = []
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(self.module, "_Py_DecRef") as decref,
+            self.assertLogs("mouser.hook", level="WARNING") as logs,
+        ):
+            for _ in range(3):
+                proxy = self._objc_named_fake()
+                keep.append(proxy)                 # extra owner: refcount != 3
+                hook._prev_passthrough = proxy
+                self.assertFalse(hook._drop_prev_passthrough())
+        decref.assert_not_called()
+        self.assertEqual(hook.passthrough_guard_skipped_total, 3)
+        self.assertEqual(hook.passthrough_released_total, 0)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("guard skipped (refcount=", logs.records[0].getMessage())
+        self.assertIn("passthrough_guard_skipped_total", logs.records[0].getMessage())
+
+    def test_release_counts(self):
+        hook = self._hook()
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(self.module, "_Py_DecRef") as decref,
+            patch.object(self.module.sys, "getrefcount",
+                         return_value=self.module._LEAKED_PASSTHROUGH_REFCOUNT),
+        ):
+            hook._prev_passthrough = self._objc_named_fake()
+            self.assertTrue(hook._drop_prev_passthrough())
+        decref.assert_called_once()
+        self.assertEqual(hook.passthrough_released_total, 1)
+        self.assertEqual(hook.passthrough_guard_skipped_total, 0)
+
+    def test_status_exposes_counters_next_to_tap_kind(self):
+        hook = self._hook()
+        hook.tap_kind = "python"
+        hook.passthrough_guard_skipped_total = 2
+        hook.passthrough_released_total = 5
+        hook.native_drop_total = 1
+        status = hook.status()
+        self.assertEqual(status["tap_kind"], "python")
+        self.assertEqual(status["passthrough_guard_skipped_total"], 2)
+        self.assertEqual(status["passthrough_released_total"], 5)
+        self.assertEqual(status["native_drop_total"], 1)
+        self.assertIn("tap_reenable_total", status)
+
+
+class DropWarnLimiterTests(_MacOSHookCase):
+    """M5 audit R2-8: the native drain thread polls every 50 ms, so a
+    saturated ring logged up to 20 warnings per second."""
+
+    def test_at_most_one_warning_per_second_with_suppressed_count(self):
+        limiter = self.module._DropWarnLimiter()
+        first = limiter.note(1, 0.0)
+        self.assertIn("dropped 1 event(s)", first)
+        self.assertNotIn("suppressed", first)
+        self.assertIsNone(limiter.note(2, 0.05))
+        self.assertIsNone(limiter.note(3, 0.95))
+        third = limiter.note(4, 1.0)
+        self.assertIn("dropped 4 event(s)", third)
+        self.assertIn("+5 dropped in 2 suppressed warning(s)", third)
+        # Counters reset after a warning is emitted.
+        self.assertIsNone(limiter.note(1, 1.5))
+        self.assertIn("+1 dropped in 1 suppressed warning(s)", limiter.note(1, 2.5))
+
+    def test_drain_loop_uses_the_limiter_and_counts_drops(self):
+        hook = self._hook()
+        drops = iter([5, 7, 7])
+        state = {"n": 0}
+
+        class Native:
+            hid_monitor_open = False
+            reenabled = 0
+            path = "fake"
+
+            @property
+            def dropped(self):
+                return state["last"]
+
+            def next_event(self, _event, _timeout):
+                state["n"] += 1
+                if state["n"] > 3:
+                    hook._running = False
+                state["last"] = next(drops, 7)
+                return False
+
+            def set_filter(self, *_a):
+                pass
+
+        hook._native = Native()
+        with (
+            patch.object(self.module.time, "monotonic", side_effect=[0.0, 0.1, 0.2, 0.3]),
+            patch.object(hook, "_push_native_filter"),
+            patch("builtins.print") as printer,
+        ):
+            hook._native_drain_worker()
+        lines = [" ".join(str(a) for a in c.args) for c in printer.call_args_list]
+        self.assertEqual(sum("ring dropped" in l for l in lines), 1)
+        self.assertEqual(hook.native_drop_total, 7)
+
+
 class MotionFastPathTests(_MacOSHookCase):
     """Pointer motion is the 1 kHz path; it must cost zero crossings unless
     the gesture engine can actually use the data."""

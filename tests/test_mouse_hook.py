@@ -489,6 +489,26 @@ class MacOSWakeRecoveryTests(unittest.TestCase):
 
         return CapturingThread
 
+    def test_wake_reconnects_the_current_listener_not_the_one_at_start(self):
+        # M5 audit R2-6: the observers used to close over the listener that
+        # existed when they were registered; attach_hid_gesture replaces it.
+        center, _ = self._register_observers()
+        old = self.listener
+        new = Mock(name="new-listener")
+        self.hook._hid_gesture = new
+        with patch.object(self.hook, "sync_hook_state"), patch("builtins.print"):
+            center.callbacks[self._SESSION_ACTIVE][1](None)
+        new.force_reconnect.assert_called_once()
+        old.force_reconnect.assert_not_called()
+
+    def test_wake_with_listener_detached_does_not_reconnect_the_old_one(self):
+        center, _ = self._register_observers()
+        old = self.listener
+        self.hook._hid_gesture = None
+        with patch.object(self.hook, "sync_hook_state"), patch("builtins.print"):
+            center.callbacks[self._SESSION_ACTIVE][1](None)
+        old.force_reconnect.assert_not_called()
+
     def test_system_and_screens_wake_coalesce_to_one_recovery_worker(self):
         center, _ = self._register_observers()
         workers = []
@@ -608,6 +628,50 @@ class MacOSWakeRecoveryTests(unittest.TestCase):
         center.callbacks[self._SESSION_ACTIVE][1](None)
 
         self.listener.force_reconnect.assert_called_once_with()
+
+
+class BaseMouseHookDebugGateTests(unittest.TestCase):
+    """M5 audit R2-7: the per-event debug f-strings (and the dispatch
+    ``format_debug_details`` call) are only built when debug_mode is on."""
+
+    def test_dispatch_skips_debug_formatting_when_debug_off(self):
+        hook = BaseMouseHook()
+        hook.set_debug_callback(Mock())
+        hook.debug_mode = False
+        with patch("core.mouse_hook_base.format_debug_details") as fmt:
+            hook._dispatch(SimpleNamespace(event_type="xbutton1_down", raw_data={"a": 1}))
+        fmt.assert_not_called()
+        hook._debug_callback.assert_not_called()
+
+    def test_dispatch_formats_when_debug_on(self):
+        hook = BaseMouseHook()
+        hook.set_debug_callback(Mock())
+        hook.debug_mode = True
+        with patch("core.mouse_hook_base.format_debug_details", return_value=" x") as fmt:
+            hook._dispatch(SimpleNamespace(event_type="xbutton1_down", raw_data={"a": 1}))
+        fmt.assert_called_once()
+        self.assertTrue(any(
+            "Dispatch xbutton1_down x" in c.args[0]
+            for c in hook._debug_callback.call_args_list))
+
+    def test_gesture_segment_debug_only_when_debug_on(self):
+        hook = BaseMouseHook()
+        hook.set_debug_callback(Mock())
+        hook.set_gesture_callback(Mock())
+        hook._gesture_direction_enabled = True
+        hook._gesture_active = True
+        hook._gesture_tracking = True
+        hook.debug_mode = False
+        with patch.object(hook, "_emit_debug", wraps=hook._emit_debug) as emit:
+            hook._accumulate_gesture_delta(3, 4, "event_tap")
+        emit.assert_not_called()
+        hook._gesture_callback.assert_not_called()
+        hook.debug_mode = True
+        hook._accumulate_gesture_delta(3, 4, "event_tap")
+        self.assertTrue(
+            any("Gesture segment" in c.args[0] for c in hook._debug_callback.call_args_list))
+        self.assertTrue(
+            any(c.args[0].get("type") == "segment" for c in hook._gesture_callback.call_args_list))
 
 
 class BaseMouseHookDispatchQueueTests(unittest.TestCase):

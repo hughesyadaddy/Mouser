@@ -405,6 +405,10 @@ class DeferredReleaseGuardSoak(unittest.TestCase):
     def _hook(self):
         hook = self.mh.MouseHook.__new__(self.mh.MouseHook)
         hook._prev_passthrough = None
+        # Guard counters normally seeded by __init__ (M5 audit R2-5).
+        hook.passthrough_released_total = 0
+        hook.passthrough_guard_skipped_total = 0
+        hook._passthrough_leak_logged = False
         hook._running = True
         hook._tap_callback_body = lambda _proxy, _type, event, _refcon: event
         return hook

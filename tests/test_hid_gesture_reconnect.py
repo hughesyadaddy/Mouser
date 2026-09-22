@@ -82,6 +82,10 @@ class _HidapiFailingConnect:
                 SimpleNamespace(device=lambda: self.fake_dev), create=True,
             ),
             patch.object(hid_gesture, "_load_last_device_cache", return_value=None),
+            # These tests call _try_connect back-to-back in real time and
+            # assert on re-enumeration; disable the 1 s scan memo (covered
+            # by VendorInfosMemoTests).
+            patch.object(hid_gesture, "VENDOR_INFOS_MEMO_S", 0.0),
             patch("builtins.print"),
         ]
         self.print_mock = None
@@ -595,6 +599,7 @@ class SharedIOHIDManagerTests(unittest.TestCase):
             patch.object(hid_gesture, "HIDAPI_OK", False),
             patch.object(hid_gesture, "_BACKEND_PREFERENCE", "iokit"),
             patch.object(hid_gesture, "_load_last_device_cache", return_value=None),
+            patch.object(hid_gesture, "VENDOR_INFOS_MEMO_S", 0.0),
             patch.object(self.listener, "_find_feature", return_value=None),
             patch("builtins.print"),
         ]
@@ -693,6 +698,405 @@ class SharedIOHIDManagerTests(unittest.TestCase):
         self.assertNotEqual(ref, self.fake.DEVICE)
         self.assertIsNone(manager.find_device(0xBEEF))
         self.assertEqual(self.fake.device_creates, 1)
+
+
+# ── M5 audit R1: read-only reconnect churn, attach generation ─────
+
+
+class ReadonlyReconnectChurnTests(unittest.TestCase):
+    """prove2 experiment B: a Deskflow read-only session whose sink returns
+    nothing dies instantly; with the attach request still queued the old
+    ``_wait_reconnect`` returned at once and the loop rebuilt the session
+    thousands of times per second."""
+
+    DECODE = {"feat_idx": 5, "gesture_cid": "0x00C3"}
+
+    def setUp(self):
+        from core.hid_deskflow_backend import reset_deskflow_sink_for_tests
+
+        reset_deskflow_sink_for_tests()
+        self.clock = _FakeClock()
+        self.connects = []
+        self.listener = hid_gesture.HidGestureListener(
+            on_connect=lambda: self.connects.append(self.clock.now))
+        self.listener._iokit_manager = None
+
+    def tearDown(self):
+        from core.hid_deskflow_backend import reset_deskflow_sink_for_tests
+
+        reset_deskflow_sink_for_tests()
+
+    def _queue_attach(self):
+        # Direct queue (request_deskflow_attach blocks on the ready event).
+        with self.listener._deskflow_control_lock:
+            self.listener._deskflow_attach = {
+                "decode": dict(self.DECODE),
+                "product_id": 0xC548,
+                "product_name": "MX Master 3S",
+            }
+            self.listener._attach_gen += 1
+
+    def test_unchanged_attach_reconnects_on_present_ladder(self):
+        listener = self.listener
+        self._queue_attach()
+        listener._running = True
+
+        def rx(_timeout_ms=1000):
+            if len(self.connects) >= 6:
+                listener._running = False
+            return None    # instant None: dead sink
+
+        with (
+            patch.object(hid_gesture, "time", self.clock),
+            patch.object(hid_gesture, "INSTANT_NONE_LIMIT", 1),
+            patch.object(listener, "_rx", side_effect=rx),
+            patch("builtins.print"),
+        ):
+            listener._run_main_loop()
+
+        gaps = [round(b - a, 3) for a, b in zip(self.connects, self.connects[1:])]
+        self.assertEqual(len(self.connects), 6)
+        self.assertGreaterEqual(min(gaps), 1.0)
+        self.assertEqual(gaps, [1.0, 2.0, 4.0, 8.0, 16.0])
+        # The request is still queued (Deskflow never withdrew it) ...
+        self.assertIsNotNone(listener._deskflow_attach)
+        # ... and nothing was enumerated in the meantime.
+        self.assertIsNone(listener._vendor_infos_memo)
+
+    def test_healthy_readonly_session_resets_ladder(self):
+        listener = self.listener
+        listener._present_backoff_s = 16.0
+        with patch("builtins.print"):
+            self.assertEqual(listener._readonly_retry_delay(True), 1.0)
+        self.assertEqual(listener._present_backoff_s, 0.0)
+        self.assertEqual(listener._readonly_retry_delay(False), 1.0)
+        self.assertEqual(listener._readonly_retry_delay(False), 2.0)
+
+    def test_wait_ignores_attach_already_acted_on(self):
+        listener = self.listener
+        self._queue_attach()
+        listener._attach_gen_seen = listener._attach_gen
+        listener._running = True
+        with patch.object(hid_gesture, "time", self.clock):
+            listener._wait_reconnect(4.0)
+        self.assertGreaterEqual(self.clock.now - 1_000_000.0, 4.0)
+
+    def test_wait_ends_early_on_new_attach_generation(self):
+        listener = self.listener
+        listener._running = True
+        listener._attach_gen_seen = listener._attach_gen
+        self._queue_attach()      # newer generation than the loop has seen
+        with patch.object(hid_gesture, "time", self.clock):
+            listener._wait_reconnect(30.0)
+        self.assertLess(self.clock.now - 1_000_000.0, 0.2)
+
+    def test_clear_attach_bumps_generation(self):
+        listener = self.listener
+        before = listener._attach_gen
+        with patch("builtins.print"):
+            listener.clear_deskflow_attach()
+        self.assertEqual(listener._attach_gen, before + 1)
+
+    def test_try_connect_records_generation(self):
+        listener = self.listener
+        self._queue_attach()
+        with (
+            patch.object(listener, "_try_connect_deskflow", return_value=True),
+            patch("builtins.print"),
+        ):
+            self.assertTrue(listener._try_connect())
+        self.assertEqual(listener._attach_gen_seen, listener._attach_gen)
+
+
+class AttachContentCompareTests(unittest.TestCase):
+    """A re-announced identical attach is a fresh dict; the reject/clear
+    path in ``_try_connect`` used to compare with ``is`` and leave it
+    queued forever."""
+
+    DECODE = {"feat_idx": 5, "gesture_cid": "0x00C3"}
+
+    def _request(self):
+        return {"decode": dict(self.DECODE), "product_id": 0xC548,
+                "product_name": "MX Master 3S"}
+
+    def test_rejected_attach_cleared_even_when_reannounced(self):
+        listener = hid_gesture.HidGestureListener()
+        listener._deskflow_attach = self._request()
+
+        def reject(_attach):
+            # Deskflow re-announces the same device mid-attempt.
+            listener._deskflow_attach = self._request()
+            return False
+
+        with (
+            patch.object(listener, "_try_connect_deskflow", side_effect=reject),
+            patch.object(listener, "_enumerate_candidates", return_value=[]),
+            patch("builtins.print"),
+        ):
+            self.assertFalse(listener._try_connect())
+        self.assertIsNone(listener._deskflow_attach)
+
+    def test_changed_attach_is_kept(self):
+        listener = hid_gesture.HidGestureListener()
+        listener._deskflow_attach = self._request()
+        newer = dict(self._request(), product_name="MX Master 4")
+
+        def reject(_attach):
+            listener._deskflow_attach = newer
+            return False
+
+        with (
+            patch.object(listener, "_try_connect_deskflow", side_effect=reject),
+            patch.object(listener, "_enumerate_candidates", return_value=[]),
+            patch("builtins.print"),
+        ):
+            self.assertFalse(listener._try_connect())
+        self.assertIs(listener._deskflow_attach, newer)
+
+    def test_request_bumps_generation_only_when_changed(self):
+        listener = hid_gesture.HidGestureListener()
+        listener._deskflow_readonly = True
+        listener._connected = True
+        with patch.object(listener, "_deskflow_attach", self._request()):
+            before = listener._attach_gen
+            self.assertTrue(listener.request_deskflow_attach(
+                dict(self.DECODE), 0xC548, "MX Master 3S"))
+            self.assertEqual(listener._attach_gen, before)
+
+
+class VendorInfosMemoTests(unittest.TestCase):
+    def setUp(self):
+        self.listener = hid_gesture.HidGestureListener()
+        self.clock = _FakeClock()
+        self.info = _candidate_info()
+        self.enumerate = Mock(return_value=[self.info])
+        self._patches = [
+            patch.object(self.listener, "_vendor_hid_infos", self.enumerate),
+            patch.object(hid_gesture, "time", self.clock),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self._patches):
+            p.stop()
+
+    def test_memoised_within_window(self):
+        for _ in range(5):
+            self.assertEqual(self.listener._enumerate_candidates(), [self.info])
+        self.assertEqual(self.enumerate.call_count, 1)
+        self.clock.sleep(0.999)
+        self.listener._enumerate_candidates()
+        self.assertEqual(self.enumerate.call_count, 1)
+        self.clock.sleep(0.002)
+        self.listener._enumerate_candidates()
+        self.assertEqual(self.enumerate.call_count, 2)
+
+    def test_pending_arrival_bypasses_memo(self):
+        self.listener._enumerate_candidates()
+        self.listener._device_arrival.set()
+        self.listener._enumerate_candidates()
+        self.assertEqual(self.enumerate.call_count, 2)
+
+    def test_arrival_and_removal_callbacks_invalidate(self):
+        self.listener._enumerate_candidates()
+        self.listener.notify_device_arrival()
+        self.listener._device_arrival.clear()
+        self.listener._enumerate_candidates()
+        self.assertEqual(self.enumerate.call_count, 2)
+        self.listener._on_candidate_set_changed()
+        self.listener._enumerate_candidates()
+        self.assertEqual(self.enumerate.call_count, 3)
+        self.listener._on_iokit_device_arrival()
+        self.listener._device_arrival.clear()
+        self.listener._enumerate_candidates()
+        self.assertEqual(self.enumerate.call_count, 4)
+
+
+@unittest.skipUnless(
+    sys.platform == "darwin" and hid_gesture._MAC_NATIVE_OK,
+    "native IOKit backend only",
+)
+class PumpNoSourcesTests(unittest.TestCase):
+    """CFRunLoopRunInMode returns kCFRunLoopRunFinished (1) immediately when
+    the mode has no sources; pump() must then sleep the interval instead of
+    letting its caller busy-spin."""
+
+    def _manager(self):
+        m = hid_gesture._MacHidManager()
+        m._manager = 1   # pretend created; _cf is faked below
+        return m
+
+    def test_finished_sleeps_remaining_interval(self):
+        m = self._manager()
+        clock = _FakeClock()
+        cf = SimpleNamespace(CFRunLoopRunInMode=Mock(return_value=1))
+        with (
+            patch.object(hid_gesture, "_cf", cf),
+            patch.object(hid_gesture, "time", clock),
+        ):
+            m.pump(0.1)
+        self.assertEqual(cf.CFRunLoopRunInMode.call_count, 1)
+        self.assertEqual(clock.sleeps, [0.1])
+
+    def _pump_with_rc(self, rc):
+        m = self._manager()
+        clock = _FakeClock()
+        cf = SimpleNamespace(CFRunLoopRunInMode=Mock(return_value=rc))
+        with (
+            patch.object(hid_gesture, "_cf", cf),
+            patch.object(hid_gesture, "time", clock),
+        ):
+            m.pump(0.1)
+        return clock.sleeps
+
+    def test_handled_source_does_not_sleep(self):
+        # 4 = kCFRunLoopRunHandledSource: a callback ran, the wait was real.
+        self.assertEqual(self._pump_with_rc(4), [])
+
+    def test_stopped_does_not_sleep(self):
+        # 2 = kCFRunLoopRunStopped (CFRunLoopStop from close()): return so
+        # the caller sees _running / the manager state, never spin-sleep.
+        self.assertEqual(self._pump_with_rc(2), [])
+
+
+class SleepingMouseFastResumeTests(unittest.TestCase):
+    """Three consecutive HID++ timeouts take ~45 s per session while the
+    mouse sleeps. Base re-ran the full enumeration + 7-slot probe on every
+    ~47 s cycle; the first batch-1 fix climbed the backoff instead and left
+    gesture input dead for up to 60 s after the wake (review wake_gap.py:
+    nothing fires a device-arrival when a sleeping mouse wakes). Now the
+    dead session's interface is re-opened directly on a flat 2 s cadence.
+    """
+
+    CANDIDATE = {"info": _candidate_info(), "dev_idx": 2}
+
+    def _wake_gap(self, sleep_sessions):
+        listener = hid_gesture.HidGestureListener()
+        clock = _FakeClock()
+        connects = []
+        state = {"asleep": True, "woke_at": None}
+
+        def on_connect():
+            connects.append(clock.now)
+            if len(connects) >= sleep_sessions + 1:
+                listener._running = False
+
+        def rx(_timeout_ms=1000):
+            if state["asleep"]:
+                clock.sleep(45.0)
+                listener._consecutive_request_timeouts = 3
+                if len(connects) >= sleep_sessions:
+                    # The mouse wakes just as this session dies.
+                    state["asleep"] = False
+                    state["woke_at"] = clock.now
+                return None
+            clock.sleep(0.2)
+            return [0x11, 0x01, 0x05, 0x00]
+
+        listener._on_connect = on_connect
+        listener._running = True
+        listener._iokit_manager = None
+        with (
+            patch.object(hid_gesture, "time", clock),
+            patch.object(listener, "_try_connect", return_value=True),
+            patch.object(listener, "_rx", side_effect=rx),
+            patch.object(listener, "_undivert"),
+            patch.object(listener, "_on_report"),
+            patch("builtins.print"),
+        ):
+            listener._run_main_loop()
+        first_after = next(c for c in connects if c >= state["woke_at"])
+        return round(first_after - state["woke_at"], 3), listener
+
+    def test_wake_reconnects_within_2s_however_long_the_mouse_slept(self):
+        for sessions in (1, 3, 6, 8):
+            gap, listener = self._wake_gap(sessions)
+            self.assertLessEqual(gap, 2.0, f"{sessions} sleeping sessions: gap {gap}s")
+            self.assertEqual(listener._reconnect_backoff_s, 0.0)
+
+    def _sleeping_loop(self, resume_ok=True, sessions=4):
+        listener = hid_gesture.HidGestureListener()
+        clock = _FakeClock()
+        connects = []
+        usb_calls = []
+        enumerations = []
+
+        def on_connect():
+            connects.append(clock.now)
+            if len(connects) >= sessions:
+                listener._running = False
+
+        def rx(_timeout_ms=1000):
+            clock.sleep(45.0)
+            listener._consecutive_request_timeouts = 3
+            return None
+
+        def enumerate_candidates():
+            enumerations.append(clock.now)
+            return [_candidate_info()]
+
+        def try_connect_usb(infos, resume_dev_idx=None):
+            usb_calls.append((len(infos), resume_dev_idx))
+            if resume_dev_idx is not None and not resume_ok:
+                return False
+            listener._session_candidate = dict(self.CANDIDATE)
+            return True
+
+        listener._on_connect = on_connect
+        listener._running = True
+        listener._iokit_manager = None
+        with (
+            patch.object(hid_gesture, "time", clock),
+            patch.object(listener, "_enumerate_candidates", side_effect=enumerate_candidates),
+            patch.object(listener, "_try_connect_usb", side_effect=try_connect_usb),
+            patch.object(listener, "_rx", side_effect=rx),
+            patch.object(listener, "_undivert"),
+            patch("builtins.print"),
+        ):
+            listener._run_main_loop()
+        gaps = [round(b - a, 3) for a, b in zip(connects, connects[1:])]
+        return gaps, usb_calls, enumerations, listener
+
+    def test_asleep_reconnects_on_cached_path_without_enumerating(self):
+        gaps, usb_calls, enumerations, listener = self._sleeping_loop()
+        # Flat 2 s cadence: 45 s session + 2 s wait, never climbing.
+        self.assertEqual(gaps, [47.0, 47.0, 47.0])
+        # One enumeration (the first connect); every reconnect went straight
+        # to the dead session's interface and probed its devIdx only.
+        self.assertEqual(len(enumerations), 1)
+        self.assertEqual(usb_calls, [(1, None), (1, 2), (1, 2), (1, 2)])
+        self.assertEqual(listener.fast_resume_total, 3)
+        self.assertEqual(listener._reconnect_backoff_s, 0.0)
+
+    def test_failed_fast_resume_escalates_and_rescans(self):
+        gaps, usb_calls, enumerations, listener = self._sleeping_loop(resume_ok=False)
+        # Resume fails -> escalate the timeout ladder -> full scan in the
+        # same attempt (which succeeds here), so each cycle costs one extra
+        # probe but still no climbing wait while the scan keeps working.
+        self.assertEqual(usb_calls[:3], [(1, None), (1, 2), (1, None)])
+        self.assertEqual(len(enumerations), 4)
+        # Three failed resumes: 2 -> 4 -> 8 s on the timeout ladder.
+        self.assertEqual(listener._reconnect_backoff_s, 8.0)
+
+    def test_escalated_ladder_governs_the_present_retry(self):
+        listener = hid_gesture.HidGestureListener()
+        listener._last_failed_scan = {"digest": "x", "keys": (), "at": 0.0}
+        listener._reconnect_backoff_s = 8.0
+        with patch("builtins.print"):
+            self.assertEqual(listener._next_retry_delay(present=True), 8.0)
+        listener._reconnect_backoff_s = 0.0
+        self.assertEqual(listener._next_retry_delay(present=True), 2.0)
+
+    def test_attach_generation_change_resets_present_ladder(self):
+        listener = hid_gesture.HidGestureListener()
+        listener._running = True
+        listener._present_backoff_s = 16.0
+        listener._attach_gen_seen = listener._attach_gen
+        listener._attach_gen += 1
+        with patch.object(hid_gesture, "time", _FakeClock()):
+            listener._wait_reconnect(30.0)
+        self.assertEqual(listener._present_backoff_s, 0.0)
 
 
 if __name__ == "__main__":

@@ -203,6 +203,68 @@ class RemoteForwarderTests(unittest.TestCase):
         ))
 
 
+class _SilentBridge:
+    """Accepts connections and never answers the hello."""
+
+    def __init__(self):
+        self.accepted = []
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(4)
+        self.port = self._listener.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        try:
+            while True:
+                conn, _ = self._listener.accept()
+                self.accepted.append(conn)
+        except OSError:
+            pass
+
+    def close(self):
+        for conn in self.accepted:
+            try:
+                conn.close()
+            except OSError:
+                pass
+        self._listener.close()
+
+
+class RemoteForwarderStopDuringHandshakeTests(unittest.TestCase):
+    """M5 audit R5-15 (fwd_timeout2.py): the dialled socket was only
+    published in _session, after the 5 s hello wait, so stop() could not
+    reach an in-flight handshake and blocked on the join."""
+
+    def setUp(self):
+        self.bridge = _SilentBridge()
+        self.forwarder = RemoteForwarder(token=TOKEN, port=self.bridge.port)
+
+    def tearDown(self):
+        self.forwarder.stop()
+        self.bridge.close()
+
+    def test_stop_interrupts_handshake_wait(self):
+        with patch("builtins.print"):
+            self.assertTrue(self.forwarder.start())
+            self.assertTrue(_wait_until(lambda: len(self.bridge.accepted) >= 1))
+            self.assertIsNotNone(self.forwarder._dial_sock)
+            started = time.monotonic()
+            self.forwarder.stop()
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 1.0, f"stop() took {elapsed:.2f}s")
+        self.assertIsNone(self.forwarder._thread)
+        self.assertIsNone(self.forwarder._dial_sock)
+        self.assertIsNone(self.forwarder._sock)
+
+    def test_dial_socket_is_not_used_for_sends(self):
+        with patch("builtins.print"):
+            self.assertTrue(self.forwarder.start())
+            self.assertTrue(_wait_until(lambda: len(self.bridge.accepted) >= 1))
+            self.assertFalse(self.forwarder.send_report("11ff"))
+
+
 class RemoteForwarderDecodeOnlyTests(unittest.TestCase):
     """HID passthrough host: publish decode context only."""
 

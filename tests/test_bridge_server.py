@@ -10,6 +10,7 @@ import socket
 import stat
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from types import SimpleNamespace
@@ -682,11 +683,35 @@ class LegacyPeerTests(_BridgeCase):
         reply = client.send({"type": "hello", "token": "bad", "version": 1})
         self.assertEqual(reply, {"ok": False, "error": "unauthorized"})
 
-    def test_silent_peer_falls_back_to_legacy_after_timeout(self):
+    def test_silent_peer_is_dropped_and_never_blocks_attach(self):
+        # M5 audit R5-13 (silent_peer.py): a peer that connects and sends
+        # nothing inside the hello window used to fall into the legacy
+        # path with an empty buffer, count as an active legacy session and
+        # block in a no-timeout recv -- every real attach got "busy" until
+        # that peer happened to close.
+        silent = self.client()
+        time.sleep(0.5)  # past hello_timeout_s without a line
+        self.assertEqual(self.server._legacy_active, 0)
         client = self.client()
-        time.sleep(0.4)  # past hello_timeout_s without a line
-        reply = client.send({"type": "hello", "token": LEGACY_TOKEN, "version": 1})
-        self.assertEqual(reply["version"], 1)
+        self.assertTrue(client.hello()["ok"])
+        reply = client.attach("s1")
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(self.server.state, ATTACHED)
+        # The silent connection was closed by the server.
+        silent.sock.settimeout(1.0)
+        self.assertEqual(silent.sock.recv(16), b"")
+
+    def test_partial_hello_peer_times_out_and_releases_legacy_slot(self):
+        # A peer that sends half a legacy hello line and stalls reaches the
+        # legacy path with a non-empty buffer; the hello read is now bounded
+        # by hello_timeout_s so the legacy slot is released.
+        stalled = self.client()
+        stalled.sock.sendall(b'{"type": "hello", "token": "')
+        self.assertTrue(_wait_until(lambda: self.server._legacy_active == 1, 1.0))
+        self.assertTrue(_wait_until(lambda: self.server._legacy_active == 0, 2.0))
+        client = self.client()
+        self.assertTrue(client.hello()["ok"])
+        self.assertTrue(client.attach("s1")["ok"])
 
     def test_legacy_peer_rejected_while_proto2_attached(self):
         self.attached_client()
@@ -694,6 +719,48 @@ class LegacyPeerTests(_BridgeCase):
         reply = legacy.send({"type": "hello", "token": LEGACY_TOKEN, "version": 1})
         self.assertEqual(reply, {"ok": False, "error": "busy"})
         self.assertEqual(self.server.state, ATTACHED)
+
+
+class ZombiePeerTests(_BridgeCase):
+    """M5 audit R5-14: a peer that pings but never reads fills its receive
+    window; the reader's pong then blocked in a no-timeout sendall holding
+    the send lock, the heartbeat thread queued behind it, and the 3-miss
+    drop could never fire."""
+
+    heartbeat_s = 0.2
+
+    def test_peer_that_never_reads_is_dropped(self):
+        original_serve = self.server._serve
+
+        def small_send_buffer_serve(conn, addr):
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+            original_serve(conn, addr)
+
+        self.server._serve = small_send_buffer_serve
+        # Receive window must be small before connect (it is advertised in
+        # the handshake); _Client connects in its constructor.
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        sock.connect(("127.0.0.1", self.server.port))
+        self.addCleanup(sock.close)
+        sock.settimeout(3)
+        sock.sendall(json.dumps({
+            "t": "hello", "proto": PROTO, "app": "deskflow-core", "ver": "2.0",
+            "pid": 4242, "role": "client", "caps": [], "token": TOKEN,
+        }).encode() + b"\n")
+        self.assertTrue(_wait_until(lambda: len(self.server._peers) == 1))
+        sock.settimeout(0.05)
+        ping = json.dumps({"t": "ping"}).encode() + b"\n"
+        deadline = time.monotonic() + 6.0
+        while self.server._peers and time.monotonic() < deadline:
+            try:
+                sock.sendall(ping)          # never reads a single byte back
+            except (socket.timeout, OSError):
+                time.sleep(0.02)
+        self.assertEqual(self.server._peers, [], "zombie peer was never dropped")
+        self.assertEqual(self.server.state, IDLE)
+        self.assertTrue(_wait_until(lambda: not any(
+            t.name == "BridgeHB" and t.is_alive() for t in threading.enumerate())))
 
 
 class ReportPlaneTests(_BridgeCase):

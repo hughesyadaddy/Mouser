@@ -340,6 +340,34 @@ class MemoryGuardTests(unittest.TestCase):
         fx.run_hours(0.2)
         self.assertGreater(len(fx.trip_lines), trips)
 
+    def test_mem_line_carries_passthrough_guard_counters_when_exposed(self):
+        # M5 audit R2-5: the macOS hook exposes the Python-tap guard
+        # counters; the [mem] line reports them (omitted when absent).
+        fx = _Fixture(footprint_mb=180.0)
+        fx.hook.passthrough_guard_skipped_total = 3
+        fx.hook.passthrough_released_total = 41
+        fx.tick()
+        self.assertEqual(fx.mem_lines, [
+            "[mem] footprint_mb=180.0 peak_mb=180.0 growth_mb_h=n/a "
+            "passthrough_guard_skipped=3 passthrough_released=41"
+        ])
+
+    def test_trip_line_notes_growing_passthrough_leaks(self):
+        fx = _Fixture(footprint_mb=1600.0)
+        fx.hook.tap_kind = "python"
+        fx.hook.passthrough_guard_skipped_total = 0
+        fx.hook.passthrough_released_total = 0
+        fx.tick()                                   # trips on footprint
+        self.assertIn(
+            "[Watchdog] trip n=1 consecutive=1 tap=python mem footprint_mb=1600 > 1500",
+            fx.logs,
+        )
+        fx.hook.passthrough_guard_skipped_total = 7        # grew since the last tick
+        fx.tick()
+        self.assertTrue(any(
+            line.startswith("[Watchdog] trip n=2 consecutive=2 tap=python passthrough_guard_skipped=+7/7 ")
+            for line in fx.logs), fx.logs)
+
     def test_mem_line_format_and_rate(self):
         fx = _Fixture(footprint_mb=180.0)
         fx.tick()

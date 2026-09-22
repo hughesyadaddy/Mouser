@@ -96,6 +96,100 @@ class SinkSurvivesReconnectTests(unittest.TestCase):
             )
 
 
+class _FlipClock:
+    """Fake ``hid_gesture.time`` with scheduled events fired from sleep()."""
+
+    def __init__(self):
+        self.now = 1_000_000.0
+        self.events = []
+
+    def time(self):
+        return self.now
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        target = self.now + seconds
+        while self.events and self.events[0][0] <= target:
+            when, fn = self.events.pop(0)
+            self.now = when
+            fn()
+        self.now = target
+
+    def at(self, when, fn):
+        self.events.append((when, fn))
+        self.events.sort(key=lambda e: e[0])
+
+
+class RoleFlipReattachTests(unittest.TestCase):
+    """Review flip_gap.py: ``clear_deskflow_attach`` used to flip
+    ``_deskflow_readonly`` before the main-loop cleanup ran, so the cleanup
+    took the dying session for a USB device and close()d the process-global
+    sink -- terminal -- and every later attach was rejected as "sink is
+    closed" until Mouser restarted. Five attach/clear/attach flips must all
+    reconnect promptly on the same sink."""
+
+    def setUp(self):
+        reset_deskflow_sink_for_tests()
+
+    def tearDown(self):
+        reset_deskflow_sink_for_tests()
+
+    def test_five_flips_reattach_within_200ms_each(self):
+        connects = []
+        listener = HidGestureListener(on_connect=lambda: connects.append(clock.now))
+        listener._iokit_manager = None
+        clock = _FlipClock()
+        requests = []
+        rejected = []
+
+        def attach():
+            requests.append(clock.now)
+            with listener._deskflow_control_lock:
+                listener._deskflow_attach = {
+                    "decode": dict(DECODE), "product_id": 0xC548, "product_name": "MX",
+                }
+                listener._attach_gen += 1
+            if listener._connected:
+                listener._reconnect_requested = True
+
+        t0 = clock.now
+        for i in range(5):
+            clock.at(t0 + 2 * i + 0.5, attach)
+            clock.at(t0 + 2 * i + 1.5, listener.clear_deskflow_attach)
+        clock.at(t0 + 13.0, lambda: setattr(listener, "_running", False))
+
+        def rx(_timeout_ms=1000):
+            clock.sleep(0.2)
+            return None
+
+        def log(*args, **_kwargs):
+            line = " ".join(str(a) for a in args)
+            if "sink is closed" in line:
+                rejected.append(line)
+
+        sink = get_deskflow_sink()
+        listener._running = True
+        with (
+            patch.object(hid_gesture, "time", clock),
+            patch.object(listener, "_rx", side_effect=rx),
+            patch.object(listener, "_vendor_hid_infos", return_value=[]),
+            patch("builtins.print", side_effect=log),
+        ):
+            listener._run_main_loop()
+
+        gaps = []
+        for requested in requests:
+            after = [c for c in connects if c >= requested]
+            gaps.append(round(after[0] - requested, 3) if after else None)
+        self.assertEqual(len(gaps), 5)
+        self.assertTrue(all(g is not None and g <= 0.2 for g in gaps), gaps)
+        self.assertEqual(rejected, [])
+        self.assertFalse(sink.closed)
+        self.assertIs(get_deskflow_sink(), sink)
+
+
 class _InstantNoneDevice:
     """A dead backend: read() returns None without waiting."""
 

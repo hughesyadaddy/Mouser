@@ -180,6 +180,28 @@ class AppDetectorMacOSTests(unittest.TestCase):
         self.addCleanup(importlib.reload, app_detector)
         return app_detector, workspace
 
+    def test_deliver_and_idle_check_run_inside_an_autorelease_pool(self):
+        # M5 audit R3-10: the detector thread has no pool of its own.
+        center = _FakeNotificationCenter()
+        module, _workspace = self._darwin_module(center)
+        entries = []
+
+        class _Pool:
+            def __enter__(self):
+                entries.append(1)
+
+            def __exit__(self, *exc):
+                return False
+
+        detector = module.AppDetector(lambda exe: None, interval=0.01)
+        with patch.object(module, "_objc", types.SimpleNamespace(autorelease_pool=_Pool)):
+            detector._deliver(None)
+            self.assertEqual(len(entries), 1)
+            with patch.object(module.AppDetector, "_read_foreground", staticmethod(lambda: None)):
+                detector._idle_check()
+        # _idle_check pools itself and calls the pooled _deliver.
+        self.assertEqual(len(entries), 3)
+
     def test_observers_registered_once_and_no_polling(self):
         center = _FakeNotificationCenter()
         module, workspace = self._darwin_module(center)

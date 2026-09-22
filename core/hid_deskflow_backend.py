@@ -102,6 +102,12 @@ def get_deskflow_sink() -> DeskflowSinkDevice:
         return _GLOBAL_SINK
 
 
+def peek_deskflow_sink() -> DeskflowSinkDevice | None:
+    """The process-global sink if one exists; never creates it."""
+    with _SINK_LOCK:
+        return _GLOBAL_SINK
+
+
 def flush_deskflow_sink():
     """Clear any queued DFHR reports in the global sink."""
     with _SINK_LOCK:

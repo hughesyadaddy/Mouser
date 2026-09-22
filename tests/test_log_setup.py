@@ -4,9 +4,133 @@ import os
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+import tests.support  # noqa: F401 - offscreen Qt before any PySide6 import
 from core import log_setup
+
+
+class QtMessageBridgeTests(unittest.TestCase):
+    """M5 audit R6: Qt/QML warnings are routed into the rotating Python log
+    with per-message dedupe (first occurrence, then every 100th)."""
+
+    def setUp(self):
+        self.logger = logging.getLogger("test.qt.bridge")
+        self.logger.propagate = False
+        self.logger.setLevel(logging.DEBUG)
+        self.records = []
+
+        class _Capture(logging.Handler):
+            def emit(handler, record):
+                self.records.append(record)
+
+        self.handler = _Capture()
+        self.logger.addHandler(self.handler)
+        self.addCleanup(self.logger.removeHandler, self.handler)
+
+    def test_install_uses_fake_installer_without_importing_pyside(self):
+        installed = []
+        with patch.dict(sys.modules, {"PySide6": None, "PySide6.QtCore": None}):
+            bridge = log_setup.install_qt_message_handler(
+                install=installed.append, logger=self.logger)
+        self.assertIsNotNone(bridge)
+        self.assertEqual(installed, [bridge])
+
+    def test_missing_pyside_is_tolerated(self):
+        with patch.dict(sys.modules, {"PySide6": None, "PySide6.QtCore": None}):
+            self.assertIsNone(log_setup.install_qt_message_handler(logger=self.logger))
+
+    def test_module_import_does_not_import_pyside(self):
+        import subprocess
+
+        code = "import sys; import core.log_setup; print('PySide6' in sys.modules)"
+        out = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        )
+        self.assertEqual(out.stdout.strip(), "False", out.stderr)
+
+    def test_first_then_every_100th_with_count(self):
+        bridge = log_setup.QtMessageBridge(logger=self.logger)
+        ctx = type("Ctx", (), {"file": "qrc:/ui/qml/MousePage.qml", "line": 42})()
+        for _ in range(250):
+            bridge(1, ctx, "Binding loop detected for property \"width\"")
+        self.assertEqual([r.levelno for r in self.records], [logging.WARNING] * 3)
+        msgs = [r.getMessage() for r in self.records]
+        self.assertIn("Binding loop detected", msgs[0])
+        self.assertIn("MousePage.qml:42", msgs[0])
+        self.assertNotIn("repeated", msgs[0])
+        self.assertIn("[repeated x100]", msgs[1])
+        self.assertIn("[repeated x200]", msgs[2])
+        self.assertEqual(bridge.counts[("qrc:/ui/qml/MousePage.qml", 42)], 250)
+
+    def test_keys_are_source_location_else_text_prefix_and_bounded(self):
+        bridge = log_setup.QtMessageBridge(logger=self.logger, max_keys=3)
+        ctx = type("Ctx", (), {"file": "A.qml", "line": 7})()
+        # Same location, changing text (an embedded value): one key.
+        for i in range(5):
+            bridge(1, ctx, f"value is {i}")
+        self.assertEqual(bridge.counts, {("A.qml", 7): 5})
+        self.assertEqual(len(self.records), 1)
+        # No location: keyed by the first QT_MESSAGE_KEY_CHARS chars.
+        long = "x" * log_setup.QT_MESSAGE_KEY_CHARS
+        bridge(1, None, long + "-1")
+        bridge(1, None, long + "-2")
+        self.assertEqual(bridge.counts[(long,)], 2)
+        # Bounded: the oldest key is evicted past max_keys.
+        bridge(1, None, "b")
+        bridge(1, None, "c")
+        self.assertEqual(len(bridge.counts), 3)
+        self.assertNotIn(("A.qml", 7), bridge.counts)
+        self.assertIn(("c",), bridge.counts)
+
+    def test_distinct_messages_dedupe_independently(self):
+        bridge = log_setup.QtMessageBridge(logger=self.logger)
+        for _ in range(5):
+            bridge(1, None, "a")
+            bridge(2, None, "b")
+        self.assertEqual([r.getMessage() for r in self.records], ["[Qt] a", "[Qt] b"])
+        self.assertEqual([r.levelno for r in self.records], [logging.WARNING, logging.ERROR])
+
+    def test_levels_by_enum_name_and_value(self):
+        class Mode:
+            def __init__(self, name):
+                self.name = name
+
+        self.assertEqual(log_setup._qt_level(Mode("QtDebugMsg")), logging.DEBUG)
+        self.assertEqual(log_setup._qt_level(Mode("QtInfoMsg")), logging.INFO)
+        self.assertEqual(log_setup._qt_level(Mode("QtCriticalMsg")), logging.ERROR)
+        self.assertEqual(log_setup._qt_level(Mode("QtFatalMsg")), logging.CRITICAL)
+        self.assertEqual(log_setup._qt_level(4), logging.INFO)
+        self.assertEqual(log_setup._qt_level(0), logging.DEBUG)
+        self.assertEqual(log_setup._qt_level("junk"), logging.WARNING)
+
+    def test_handler_never_raises_into_qt(self):
+        bad = Mock(side_effect=RuntimeError("boom"))
+        bridge = log_setup.QtMessageBridge(logger=Mock(log=bad))
+        bridge(1, None, "x")   # must not raise
+
+    def test_setup_logging_installs_bridge_when_requested(self):
+        installed = []
+        with (
+            patch.object(log_setup, "_get_log_dir", return_value=tempfile.mkdtemp()),
+            patch.object(log_setup, "install_qt_message_handler",
+                         side_effect=lambda *a, **k: installed.append(1)),
+        ):
+            saved = (sys.stdout, logging.root.handlers[:], logging.root.level)
+            logging.root.handlers.clear()
+            try:
+                log_setup.setup_logging()
+                self.assertEqual(installed, [1])
+                logging.root.handlers.clear()
+                log_setup.setup_logging(qt_messages=False)
+                self.assertEqual(installed, [1])
+            finally:
+                sys.stdout = saved[0]
+                for h in logging.root.handlers:
+                    h.close()
+                logging.root.handlers[:] = saved[1]
+                logging.root.setLevel(saved[2])
 
 
 class GetLogDirTests(unittest.TestCase):

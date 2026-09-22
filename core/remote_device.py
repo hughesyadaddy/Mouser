@@ -249,22 +249,35 @@ class RemoteDeviceServer:
                 except OSError:
                     pass
 
-    def _handle_client(self, conn, addr, initial=b""):
-        buffer, ok = self._read_hello(conn, initial)
+    def _handle_client(self, conn, addr, initial=b"", hello_timeout_s=None):
+        if hello_timeout_s is not None:
+            # Bound the hello read: without it a peer that sent a partial
+            # line and went quiet parks this thread in recv() forever.
+            conn.settimeout(hello_timeout_s)
+        try:
+            buffer, ok = self._read_hello(conn, initial)
+        except socket.timeout:
+            print(f"[RemoteDevice] no hello from {addr} within "
+                  f"{hello_timeout_s:g}s; dropping")
+            return
+        finally:
+            if hello_timeout_s is not None:
+                conn.settimeout(None)
         if not ok:
             return
         self.serve_frames(conn, addr, buffer)
 
-    def serve_connection(self, conn, addr, initial=b""):
+    def serve_connection(self, conn, addr, initial=b"", hello_timeout_s=None):
         """Run one legacy (protocol v1) session on an accepted socket.
 
         Used by :class:`core.bridge_server.BridgeServer` for peers that
         never sent a proto-2 hello. ``initial`` is whatever the caller
         already read off the socket (typically the legacy hello line).
+        ``hello_timeout_s`` bounds the wait for the rest of the hello line.
         Ends with the same ghost-device cleanup as the built-in listener.
         """
         try:
-            self._handle_client(conn, addr, initial)
+            self._handle_client(conn, addr, initial, hello_timeout_s)
         except Exception as exc:  # noqa: BLE001 - session boundary
             print(f"[RemoteDevice] client session error: {exc!r}")
         finally:
