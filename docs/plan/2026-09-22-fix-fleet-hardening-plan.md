@@ -1,6 +1,6 @@
 # fix: fleet hardening — Mouser memory, login-screen capitalization, stuck keys, single-launcher, signed deploys, settings survival
 
-> Status: APPROVED 2026-09-22 — build input for `/build`.
+> Status: BUILT 2026-09-22 — all PRs + audit batches merged on `fleet/memory-program` (deskflow 4cc0f27ce+, Mouser a679a07+); NOT deployed. QML teardown shipped opt-in (`MOUSER_QML_TEARDOWN=1`) because Qt 6.11 leaks ~12 MB per native window; hide-only measures ~154 MB hidden.
 
 ## Context
 
