@@ -97,25 +97,18 @@ BUILD_INFO_DATA = _write_build_info(APP_VERSION)
 def _native_tap_binaries():
     """Bundle the native CGEventTap callback (native/mac/mouser_tap.m).
 
-    Built here when missing or stale so a packaged app never silently ships
-    the slower Python tap; without clang the app still works on that path.
-    The dylib lands in Contents/Frameworks, where build_macos_app.sh
-    re-signs every nested dylib with the hardened runtime.
+    Built here when missing or stale. A missing dylib is a build failure
+    (SystemExit): the Python tap fallback leaks one CGEvent per event
+    through PyObjC's trampoline (docs/upstream/pyobjc-cgeventtap-leak.md),
+    so a packaged app must never ship without the native tap. The dylib
+    lands in Contents/Frameworks, where build_macos_app.sh re-signs every
+    nested dylib with the hardened runtime.
     """
-    build_py = os.path.join(ROOT, "native", "mac", "build.py")
-    dylib = os.path.join(ROOT, "native", "mac", "libmouser_tap.dylib")
-    source = os.path.join(ROOT, "native", "mac", "mouser_tap.m")
-    stale = not os.path.isfile(dylib) or (
-        os.path.isfile(source) and os.path.getmtime(dylib) < os.path.getmtime(source)
-    )
-    if stale and os.path.isfile(build_py):
-        subprocess.run([sys.executable, build_py], cwd=ROOT, check=False)
-    if not os.path.isfile(dylib):
-        print("[Mouser] native/mac/libmouser_tap.dylib not built -- "
-              "the app will use the Python event tap")
-        return []
-    print(f"[Mouser] bundling native tap: {dylib}")
-    return [(dylib, ".")]
+    if ROOT not in sys.path:
+        sys.path.insert(0, ROOT)
+    from scripts.native_tap_build import native_tap_binaries
+
+    return native_tap_binaries(ROOT)
 
 a = Analysis(
     ["main_qml.py"],
