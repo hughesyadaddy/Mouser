@@ -4,6 +4,7 @@ macOS mouse hook implementation.
 
 import ctypes
 import functools
+import logging
 import queue
 import sys
 import threading
@@ -113,6 +114,45 @@ _kCGEventTapDisabledByUserInput = 0xFFFFFFFF
 _kCFRunLoopRunFinished = 1
 
 from core.macos_iokit_scroll import LogitechScrollMonitor, SCROLL_MONITOR_AVAILABLE
+
+_log = logging.getLogger("mouser.hook")
+
+#: Minimum spacing between "ring dropped" warnings from the native drain
+#: thread. The drain polls every NATIVE_DRAIN_TIMEOUT_MS, so an overloaded
+#: ring used to log up to 20 lines per second.
+DROP_WARN_INTERVAL_S = 1.0
+
+
+class _DropWarnLimiter:
+    """At most one ring-drop warning per DROP_WARN_INTERVAL_S; drops seen
+    in between are folded into the next warning as a suppressed count."""
+
+    def __init__(self, interval_s=DROP_WARN_INTERVAL_S):
+        self._interval = interval_s
+        self._last_warned = None
+        self._suppressed_drops = 0
+        self._suppressed_warnings = 0
+
+    def note(self, dropped, now):
+        """Record ``dropped`` new drops at ``now``; return the warning line
+        to print, or None while rate-limited."""
+        if self._last_warned is not None and now - self._last_warned < self._interval:
+            self._suppressed_drops += dropped
+            self._suppressed_warnings += 1
+            return None
+        line = (
+            f"[MouseHook] native tap ring dropped {dropped} event(s) -- "
+            "drain thread fell behind"
+        )
+        if self._suppressed_warnings:
+            line += (
+                f" (+{self._suppressed_drops} dropped in "
+                f"{self._suppressed_warnings} suppressed warning(s))"
+            )
+        self._last_warned = now
+        self._suppressed_drops = 0
+        self._suppressed_warnings = 0
+        return line
 from core.native_hook_mac import (
     EVT_NONE,
     EVT_SENSE_PANEL_DOWN,
@@ -235,6 +275,16 @@ class MouseHook(BaseMouseHook):
         # held until the next callback entry so its leaked reference can be
         # released once the trampoline is provably done with it.
         self._prev_passthrough = None
+        #: Guard outcomes for the Python tap (see _drop_prev_passthrough):
+        #: proxies whose leaked reference was released, and proxies the
+        #: guard had to leave alone (refcount not the trampoline-only
+        #: shape) -- each of those is one CGEvent leaked for good. Both
+        #: are exposed by status() for the self-check watchdog.
+        self.passthrough_released_total = 0
+        self.passthrough_leaked_total = 0
+        self._passthrough_leak_logged = False
+        #: Native-tap ring drops observed by the drain thread (lifetime).
+        self.native_drop_total = 0
         self._native_drain_thread = None
         self._native_filter_state = None
         self._native_filter_lock = threading.Lock()
@@ -490,15 +540,38 @@ class MouseHook(BaseMouseHook):
         if self._prev_passthrough is None:
             return False
         released = False
-        if (
-            sys.platform == "darwin"
-            and _is_bridge_proxy(self._prev_passthrough)
-            and sys.getrefcount(self._prev_passthrough) == _LEAKED_PASSTHROUGH_REFCOUNT
-        ):
-            _Py_DecRef(self._prev_passthrough)
-            released = True
+        if sys.platform == "darwin" and _is_bridge_proxy(self._prev_passthrough):
+            refcount = sys.getrefcount(self._prev_passthrough)
+            if refcount == _LEAKED_PASSTHROUGH_REFCOUNT:
+                _Py_DecRef(self._prev_passthrough)
+                released = True
+                self.passthrough_released_total += 1
+            else:
+                # Not the trampoline-only shape: leave it alone (a leak,
+                # never a use-after-free) but count it, and say so once.
+                self.passthrough_leaked_total += 1
+                if not self._passthrough_leak_logged:
+                    self._passthrough_leak_logged = True
+                    _log.warning(
+                        "[MouseHook] pass-through guard no-op: CGEvent proxy "
+                        f"refcount={refcount} (expected "
+                        f"{_LEAKED_PASSTHROUGH_REFCOUNT}); the reference was "
+                        "left leaked. Further no-ops are counted in "
+                        "passthrough_leaked_total without logging."
+                    )
         self._prev_passthrough = None
         return released
+
+    def status(self) -> dict:
+        """Counters the self-check watchdog line reports alongside
+        ``tap_kind``. Plain ints; safe to read from any thread."""
+        return {
+            "tap_kind": self.tap_kind,
+            "passthrough_released_total": self.passthrough_released_total,
+            "passthrough_leaked_total": self.passthrough_leaked_total,
+            "tap_reenable_total": self.tap_reenable_total,
+            "native_drop_total": self.native_drop_total,
+        }
 
     def _tap_callback_body(self, proxy, event_type, cg_event, refcon):
         # The CGEventTap continues to fire briefly after ``stop()`` sets
@@ -914,7 +987,6 @@ class MouseHook(BaseMouseHook):
         except ImportError:
             return
         notification_center = NSWorkspace.sharedWorkspace().notificationCenter()
-        hg = self._hid_gesture
 
         def _re_enable_tap_and_reconnect(reason, reconnect=True):
             # macOS may have disabled the tap across sleep; converge it to
@@ -927,6 +999,10 @@ class MouseHook(BaseMouseHook):
                     f"{'enabled' if self._tap_wanted else 'idle'}",
                     flush=True,
                 )
+            # Read the listener at fire time: it is replaced on every
+            # attach_hid_gesture, and a closure over the one that existed at
+            # start() would reconnect a stopped listener instead.
+            hg = self._hid_gesture
             if hg and reconnect:
                 hg.force_reconnect()
 
@@ -1298,6 +1374,7 @@ class MouseHook(BaseMouseHook):
         event = NativeTapEvent()
         native = self._native
         dropped_seen = 0
+        drops = _DropWarnLimiter()
         reenabled_seen = 0
         monitor_warned = False
         while self._running:
@@ -1318,11 +1395,11 @@ class MouseHook(BaseMouseHook):
                 print(f"[MouseHook] native tap drain error: {exc}")
                 return
             if dropped > dropped_seen:
-                print(
-                    f"[MouseHook] native tap ring dropped {dropped - dropped_seen} "
-                    "event(s) -- drain thread fell behind"
-                )
+                self.native_drop_total += dropped - dropped_seen
+                line = drops.note(dropped - dropped_seen, time.monotonic())
                 dropped_seen = dropped
+                if line:
+                    print(line)
             if reenabled > reenabled_seen:
                 self.tap_reenable_total += reenabled - reenabled_seen
                 print(
