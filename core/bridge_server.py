@@ -552,7 +552,13 @@ class BridgeServer:
     # ── legacy (protocol 1) ───────────────────────────────────────
 
     def _serve_legacy(self, conn, addr, buffer):
-        if not buffer and self._stopped.is_set():
+        if not buffer:
+            # Nothing arrived inside the hello window (a peer that connected
+            # and went silent, or a port probe). There is no legacy hello to
+            # serve, and handing an empty buffer on would park this thread
+            # in a no-timeout recv while counting as an active legacy
+            # session -- which answered every real attach with "busy" until
+            # that peer happened to close.
             return
         with self._state_lock:
             if self._state in (ATTACHED, PAUSED):
@@ -563,7 +569,9 @@ class BridgeServer:
             self._legacy_active += 1
         try:
             print(f"[Bridge] legacy (proto 1) peer {addr}")
-            self._legacy.serve_connection(conn, addr, initial=buffer)
+            self._legacy.serve_connection(
+                conn, addr, initial=buffer, hello_timeout_s=self._hello_timeout_s
+            )
         finally:
             with self._state_lock:
                 self._legacy_active -= 1
@@ -571,6 +579,17 @@ class BridgeServer:
     # ── proto 2 ───────────────────────────────────────────────────
 
     def _serve_proto2(self, conn, addr, hello, buffer):
+        # Socket-level timeout on the proto-2 link, one heartbeat period
+        # beyond the miss limit. Sends and receives on this socket must
+        # never block indefinitely: a peer that keeps pinging but never
+        # reads fills its receive window, the reader thread's pong then
+        # blocks in sendall while holding _LockedSocket's lock, and the
+        # heartbeat thread blocks behind it -- so the 3-miss drop that
+        # would have cleared the zombie could never run. With the timeout
+        # the blocked send raises, peer.close() runs, and the reader exits.
+        # The heartbeat thread still wins the ordinary silent-peer case
+        # (it fires inside the extra period), so its log line is kept.
+        conn.settimeout(self._link_timeout_s())
         conn = _LockedSocket(conn)
         peer = _Peer(conn, addr, self._clock)
         if not self._accept_hello(peer, hello):
@@ -591,19 +610,26 @@ class BridgeServer:
             if peer.role == "server":
                 self._publish_connect(peer)
             hb.start()
-            for kind, item in read_frames(conn, addr, buffer, self._stopped):
-                peer.last_rx = self._clock()
-                if kind == "report":
-                    self._legacy._handle_binary_report(item)
-                elif item is None:
-                    peer.send({"ok": False, "error": "malformed_json"})
-                else:
-                    self._on_peer_message(peer, item)
-                if not peer.alive:
-                    break
+            try:
+                for kind, item in read_frames(conn, addr, buffer, self._stopped):
+                    peer.last_rx = self._clock()
+                    if kind == "report":
+                        self._legacy._handle_binary_report(item)
+                    elif item is None:
+                        peer.send({"ok": False, "error": "malformed_json"})
+                    else:
+                        self._on_peer_message(peer, item)
+                    if not peer.alive:
+                        break
+            except socket.timeout:
+                if not peer.quiet and self._clock() >= self._quiet_until:
+                    print(f"[Bridge] {peer.app} link timed out; dropping link")
         finally:
             peer.alive = False
             self._on_peer_gone(peer)
+
+    def _link_timeout_s(self) -> float:
+        return self._heartbeat_s * (self._heartbeat_misses + 1)
 
     def _accept_hello(self, peer, hello) -> bool:
         proto = hello.get("proto")
