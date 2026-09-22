@@ -25,7 +25,7 @@ MOUSE_PAGE_QML = (QML_DIR / "MousePage.qml").read_text(encoding="utf-8")
 HOTSPOT_QML = (QML_DIR / "HotspotDot.qml").read_text(encoding="utf-8")
 HUD_QML = (QML_DIR / "GestureHud.qml").read_text(encoding="utf-8")
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+import tests.support  # noqa: F401  - forces QT_QPA_PLATFORM=offscreen before PySide6
 
 try:
     from PySide6.QtCore import QCoreApplication, QEventLoop, QMetaObject, QObject, QTimer
