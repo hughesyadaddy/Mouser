@@ -253,7 +253,8 @@ class RemoteForwarder:
             reply_line = reader.readline(MAX_LINE_BYTES)
             reply = json.loads(reply_line) if reply_line else None
             if not (isinstance(reply, dict) and reply.get("ok")):
-                print(f"[RemoteForward] bridge rejected hello: {reply!r}")
+                if not self._stopped.is_set():
+                    print(f"[RemoteForward] bridge rejected hello: {reply!r}")
                 reader.close()
                 self._close_dial_sock(sock)
                 return None
