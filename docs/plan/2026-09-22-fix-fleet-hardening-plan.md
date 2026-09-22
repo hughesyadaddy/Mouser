@@ -180,7 +180,7 @@ Checklist per file: per-event allocations; PyObjC proxies stored beyond the call
 
 **L3. Signing**
 - `cmake/MacCodesign.cmake:20-27`: `FATAL_ERROR` unless `FLEET_ALLOW_ADHOC_DEV_BUILD=ON`; when allowed, write `${CMAKE_BINARY_DIR}/ADHOC-DEV-BUILD`. `install-macos.sh verify_signature :131-158`: refuse if the marker exists; walk every Mach-O (same find as `tools/fleet-health:255-270`); require no `Signature=adhoc`, `TeamIdentifier=${DESKFLOW_EXPECT_TEAM:-J5KPG8ZR5C}`, and `flags=…(runtime)` on `Contents/MacOS/*`. Mouser `scripts/build_and_install.py:327-330`: same walk (confirm `build_macos_app.sh` uses `--options runtime`; add entitlements if PyInstaller needs `allow-unsigned-executable-memory`).
-- Windows (user decision: keep fleet cert): `scripts/sign-windows.ps1:38` throw on `-NoTimestampOk` when `FLEET_DEPLOY=1`; `Test-SignedFiles :102` + `fleet-health.ps1 Test-Authenticode :84` require `TimeStamperCertificate` present and thumbprint `FBB49069A6C594E83714724217C7A5F54885FAEC`.
+- Windows (user decision: keep fleet cert): `scripts/sign-windows.ps1:38` throw on `-NoTimestampOk` when `FLEET_DEPLOY=1`; `Test-SignedFiles :102` + `fleet-health.ps1 Test-Authenticode :84` require `TimeStamperCertificate` present and thumbprint `FBB49069…FAEC (full thumbprint lives in scripts/fleet.env)`.
 - `fleet-deploy.sh` report (:527-533): per-seat `applecount/adhoc/hardened` columns from `fleet-health check_sign` (:548-567, add `hardened`); `ALL_OK=0` on adhoc>0 or hardened=false. hackintosh's `flags=0x0` build fails until the deploy rebuilds it (it always does).
 
 **L4. Settings-survival proof**
