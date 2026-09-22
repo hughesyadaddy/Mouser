@@ -5,6 +5,7 @@ QApplication. The scenario mirrors the harness ``window-toggle`` row: the
 main window is shown and hidden repeatedly, which flips the activation policy
 and fires the status-item / Dock-icon refresh callbacks each time.
 """
+from tests.support import offscreen  # noqa: F401  must precede any PySide6 import
 import contextlib
 import gc
 import unittest

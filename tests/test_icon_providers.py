@@ -5,6 +5,7 @@ replaced with counting fakes and ``SystemIconProvider`` gets an injected
 file-icon provider, so the tests exercise cache keys, hit/miss accounting
 and eviction rather than Qt's rasterizer.
 """
+from tests.support import offscreen  # noqa: F401  must precede any PySide6 import
 import unittest
 from unittest.mock import patch
 
