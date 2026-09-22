@@ -113,7 +113,10 @@ class _FakeNSImageFactory:
         _FakeNSImage.from_data += 1
         return image
 
-    def initWithContentsOfFile_(self, _path):
+    paths = []
+
+    def initWithContentsOfFile_(self, path):
+        type(self).paths.append(path)
         image = _FakeNSImage()
         image.size = lambda: SimpleNamespace(width=1024.0, height=1024.0)
         return image
@@ -208,6 +211,7 @@ class _StatusItemTestCase(unittest.TestCase):
         main_qml._MACOS_DOCK_ICON_NSIMAGE = None
         _FakeNSImage.instances = 0
         _FakeNSImage.from_data = 0
+        _FakeNSImageFactory.paths = []
         _FakeTarget.instances = 0
         self.renders = 0
         self.timers = []
@@ -373,7 +377,11 @@ class StatusItemOwnershipTests(_StatusItemTestCase):
 
 
 class DockIconTests(_StatusItemTestCase):
-    def test_dock_icon_is_set_once_for_repeated_same_image(self):
+    """Every ``setApplicationIconImage_`` call leaks a 32 MiB Dock tile
+    (audit R4), so the icon is set at most once per process, from the
+    .icns, and never from a frozen bundle."""
+
+    def test_dock_icon_is_set_once_from_icns_for_repeated_calls(self):
         status_bar = _FakeStatusBar()
         nsapp = _FakeNSApp(status_bar)
         with self._env(_fake_appkit(status_bar, nsapp)):
@@ -383,29 +391,48 @@ class DockIconTests(_StatusItemTestCase):
         self.assertEqual(nsapp.icon_sets, 1)
         self.assertEqual(_FakeNSImage.instances, 1)
         self.assertIs(nsapp.icon, main_qml._MACOS_DOCK_ICON_NSIMAGE)
+        self.assertEqual(len(_FakeNSImageFactory.paths), 1)
+        self.assertTrue(_FakeNSImageFactory.paths[0].endswith("AppIcon.icns"))
 
-    def test_dock_icon_is_reapplied_when_appkit_reseeds_it(self):
+    def test_dock_icon_is_never_reapplied_even_when_appkit_reseeds_it(self):
         status_bar = _FakeStatusBar()
         nsapp = _FakeNSApp(status_bar)
         with self._env(_fake_appkit(status_bar, nsapp)):
             main_qml._install_macos_dock_icon()
             nsapp.icon = object()  # AppKit re-seeded from the bundle
             main_qml._install_macos_dock_icon()
-            main_qml._install_macos_dock_icon()
+            main_qml._set_macos_activation_policy(regular=True)
+            self._drain_timers()
 
-        self.assertEqual(nsapp.icon_sets, 2)
-        self.assertIs(nsapp.icon, main_qml._MACOS_DOCK_ICON_NSIMAGE)
+        self.assertEqual(nsapp.icon_sets, 1)
 
-    def test_show_hide_storm_sets_dock_icon_once_per_promotion_at_most(self):
+    def test_dock_icon_skipped_in_frozen_bundle(self):
+        status_bar = _FakeStatusBar()
+        nsapp = _FakeNSApp(status_bar)
+        with self._env(_fake_appkit(status_bar, nsapp)):
+            with patch.object(main_qml.sys, "frozen", True, create=True):
+                main_qml._install_macos_dock_icon()
+                self._toggle_window(3)
+
+        self.assertEqual(nsapp.icon_sets, 0)
+        self.assertEqual(_FakeNSImage.instances, 0)
+        self.assertIsNone(main_qml._MACOS_DOCK_ICON_NSIMAGE)
+
+    def test_show_hide_storm_sets_dock_icon_at_most_once(self):
         status_bar = _FakeStatusBar()
         nsapp = _FakeNSApp(status_bar)
         with self._env(_fake_appkit(status_bar, nsapp)):
             main_qml._install_native_macos_status_item(_Menu(), lambda: None)
-            self._toggle_window(100)
+            main_qml._install_macos_dock_icon()  # startup
+            for _ in range(10):
+                # show_main_window + visibilityChanged + policy flip, both ways
+                main_qml._install_macos_dock_icon()
+                main_qml._set_macos_activation_policy(regular=True)
+                self._drain_timers()
+                main_qml._set_macos_activation_policy(regular=False)
+                self._drain_timers()
 
-        # The Dock never re-seeded in this fake, so the very first promotion
-        # is the only set; the 0 ms / 250 ms refresh callbacks all no-op.
-        self.assertEqual(nsapp.icon_sets, 1)
+        self.assertLessEqual(nsapp.icon_sets, 1)
         self.assertEqual(_FakeNSImage.instances, 2)  # status item + dock
 
 

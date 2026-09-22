@@ -1,4 +1,6 @@
 import QtQuick
+import QtQuick.Shapes
+import QtQuick.Window
 import "Theme.js" as Theme
 
 /*  A single clickable hotspot dot placed over the mouse image.
@@ -83,10 +85,12 @@ Item {
         Behavior on opacity { NumberAnimation { duration: 200 } }
         Behavior on border.width { NumberAnimation { duration: 150 } }
 
-        // Pulse animation when selected
+        // Pulse animation when selected. Gated on the window being on
+        // screen: a hidden window otherwise keeps the animation driver (and
+        // the render thread) ticking at 60 Hz until the engine is torn down.
         SequentialAnimation on scale {
             loops: Animation.Infinite
-            running: isSelected
+            running: isSelected && hotspot.Window.visibility !== Window.Hidden
             NumberAnimation { from: 1.0; to: 1.25; duration: 800; easing.type: Easing.InOutQuad }
             NumberAnimation { from: 1.25; to: 1.0; duration: 800; easing.type: Easing.InOutQuad }
         }
@@ -119,32 +123,25 @@ Item {
     }
 
     // ── Connecting line ───────────────────────────────────────
-    Canvas {
-        id: lineCanvas
-        anchors.fill: parent
+    // GPU geometry (Shape) rather than a Canvas: a Canvas filling the
+    // mouse area allocated a page-wide x 420 px bitmap per hotspot (4.8 MB
+    // each at DPR 2, ~29 MB for a six-hotspot layout, plus a same-size
+    // Metal texture) to draw one dashed leader line. The curve renderer
+    // gives antialiasing without a multisampled layer.
+    Shape {
         z: 0
-        onPaint: {
-            var ctx = getContext("2d")
-            ctx.clearRect(0, 0, width, height)
-            ctx.strokeStyle = isSelected ? theme.accent : Qt.rgba(0, 0.83, 0.67, 0.35)
-            ctx.lineWidth = 1
-            ctx.setLineDash([4, 3])
-            ctx.beginPath()
-            ctx.moveTo(cx, cy)
-            ctx.lineTo(lineEndX, lineEndY)
-            ctx.stroke()
-        }
+        preferredRendererType: Shape.CurveRenderer
 
-        // Repaint when position or selection changes
-        Connections {
-            target: hotspot
-            function onCxChanged() { lineCanvas.requestPaint() }
-            function onCyChanged() { lineCanvas.requestPaint() }
-            function onIsSelectedChanged() { lineCanvas.requestPaint() }
-            function onLabelXChanged() { lineCanvas.requestPaint() }
-            function onLabelYChanged() { lineCanvas.requestPaint() }
+        ShapePath {
+            strokeColor: isSelected ? theme.accent : Qt.rgba(0, 0.83, 0.67, 0.35)
+            strokeWidth: 1
+            strokeStyle: ShapePath.DashLine
+            dashPattern: [4, 3]
+            fillColor: "transparent"
+            startX: hotspot.cx
+            startY: hotspot.cy
+            PathLine { x: hotspot.lineEndX; y: hotspot.lineEndY }
         }
-        Component.onCompleted: requestPaint()
     }
 
     // ── Annotation label ──────────────────────────────────────

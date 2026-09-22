@@ -142,21 +142,6 @@ class AppIdentityTests(unittest.TestCase):
 
         app.setDesktopFileName.assert_not_called()
 
-    def test_macos_dock_icon_refresh_schedules_immediate_and_delayed_reapply(self):
-        with (
-            patch.object(main_qml.sys, "platform", "darwin"),
-            patch.object(main_qml.QTimer, "singleShot") as single_shot,
-        ):
-            main_qml._schedule_macos_dock_icon_refresh()
-
-        self.assertEqual(
-            [call.args for call in single_shot.call_args_list],
-            [
-                (0, main_qml._install_macos_dock_icon),
-                (250, main_qml._install_macos_dock_icon),
-            ],
-        )
-
 
 @unittest.skipIf(main_qml is None, "main_qml / PySide6 not available")
 class MacOSStatusItemReinstallTests(unittest.TestCase):
@@ -276,7 +261,6 @@ class MacOSStatusItemReinstallTests(unittest.TestCase):
             patch.object(main_qml.sys, "platform", "darwin"),
             patch.object(main_qml, "_macos_appkit", return_value=appkit),
             patch.object(main_qml, "_install_macos_dock_icon"),
-            patch.object(main_qml, "_schedule_macos_dock_icon_refresh"),
             patch.object(
                 main_qml.QTimer,
                 "singleShot",
@@ -324,7 +308,6 @@ class MacOSStatusItemReinstallTests(unittest.TestCase):
             patch.object(main_qml.sys, "platform", "darwin"),
             patch.object(main_qml, "_macos_appkit", return_value=appkit),
             patch.object(main_qml, "_install_macos_dock_icon") as dock_icon,
-            patch.object(main_qml, "_schedule_macos_dock_icon_refresh"),
             patch.object(
                 main_qml.QTimer,
                 "singleShot",
@@ -334,8 +317,8 @@ class MacOSStatusItemReinstallTests(unittest.TestCase):
             main_qml._set_macos_activation_policy(regular=False)
 
         self.assertEqual([delay for delay, _ in callbacks], [0, 250])
-        # The Dock icon is a promotion-only concern; only the status item needs
-        # re-installing on the way back down to .accessory.
+        # Policy flips never touch the Dock icon any more (each set leaks a
+        # 32 MiB Dock tile); only the status item needs re-installing.
         dock_icon.assert_not_called()
 
     def test_failed_initial_native_install_leaves_qt_fallback_unarmed(self):

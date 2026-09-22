@@ -12,6 +12,7 @@ _t0 = _time.perf_counter()          # ◄ startup clock
 import sys
 import os
 import signal
+import gc
 import weakref
 from collections import OrderedDict
 from urllib.parse import parse_qs, unquote
@@ -598,10 +599,14 @@ else:
 class _MacOSQuitToTrayFilter(QObject):
     """Intercept app-level quit requests and hide the window instead."""
 
-    def __init__(self, root_window, parent=None):
+    def __init__(self, root_window=None, parent=None):
         super().__init__(parent)
         self._root_window = root_window
         self._allow_quit = False
+
+    def set_window(self, root_window) -> None:
+        """Re-bind to the current main window (``None`` while torn down)."""
+        self._root_window = root_window
 
     def allow_quit(self) -> None:
         self._allow_quit = True
@@ -615,7 +620,11 @@ class _MacOSQuitToTrayFilter(QObject):
             if _macos_current_quit_is_system_session_event():
                 self.allow_quit()
                 return False
-            self._root_window.hide()
+            # A torn-down window (engine released after hide) has nothing
+            # to hide; the quit is still swallowed because the app lives in
+            # the tray.
+            if self._root_window is not None:
+                self._root_window.hide()
             if hasattr(event, "ignore"):
                 event.ignore()
             return True
@@ -657,91 +666,48 @@ def _configure_macos_app_mode():
 
 
 def _install_macos_dock_icon():
-    """Replace the Dock / Cmd+Tab / Mission Control icon with Mouser's
-    logo. Qt's ``app.setWindowIcon()`` only covers the title bar on
-    macOS, so without this override a bare ``python main_qml.py`` shows
-    the generic Python launcher icon. The decoded NSImage is cached at
-    module scope so repeated calls only re-issue the cheap
-    ``setApplicationIconImage_`` syscall.
+    """Set the Dock / Cmd+Tab icon exactly once, and only for bare-source
+    launches.
+
+    Every ``NSApp.setApplicationIconImage_`` call makes AppKit render a fresh
+    2048 px Dock tile that it never releases: a 32 MiB ``CG image`` region
+    per call (audit R4, measured +64 MB per window show/hide cycle with the
+    old refresh-on-promotion scheme -- the "3 x 32 MB CG image" bitmaps).
+    ``NSApp.applicationIconImage()`` returns a fresh copy, so the old
+    "is it already current?" guard never matched and every refresh re-set it.
+
+    Frozen bundles never call it: the Dock reads ``CFBundleIconFile``. A
+    ``python main_qml.py`` launch would otherwise show the Python rocket, so
+    it sets ``images/AppIcon.icns`` once at startup and nothing re-applies it
+    afterwards.
     """
     global _MACOS_DOCK_ICON_NSIMAGE
-    if sys.platform != "darwin":
+    if sys.platform != "darwin" or getattr(sys, "frozen", False):
+        return
+    if _MACOS_DOCK_ICON_NSIMAGE is not None:
         return
     appkit = _macos_appkit()
     if appkit is None:
         return
-    if _MACOS_DOCK_ICON_NSIMAGE is None:
-        icon_path = os.path.join(ROOT, "images", "logo_icon.png")
-        if not os.path.isfile(icon_path):
-            print(f"[Mouser] Could not load Dock icon from {icon_path}")
-            return
-        try:
-            ns_image = appkit.NSImage.alloc().initWithContentsOfFile_(icon_path)
-        except Exception as exc:
-            print(f"[Mouser] Failed to decode Dock icon {icon_path}: {exc}")
-            return
-        if ns_image is None:
-            print(f"[Mouser] Could not load Dock icon from {icon_path}")
-            return
-        # NSImage may flag the image as "template" (auto-tinted to the
-        # system colors, which strips our gradient and renders the
-        # silhouette in monochrome black/white). Force-disable template
-        # mode so the full-color PNG comes through.
-        if hasattr(ns_image, "setTemplate_"):
-            ns_image.setTemplate_(False)
-        size = ns_image.size()
-        print(
-            f"[Mouser] Dock icon loaded {icon_path} "
-            f"size={size.width:.0f}x{size.height:.0f}"
-        )
-        _MACOS_DOCK_ICON_NSIMAGE = ns_image
-    if _macos_dock_icon_is_current(appkit, _MACOS_DOCK_ICON_NSIMAGE):
+    icon_path = os.path.join(ROOT, "images", "AppIcon.icns")
+    if not os.path.isfile(icon_path):
+        print(f"[Mouser] Could not load Dock icon from {icon_path}")
         return
     try:
-        appkit.NSApp.setApplicationIconImage_(_MACOS_DOCK_ICON_NSIMAGE)
+        ns_image = appkit.NSImage.alloc().initWithContentsOfFile_(icon_path)
+    except Exception as exc:
+        print(f"[Mouser] Failed to decode Dock icon {icon_path}: {exc}")
+        return
+    if ns_image is None:
+        print(f"[Mouser] Could not load Dock icon from {icon_path}")
+        return
+    if hasattr(ns_image, "setTemplate_"):
+        ns_image.setTemplate_(False)
+    _MACOS_DOCK_ICON_NSIMAGE = ns_image
+    try:
+        appkit.NSApp.setApplicationIconImage_(ns_image)
     except Exception as exc:
         print(f"[Mouser] Failed to apply macOS Dock icon: {exc}")
-
-
-def _macos_dock_icon_is_current(appkit, ns_image) -> bool:
-    """True when ``NSApp`` already displays ``ns_image`` (pointer identity).
-
-    AppKit re-seeds the Dock tile from the bundle on a Regular promotion, so
-    the refresh callbacks cannot simply remember "already applied"; instead
-    they read the live value back and only issue ``setApplicationIconImage_``
-    when the Dock is showing something else. That makes the delayed refresh a
-    no-op in the common case instead of a fresh AppKit round-trip.
-    """
-    if ns_image is None:
-        return False
-    try:
-        current = appkit.NSApp.applicationIconImage()
-    except Exception:
-        return False
-    if current is None:
-        return False
-    if current is ns_image:
-        return True
-    try:
-        return bool(current.isEqual_(ns_image))
-    except Exception:
-        return False
-
-
-def _schedule_macos_dock_icon_refresh() -> None:
-    """Re-apply the Dock icon after AppKit has finished building the tile.
-
-    Both callbacks funnel through ``_install_macos_dock_icon``, which reads
-    the live Dock image back and skips the set when it already matches, so
-    the second (250 ms) retry costs one getter call when the first one took.
-    """
-    if sys.platform != "darwin":
-        return
-    try:
-        QTimer.singleShot(0, _install_macos_dock_icon)
-        QTimer.singleShot(250, _install_macos_dock_icon)
-    except Exception:
-        _install_macos_dock_icon()
 
 
 def _macos_native_status_item_is_attached() -> bool:
@@ -804,20 +770,15 @@ def _schedule_macos_status_item_reinstall() -> None:
 
 def _set_macos_activation_policy(regular: bool) -> None:
     """Toggle between the Regular (foreground, Dock + Cmd+Tab) and
-    Accessory (menu-bar only) policies. On a Regular promotion AppKit
-    creates the Dock tile lazily and seeds the icon from the running
-    executable's bundle, so this also re-applies the Mouser Dock icon
-    after the flip. Skips the AppKit round-trip when the requested
-    state already matches the last-applied one, which keeps rapid
-    ``visibilityChanged`` storms cheap.
+    Accessory (menu-bar only) policies. Skips the AppKit round-trip when
+    the requested state already matches the last-applied one, which keeps
+    rapid ``visibilityChanged`` storms cheap.
     """
     global _MACOS_ACTIVATION_POLICY_REGULAR
     global _MACOS_STATUS_ITEM_REINSTALL_GENERATION
     if sys.platform != "darwin":
         return
     if _MACOS_ACTIVATION_POLICY_REGULAR == regular:
-        if regular:
-            _schedule_macos_dock_icon_refresh()
         return
     appkit = _macos_appkit()
     if appkit is None:
@@ -833,9 +794,8 @@ def _set_macos_activation_policy(regular: bool) -> None:
         return
     _MACOS_ACTIVATION_POLICY_REGULAR = regular
     _MACOS_STATUS_ITEM_REINSTALL_GENERATION += 1
-    if regular:
-        _install_macos_dock_icon()
-        _schedule_macos_dock_icon_refresh()
+    # The Dock icon is deliberately NOT re-applied here: see
+    # _install_macos_dock_icon (each set leaks a 32 MiB Dock tile).
     # Re-install on BOTH directions of the flip. AppKit drops the status
     # item's menu-bar slot on the .regular -> .accessory demotion (hiding the
     # window) exactly as it does on the promotion, so handling only the
@@ -1110,11 +1070,15 @@ class UiState(QObject):
     appearanceModeChanged = Signal()
     systemAppearanceChanged = Signal()
     darkModeChanged = Signal()
+    currentPageChanged = Signal()
 
     def __init__(self, app: QApplication, parent=None):
         super().__init__(parent)
         self._app = app
         self._appearance_mode = "system"
+        # Survives the settings-window engine teardown (MainWindowHost) so a
+        # re-opened window lands on the page the user left.
+        self._current_page = 0
         self._font_family = app.font().family()
         if self._font_family in {"", "Sans Serif"}:
             if sys.platform == "darwin":
@@ -1169,13 +1133,33 @@ class UiState(QObject):
     def fontFamily(self):
         return self._font_family
 
+    @Property(int, notify=currentPageChanged)
+    def currentPage(self):
+        return self._current_page
+
+    @currentPage.setter
+    def currentPage(self, page):
+        try:
+            page = int(page)
+        except (TypeError, ValueError):
+            page = 0
+        if page == self._current_page:
+            return
+        self._current_page = page
+        self.currentPageChanged.emit()
+
+
+ICON_REQUEST_MAX_SIZE = 128
+
 
 def _icon_request_size(params, requested_size, default: int = 24) -> int:
     """Logical pixel size for an ``image://`` request.
 
-    ``size=`` in the query wins (clamped to >= 12), then the requested
-    sourceSize width, then ``default``. Pure so the providers' cache keys
-    are testable without a QApplication.
+    ``size=`` in the query wins, then the requested sourceSize width, then
+    ``default``; the result is clamped to ``12..ICON_REQUEST_MAX_SIZE`` so a
+    QML ``sourceSize`` (or a stray query) can never pin a 64 MB pixmap in
+    the providers' LRU. Pure so the cache keys are testable without a
+    QApplication.
     """
     try:
         width = requested_size.width() if requested_size is not None else 0
@@ -1184,10 +1168,10 @@ def _icon_request_size(params, requested_size, default: int = 24) -> int:
     logical_size = width if width and width > 0 else default
     if "size" in params:
         try:
-            logical_size = max(12, int(params["size"][0]))
+            logical_size = int(params["size"][0])
         except (TypeError, ValueError):
-            logical_size = max(12, logical_size)
-    return int(logical_size)
+            pass
+    return int(max(12, min(ICON_REQUEST_MAX_SIZE, logical_size)))
 
 
 def _app_icon_request_key(icon_id, requested_size):
@@ -1300,6 +1284,243 @@ class SystemIconProvider(QQuickImageProvider):
                 self._cache.put(key, pixmap)
         _set_result_size(size, logical_size)
         return pixmap
+
+
+class MainWindowHost(QObject):
+    """Owns the settings window's ``QQmlApplicationEngine`` lifecycle.
+
+    A rendered QtQuick window costs ~175 MB of resident footprint on macOS
+    and ``QWindow.hide()`` releases none of it (scene graph, texture atlas,
+    Metal drawables, JS heap all stay). Deleting the engine returns ~110 MB.
+    So the engine is created on demand (``ensure()``), lives while the window
+    is shown, and is torn down ``TEARDOWN_DELAY_MS`` after the window has
+    been hidden. ``show()`` rebuilds it transparently.
+
+    Every Python reference to a QML-owned object (engine, root window, image
+    providers) lives on this object and is dropped to ``None`` *before*
+    ``engine.deleteLater()`` so nothing outside can hold a dangling wrapper.
+    Callers must never cache the value of ``window()``; look it up each time.
+    """
+
+    TEARDOWN_DELAY_MS = 30_000
+
+    windowCreated = Signal(object)
+    windowVisibilityChanged = Signal(object)
+    windowTornDown = Signal()
+
+    def __init__(
+        self,
+        *,
+        qml_path: str,
+        context_properties: dict,
+        image_providers: "dict[str, callable] | None" = None,
+        launch_hidden: bool = False,
+        teardown_delay_ms: "int | None" = None,
+        teardown_blocked=None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._qml_path = qml_path
+        self._context_properties = dict(context_properties)
+        self._image_providers = dict(image_providers or {})
+        # Only the engine built at process start honours ``launchHidden``;
+        # every later engine exists because someone asked to see the window.
+        self._launch_hidden = bool(launch_hidden)
+        self._teardown_blocked = teardown_blocked
+        self._engine = None
+        self._window = None
+        self._providers: dict = {}
+        self._teardown_count = 0
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(
+            self.TEARDOWN_DELAY_MS if teardown_delay_ms is None
+            else int(teardown_delay_ms)
+        )
+        self._timer.timeout.connect(self._on_teardown_timer)
+
+    # ── Accessors ────────────────────────────────────────────────
+    def window(self):
+        """Current root window or ``None`` while torn down."""
+        return self._window
+
+    def engine(self):
+        return self._engine
+
+    @property
+    def teardown_count(self) -> int:
+        return self._teardown_count
+
+    def teardown_pending(self) -> bool:
+        return self._timer.isActive()
+
+    def is_visible(self) -> bool:
+        window = self._window
+        if window is None:
+            return False
+        try:
+            return window.visibility() != QWindow.Visibility.Hidden
+        except RuntimeError:
+            return False
+
+    # ── Lifecycle ────────────────────────────────────────────────
+    def ensure(self):
+        """Create the engine + window if needed; return the window."""
+        if self._engine is not None:
+            return self._window
+        engine = QQmlApplicationEngine()
+        engine.warnings.connect(self._log_qml_warnings)
+        providers = {name: factory() for name, factory in self._image_providers.items()}
+        for name, provider in providers.items():
+            engine.addImageProvider(name, provider)
+        context = engine.rootContext()
+        for name, value in self._context_properties.items():
+            context.setContextProperty(name, value)
+        context.setContextProperty("launchHidden", self._launch_hidden)
+        self._launch_hidden = False
+        engine.load(QUrl.fromLocalFile(self._qml_path))
+        roots = engine.rootObjects()
+        if not roots:
+            engine.deleteLater()
+            raise RuntimeError(f"Failed to load QML: {self._qml_path}")
+        window = roots[0]
+        self._engine = engine
+        self._window = window
+        self._providers = providers
+        self._timer.stop()
+        window.visibilityChanged.connect(self._on_visibility_changed)
+        self.windowCreated.emit(window)
+        # The window may have been created visible (QML ``visible:
+        # !launchHidden``) before the handler above was connected, so its
+        # first transition fired with no listener. Reconcile now.
+        self._on_visibility_changed(window.visibility())
+        return window
+
+    def show(self):
+        """Ensure the engine exists, then show/raise/activate the window."""
+        window = self.ensure()
+        window.show()
+        if window.visibility() == QWindow.Visibility.Minimized:
+            window.showNormal()
+        window.raise_()
+        window.requestActivate()
+        return window
+
+    def hide(self):
+        """Hide the window and arm the teardown timer."""
+        window = self._window
+        if window is not None:
+            window.hide()
+        if self._engine is not None and not self.is_visible():
+            self._timer.start()
+
+    def teardown(self, *, force: bool = False) -> bool:
+        """Delete the engine now. Returns True when it was released.
+
+        Skipped (and the timer re-armed) while the window is visible or a
+        blocking dialog / key-capture overlay is open, unless ``force``.
+        """
+        if self._engine is None:
+            return False
+        if not force:
+            if self.is_visible():
+                return False
+            if self._teardown_is_blocked():
+                self._timer.start()
+                return False
+        self._release()
+        return True
+
+    # ── Internals ────────────────────────────────────────────────
+    def _teardown_is_blocked(self) -> bool:
+        window = self._window
+        if window is not None:
+            try:
+                if bool(window.property("shortcutsBlocked")):
+                    return True
+            except RuntimeError:
+                pass
+        if self._teardown_blocked is not None:
+            try:
+                return bool(self._teardown_blocked())
+            except Exception as exc:  # noqa: BLE001
+                print(f"[Mouser] teardown guard raised: {exc}")
+                return True
+        return False
+
+    def _release(self) -> None:
+        engine = self._engine
+        window = self._window
+        self._timer.stop()
+        self._engine = None
+        self._window = None
+        self._providers = {}
+        try:
+            window.visibilityChanged.disconnect(self._on_visibility_changed)
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            engine.warnings.disconnect(self._log_qml_warnings)
+        except (RuntimeError, TypeError):
+            pass
+        self._teardown_count += 1
+        # The QQmlApplicationEngine destructor deletes its root objects (the
+        # window and everything under it). deleteLater keeps this safe even
+        # when a QML signal handler is still on the stack.
+        engine.destroyed.connect(
+            lambda *_: print("[Mouser] Settings window engine destroyed")
+        )
+        engine.deleteLater()
+        del engine, window
+        self.windowTornDown.emit()
+        gc.collect()
+        print("[Mouser] Settings window engine released")
+
+    def _on_teardown_timer(self) -> None:
+        self.teardown()
+
+    def _on_visibility_changed(self, visibility) -> None:
+        if self._engine is None:
+            return
+        if visibility == QWindow.Visibility.Hidden:
+            self._timer.start()
+        else:
+            self._timer.stop()
+        self.windowVisibilityChanged.emit(visibility)
+
+    @staticmethod
+    def _log_qml_warnings(warnings):
+        for warning in warnings:
+            print(f"[QML] {warning.toString()}")
+
+
+class GestureHudHost(QObject):
+    """Tiny always-on engine for the gesture HUD (``GestureHud.qml``).
+
+    Lives for the whole process so the HUD keeps flashing while the main
+    window engine is torn down. ``Connections { target: backend }`` in the
+    QML file keeps working because ``backend`` is a context property here.
+    """
+
+    def __init__(self, *, qml_path: str, context_properties: dict, parent=None):
+        super().__init__(parent)
+        self._engine = QQmlApplicationEngine()
+        self._engine.warnings.connect(MainWindowHost._log_qml_warnings)
+        context = self._engine.rootContext()
+        for name, value in context_properties.items():
+            context.setContextProperty(name, value)
+        self._engine.load(QUrl.fromLocalFile(qml_path))
+        roots = self._engine.rootObjects()
+        if not roots:
+            raise RuntimeError(f"Failed to load QML: {qml_path}")
+        self._window = roots[0]
+
+    def engine(self):
+        return self._engine
+
+    def window(self):
+        return self._window
+
 
 
 def _check_accessibility(locale_mgr: "LocaleManager") -> bool:
@@ -1564,34 +1785,37 @@ def main():
         set_screenshot_action_handler(screenshot_controller.request_action)
 
     # ── QML Engine ─────────────────────────────────────────────
-    qml_engine = QQmlApplicationEngine()
-
-    def _log_qml_warnings(warnings):
-        for warning in warnings:
-            print(f"[QML] {warning.toString()}")
-
-    qml_engine.warnings.connect(_log_qml_warnings)
-    qml_engine.addImageProvider("appicons", AppIconProvider(ROOT))
-    qml_engine.addImageProvider("systemicons", SystemIconProvider())
-    qml_engine.rootContext().setContextProperty("backend", backend)
-    qml_engine.rootContext().setContextProperty("uiState", ui_state)
-    qml_engine.rootContext().setContextProperty("lm", locale_mgr)
-    qml_engine.rootContext().setContextProperty("launchHidden", launch_hidden)
-    qml_engine.rootContext().setContextProperty("appVersion", APP_VERSION)
-    qml_engine.rootContext().setContextProperty("appBuildMode", APP_BUILD_MODE)
-    qml_engine.rootContext().setContextProperty("appCommit", APP_COMMIT_DISPLAY)
-    qml_engine.rootContext().setContextProperty(
-        "appLaunchPath", _runtime_launch_path().replace("\\", "/"))
-
-    qml_path = os.path.join(ROOT, "ui", "qml", "Main.qml")
-    qml_engine.load(QUrl.fromLocalFile(qml_path))
-    _t8 = _time.perf_counter()
-
-    if not qml_engine.rootObjects():
-        print("[Mouser] FATAL: Failed to load QML")
-        sys.exit(1)
-
-    root_window = qml_engine.rootObjects()[0]
+    # The settings window lives on a MainWindowHost: its engine is created
+    # here (honouring launch_hidden), torn down 30 s after the window hides,
+    # and rebuilt by show_main_window(). Never cache host.window() -- it is
+    # None while torn down. The gesture HUD sits on its own tiny engine that
+    # is never torn down so swipes keep flashing with the window closed.
+    qml_context = {
+        "backend": backend,
+        "uiState": ui_state,
+        "lm": locale_mgr,
+        "appVersion": APP_VERSION,
+        "appBuildMode": APP_BUILD_MODE,
+        "appCommit": APP_COMMIT_DISPLAY,
+        "appLaunchPath": _runtime_launch_path().replace("\\", "/"),
+    }
+    hud_host = GestureHudHost(
+        qml_path=os.path.join(ROOT, "ui", "qml", "GestureHud.qml"),
+        context_properties=qml_context,
+        parent=app,
+    )
+    app._mouser_hud_host = hud_host
+    host = MainWindowHost(
+        qml_path=os.path.join(ROOT, "ui", "qml", "Main.qml"),
+        context_properties=qml_context,
+        image_providers={
+            "appicons": lambda: AppIconProvider(ROOT),
+            "systemicons": SystemIconProvider,
+        },
+        launch_hidden=launch_hidden,
+        parent=app,
+    )
+    app._mouser_window_host = host
 
     def show_main_window():
         def _present():
@@ -1601,12 +1825,11 @@ def main():
             # transition (idempotent), so promotion is correct on the initial
             # launch path where this function is never called.
             _set_macos_activation_policy(regular=True)
-            root_window.show()
-            if root_window.visibility() == QWindow.Visibility.Minimized:
-                root_window.showNormal()
-            root_window.raise_()
-            root_window.requestActivate()
-            _schedule_macos_dock_icon_refresh()
+            try:
+                host.show()
+            except RuntimeError as exc:
+                print(f"[Mouser] FATAL: {exc}")
+                return
             _activate_macos_window()
 
         # macOS Accessory apps (start-minimized / menu-bar only) often ignore
@@ -1637,21 +1860,28 @@ def main():
             _activate_macos_window()
 
     if sys.platform == "darwin":
-        root_window.visibilityChanged.connect(_on_window_visibility_changed)
-        # The window was created visible (QML `visible: !launchHidden`) before
-        # this handler was connected, so its initial visibility transition has
-        # already fired with no listener. Reconcile the activation policy now
-        # so the Dock tile shows on a `--show-window` / non-hidden start.
-        _on_window_visibility_changed(root_window.visibility())
         global _MACOS_QUIT_FILTER
-        _MACOS_QUIT_FILTER = _MacOSQuitToTrayFilter(root_window, app)
+        _MACOS_QUIT_FILTER = _MacOSQuitToTrayFilter(None, app)
         app.installEventFilter(_MACOS_QUIT_FILTER)
+        # The host reconciles the activation policy itself right after each
+        # engine build (the window may have been created visible before the
+        # handler existed), so no manual initial call is needed here.
+        host.windowVisibilityChanged.connect(_on_window_visibility_changed)
+        host.windowCreated.connect(_MACOS_QUIT_FILTER.set_window)
+        host.windowTornDown.connect(lambda: _MACOS_QUIT_FILTER.set_window(None))
         app.commitDataRequest.connect(
             lambda *_: _allow_macos_session_quit_if_requested(_MACOS_QUIT_FILTER)
         )
         app.saveStateRequest.connect(
             lambda *_: _allow_macos_session_quit_if_requested(_MACOS_QUIT_FILTER)
         )
+
+    try:
+        host.ensure()
+    except RuntimeError as exc:
+        print(f"[Mouser] FATAL: {exc}")
+        sys.exit(1)
+    _t8 = _time.perf_counter()
 
     print(f"[Startup] QApp create:      {(_t6-_t5)*1000:7.1f} ms")
     print(f"[Startup] Engine create:    {(_t7-_t6)*1000:7.1f} ms")

@@ -93,6 +93,19 @@ class RequestParsingTests(unittest.TestCase):
             ("mouse.svg", "#000000", 16),
         )
 
+    def test_icon_request_size_is_clamped_to_max(self):
+        # A QML sourceSize / query size can never pin a display-sized
+        # pixmap in the providers' LRU (audit R4).
+        self.assertEqual(
+            main_qml._app_icon_request_key("mouse?size=4096", QSize(-1, -1)),
+            ("mouse.svg", "#000000", main_qml.ICON_REQUEST_MAX_SIZE),
+        )
+        self.assertEqual(
+            main_qml._app_icon_request_key("mouse", QSize(4096, 4096)),
+            ("mouse.svg", "#000000", main_qml.ICON_REQUEST_MAX_SIZE),
+        )
+        self.assertEqual(main_qml.ICON_REQUEST_MAX_SIZE, 128)
+
     def test_system_icon_key_decodes_path(self):
         self.assertEqual(
             main_qml._system_icon_request_key(

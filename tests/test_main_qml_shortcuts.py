@@ -18,7 +18,7 @@ class MainQmlShortcutGuardTests(unittest.TestCase):
 
     def test_hide_to_tray_shortcuts_are_window_scoped_and_gated(self):
         self.assertIn("readonly property bool shortcutsBlocked", MAIN_QML)
-        self.assertIn("mousePageView.hasBlockingDialog", MAIN_QML)
+        self.assertIn("mousePageLoader.item.hasBlockingDialog", MAIN_QML)
         self.assertEqual(MAIN_QML.count("context: Qt.WindowShortcut"), 3)
         self.assertEqual(
             MAIN_QML.count("enabled: root.visible && !root.shortcutsBlocked"),
