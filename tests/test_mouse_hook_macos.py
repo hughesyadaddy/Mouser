@@ -811,6 +811,287 @@ class ResumeRecoveryDedupeTests(_MacOSHookCase):
         hook._hid_gesture.force_reconnect.assert_called_once()
 
 
+class DeferredReleaseGuardTests(_MacOSHookCase):
+    """The Python tap's deferred-release guard (Leak A, plan M1).
+
+    PyObjC's ``m_CGEventTapCallBack`` never DECREFs the callback's return
+    value, so every ``return cg_event`` leaks the proxy. The guard releases
+    the *previous* pass-through at the next callback entry, only when the
+    refcount is exactly attr + getrefcount arg + leaked ref, and only for a
+    real PyObjC proxy. The fakes here are plain Python objects and must
+    never be touched.
+    """
+
+    def test_pass_through_is_remembered_and_cleared_next_entry(self):
+        hook = self._hook()
+        self.assertIsNone(hook._prev_passthrough)
+        result = self._fire(hook, _MOVED)
+        self.assertIs(result, self.cg_event)
+        self.assertIs(hook._prev_passthrough, self.cg_event)
+        # Next entry clears it (the fake is not a proxy: nothing released).
+        with patch.object(self.module, "_Py_DecRef") as decref:
+            self._fire(hook, _MOVED)
+        decref.assert_not_called()
+        self.assertIs(hook._prev_passthrough, self.cg_event)
+
+    def test_blocked_event_is_not_remembered(self):
+        hook = self._hook()
+        hook._prev_passthrough = None
+        with patch.object(hook, "_tap_callback_body", return_value=None):
+            self.assertIsNone(self._fire(hook, _OTHER_DOWN))
+        self.assertIsNone(hook._prev_passthrough)
+
+    def test_plain_object_is_never_decrefd_even_at_refcount_three(self):
+        """A non-proxy at the magic refcount must pass straight through:
+        the gate is the object type, not the count."""
+        import ctypes
+
+        class Plain:
+            pass
+
+        hook = self._hook()
+        hook._prev_passthrough = Plain()
+        # Simulate the leaked reference so the count is attr + arg + 1 == 3.
+        ctypes.pythonapi.Py_IncRef(ctypes.py_object(hook._prev_passthrough))
+        self.assertEqual(sys.getrefcount(hook._prev_passthrough), 3)
+        keep = hook._prev_passthrough  # observe the object after the guard
+        with patch.object(self.module, "_Py_DecRef") as decref:
+            self.assertFalse(hook._drop_prev_passthrough())
+        decref.assert_not_called()
+        self.assertIsNone(hook._prev_passthrough)
+        # keep + arg + the simulated leak: untouched.
+        self.assertEqual(sys.getrefcount(keep), 3)
+        ctypes.pythonapi.Py_DecRef(ctypes.py_object(keep))
+        self.assertEqual(sys.getrefcount(keep), 2)
+
+    def test_magicmock_and_none_are_not_proxies(self):
+        self.assertFalse(self.module._is_bridge_proxy(MagicMock()))
+        self.assertFalse(self.module._is_bridge_proxy(None))
+        self.assertFalse(self.module._is_bridge_proxy(object()))
+        self.assertFalse(self.module._is_bridge_proxy(SimpleNamespace()))
+
+    def test_stop_releases_the_last_pass_through_and_clears_tap_kind(self):
+        hook = self._hook()
+        hook.tap_kind = "python"
+        hook._prev_passthrough = self.cg_event
+        with patch.object(hook, "_unregister_wake_observer"), \
+                patch.object(hook, "_stop_hid_listener"), \
+                patch.object(hook, "_stop_tap", return_value=True):
+            hook.stop()
+        self.assertIsNone(hook._prev_passthrough)
+        self.assertIsNone(hook.tap_kind)
+
+    def test_stop_with_a_wedged_tap_thread_does_not_touch_the_event(self):
+        """A tap thread still alive after the join may be inside the
+        callback; a second check-and-decref would race it (double free)."""
+        hook = self._hook()
+        hook.tap_kind = "python"
+        hook._prev_passthrough = self.cg_event
+        with patch.object(hook, "_unregister_wake_observer"), \
+                patch.object(hook, "_stop_hid_listener"), \
+                patch.object(hook, "_stop_tap", return_value=False), \
+                patch.object(hook, "_drop_prev_passthrough") as drop, \
+                patch("builtins.print"):
+            hook.stop()
+        drop.assert_not_called()
+        self.assertIs(hook._prev_passthrough, self.cg_event)
+        self.assertIsNone(hook.tap_kind)
+
+    def test_stop_tap_reports_a_wedged_python_thread(self):
+        hook = self._hook()
+        hook._tap = None
+        hook._tap_loop = None
+        hook._native = None
+        wedged = SimpleNamespace(join=lambda timeout: None, is_alive=lambda: True)
+        hook._tap_thread = wedged
+        with patch.object(hook, "_teardown_python_tap"), patch("builtins.print"):
+            self.assertFalse(hook._stop_tap())
+        self.assertIsNone(hook._tap_thread)
+
+    def test_stop_tap_reports_a_joined_python_thread(self):
+        hook = self._hook()
+        hook._tap = None
+        hook._tap_loop = None
+        hook._native = None
+        hook._tap_thread = SimpleNamespace(join=lambda timeout: None, is_alive=lambda: False)
+        with patch.object(hook, "_teardown_python_tap"), patch("builtins.print"):
+            self.assertTrue(hook._stop_tap())
+
+    def test_stop_tap_native_is_always_safe(self):
+        hook = self._hook()
+        native = MagicMock(name="native")
+        native.stop.return_value = True
+        hook._native = native
+        hook._native_drain_thread = None
+        with patch("builtins.print"):
+            self.assertTrue(hook._stop_tap())
+
+
+@unittest.skipUnless(sys.platform == "darwin", "needs a real PyObjC CGEventRef proxy")
+class DeferredReleaseGuardRealProxyTests(unittest.TestCase):
+    """Drive the guard with real ``objc.CGEventRef`` proxies.
+
+    Proven here: a proxy holding one extra (simulated-leaked) reference is
+    released exactly once; a proxy with any other holder is left alone; ten
+    thousand round trips neither crash nor over-release. Not provable in a
+    unit test: the leak itself, which needs a live CGEventTap (Accessibility
+    grant, window-server events); the source of the trampoline is quoted in
+    ``MouseHook._drop_prev_passthrough`` and docs/upstream instead.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import objc  # noqa: F401
+            import Quartz
+        except ImportError as exc:  # pragma: no cover - CI without PyObjC
+            raise unittest.SkipTest(f"PyObjC not importable: {exc}")
+        cls.Quartz = Quartz
+        cls.module = sys.modules.get("core.mouse_hook_macos")
+        cls.loaded_here = False
+        if cls.module is None:
+            import importlib
+            cls.module = importlib.import_module("core.mouse_hook_macos")
+            cls.loaded_here = True
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.loaded_here:
+            sys.modules.pop("core.mouse_hook_macos", None)
+            if getattr(core, "mouse_hook_macos", None) is cls.module:
+                delattr(core, "mouse_hook_macos")
+
+    def _hook(self):
+        hook = self.module.MouseHook()
+        hook._running = True
+        return hook
+
+    def _new_event(self):
+        event = self.Quartz.CGEventCreate(None)
+        self.assertIsNotNone(event)
+        self.assertTrue(self.module._is_bridge_proxy(event))
+        return event
+
+    def test_fresh_proxy_refcount_baseline(self):
+        event = self._new_event()
+        # local + getrefcount arg
+        self.assertEqual(sys.getrefcount(event), 2)
+
+    def test_leaked_reference_is_released_exactly_once(self):
+        import ctypes
+
+        hook = self._hook()
+        hook._prev_passthrough = self._new_event()
+        # The trampoline's unreleased ``result`` reference, simulated.
+        ctypes.pythonapi.Py_IncRef(ctypes.py_object(hook._prev_passthrough))
+        self.assertEqual(sys.getrefcount(hook._prev_passthrough), 3)
+        self.assertTrue(hook._drop_prev_passthrough())
+        self.assertIsNone(hook._prev_passthrough)
+        # Second entry with nothing held is a no-op.
+        self.assertFalse(hook._drop_prev_passthrough())
+
+    def test_extra_holder_disables_the_guard(self):
+        import ctypes
+
+        hook = self._hook()
+        keep = [self._new_event()]
+        hook._prev_passthrough = keep[0]
+        ctypes.pythonapi.Py_IncRef(ctypes.py_object(keep[0]))
+        # list + attr + leaked + arg == 4: not the trampoline-only shape.
+        self.assertEqual(sys.getrefcount(hook._prev_passthrough), 4)
+        self.assertFalse(hook._drop_prev_passthrough())
+        self.assertIsNone(hook._prev_passthrough)
+        # list + leaked + arg: nothing was released.
+        self.assertEqual(sys.getrefcount(keep[0]), 3)
+        ctypes.pythonapi.Py_DecRef(ctypes.py_object(keep[0]))
+        self.assertEqual(sys.getrefcount(keep[0]), 2)
+
+    def test_no_leak_means_no_release(self):
+        """If upstream adds the DECREF the count is 2 and nothing happens."""
+        hook = self._hook()
+        keep = [self._new_event()]
+        hook._prev_passthrough = keep[0]
+        # list + attr + arg == 3 would trip a naive guard; drop the list
+        # ref first so the shape is attr + arg == 2.
+        held = keep.pop()
+        del held
+        self.assertEqual(sys.getrefcount(hook._prev_passthrough), 2)
+        self.assertFalse(hook._drop_prev_passthrough())
+        self.assertIsNone(hook._prev_passthrough)
+
+    def test_ten_thousand_round_trips_are_stable(self):
+        import ctypes
+
+        hook = self._hook()
+        released = 0
+        for _ in range(10_000):
+            hook._prev_passthrough = self.Quartz.CGEventCreate(None)
+            ctypes.pythonapi.Py_IncRef(ctypes.py_object(hook._prev_passthrough))
+            released += hook._drop_prev_passthrough()
+        self.assertEqual(released, 10_000)
+        self.assertIsNone(hook._prev_passthrough)
+
+
+class TapKindTests(_MacOSHookCase):
+    """``tap_kind`` and the DEGRADED log when the native tap is unavailable."""
+
+    def _start(self, hook):
+        return hook._start_tap(0, 0)
+
+    def test_native_tap_sets_native(self):
+        hook = self.module.MouseHook()
+        native = MagicMock(name="native", path="/x/libmouser_tap.dylib")
+        native.start.return_value = True
+        with patch.object(self.module.NativeTap, "load", return_value=native), \
+                patch.object(hook, "_push_native_filter"), \
+                patch.object(hook, "_native_drain_worker"), \
+                patch("builtins.print") as fake_print:
+            self.assertTrue(self._start(hook))
+        self.assertEqual(hook.tap_kind, "native")
+        msgs = [c.args[0] for c in fake_print.call_args_list if c.args]
+        self.assertFalse(any("DEGRADED" in m for m in msgs))
+
+    def test_missing_dylib_falls_back_and_logs_degraded_with_reason(self):
+        hook = self.module.MouseHook()
+        statuses = []
+        hook.set_status_callback(statuses.append)
+        with patch.object(self.module.NativeTap, "load", return_value=None), \
+                patch.object(self.module.NativeTap, "last_error", "libmouser_tap.dylib not found in ['/a']"), \
+                patch.object(hook, "_start_python_tap", return_value=True), \
+                patch("builtins.print") as fake_print:
+            self.assertTrue(self._start(hook))
+        self.assertEqual(hook.tap_kind, "python")
+        msgs = [c.args[0] for c in fake_print.call_args_list if c.args]
+        degraded = [m for m in msgs if m.startswith("[MouseHook] DEGRADED: python tap in use")]
+        self.assertEqual(len(degraded), 1)
+        self.assertIn("native tap unavailable: libmouser_tap.dylib not found", degraded[0])
+        self.assertEqual(len(statuses), 1)
+        self.assertIn("Degraded", statuses[0])
+
+    def test_native_start_failure_falls_back_with_that_reason(self):
+        hook = self.module.MouseHook()
+        native = MagicMock(name="native", path="/x/libmouser_tap.dylib")
+        native.start.return_value = False
+        with patch.object(self.module.NativeTap, "load", return_value=native), \
+                patch.object(self.module.NativeTap, "last_error", None), \
+                patch.object(hook, "_push_native_filter"), \
+                patch.object(hook, "_start_python_tap", return_value=True), \
+                patch("builtins.print") as fake_print:
+            self.assertTrue(self._start(hook))
+        self.assertEqual(hook.tap_kind, "python")
+        self.assertIsNone(hook._native)
+        msgs = [c.args[0] for c in fake_print.call_args_list if c.args]
+        self.assertTrue(any("native tap start failed (/x/libmouser_tap.dylib)" in m for m in msgs))
+
+    def test_python_tap_failure_leaves_tap_kind_unset(self):
+        hook = self.module.MouseHook()
+        with patch.object(self.module.NativeTap, "load", return_value=None), \
+                patch.object(hook, "_start_python_tap", return_value=False), \
+                patch("builtins.print"):
+            self.assertFalse(self._start(hook))
+        self.assertIsNone(hook.tap_kind)
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -124,9 +124,12 @@ class SelfWatchdog:
 
         self.trips += 1
         self.consecutive_trips += 1
+        # tap= says which CGEventTap callback is live ("python" = DEGRADED,
+        # the PyObjC trampoline path; see mouse_hook_macos.MouseHook.tap_kind).
+        tap_kind = getattr(self._mouse_hook(), "tap_kind", None) or "unknown"
         self._log(
             "[Watchdog] trip "
-            f"n={self.trips} consecutive={self.consecutive_trips} "
+            f"n={self.trips} consecutive={self.consecutive_trips} tap={tap_kind} "
             + " ".join(reasons)
         )
         if self.consecutive_trips >= 2:

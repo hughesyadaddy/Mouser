@@ -1,12 +1,21 @@
-"""Compiler selection for the native hook filter (native/win/build.py).
+"""Native hook build helpers.
 
-The DLL is optional, so this script failing must never fail a Mouser build --
-it has to report the failure and return non-zero without raising, and it has
-to find whichever of the two supported toolchains is present.
+Windows (native/win/build.py): the DLL is optional, so this script failing
+must never fail a Mouser build -- it has to report the failure and return
+non-zero without raising, and it has to find whichever of the two supported
+toolchains is present.
+
+macOS (scripts/native_tap_build.py, used by Mouser-mac.spec): the dylib is
+*not* optional -- a packaged app without it silently runs the Python
+CGEventTap callback, which leaks one CGEvent per pass-through event through
+PyObjC's trampoline. A build that cannot produce the dylib must abort.
 """
 
 import importlib.util
 import os
+import subprocess
+import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -23,6 +32,10 @@ def _load_build_module():
 
 
 build_module = _load_build_module()
+
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+from scripts import native_tap_build  # noqa: E402
 
 
 class CompilerSelectionTests(unittest.TestCase):
@@ -149,6 +162,111 @@ class RealCompileTests(unittest.TestCase):
             result.returncode, 0, f"native hook did not compile:\n{result.stderr}"
         )
         self.assertEqual(result.stderr.strip(), "")
+
+
+class NativeTapBundlingTests(unittest.TestCase):
+    """Mouser-mac.spec must refuse to package without libmouser_tap.dylib."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+        self.build_py, self.dylib, self.source = native_tap_build.native_tap_paths(
+            self.root
+        )
+        os.makedirs(os.path.dirname(self.build_py))
+        with open(self.source, "w", encoding="utf-8") as fh:
+            fh.write("// source\n")
+        with open(self.build_py, "w", encoding="utf-8") as fh:
+            fh.write("# build\n")
+        self.runs = []
+        self.logs = []
+
+    def _run_writing_dylib(self, args, **kwargs):
+        self.runs.append((args, kwargs))
+        with open(self.dylib, "wb") as fh:
+            fh.write(b"dylib")
+
+    def _run_writing_nothing(self, args, **kwargs):
+        self.runs.append((args, kwargs))
+
+    def _run_failing(self, args, **kwargs):
+        self.runs.append((args, kwargs))
+        if kwargs.get("check"):
+            raise subprocess.CalledProcessError(1, args)
+
+    def test_missing_dylib_is_built_with_check_true_and_bundled(self):
+        result = native_tap_build.native_tap_binaries(
+            self.root, run=self._run_writing_dylib, python="py", log=self.logs.append
+        )
+        self.assertEqual(result, [(self.dylib, ".")])
+        self.assertEqual(len(self.runs), 1)
+        args, kwargs = self.runs[0]
+        self.assertEqual(args, ["py", self.build_py])
+        self.assertEqual(kwargs.get("cwd"), self.root)
+        self.assertIs(kwargs.get("check"), True)
+        self.assertTrue(any("bundling native tap" in m for m in self.logs))
+
+    def test_fresh_dylib_is_not_rebuilt(self):
+        with open(self.dylib, "wb") as fh:
+            fh.write(b"dylib")
+        os.utime(self.source, (1_000_000, 1_000_000))
+        os.utime(self.dylib, (2_000_000, 2_000_000))
+        result = native_tap_build.native_tap_binaries(
+            self.root, run=self._run_writing_nothing, log=self.logs.append
+        )
+        self.assertEqual(result, [(self.dylib, ".")])
+        self.assertEqual(self.runs, [])
+
+    def test_stale_dylib_is_rebuilt(self):
+        with open(self.dylib, "wb") as fh:
+            fh.write(b"old")
+        os.utime(self.dylib, (1_000_000, 1_000_000))
+        os.utime(self.source, (2_000_000, 2_000_000))
+        native_tap_build.native_tap_binaries(
+            self.root, run=self._run_writing_dylib, log=self.logs.append
+        )
+        self.assertEqual(len(self.runs), 1)
+
+    def test_compiler_failure_aborts_the_build(self):
+        """check=True: a clang error propagates instead of shipping the
+        Python tap with a warning."""
+        with self.assertRaises(subprocess.CalledProcessError):
+            native_tap_build.native_tap_binaries(
+                self.root, run=self._run_failing, log=self.logs.append
+            )
+        self.assertEqual(self.logs, [])
+
+    def test_missing_dylib_after_build_is_a_systemexit_not_a_warning(self):
+        with self.assertRaises(SystemExit) as ctx:
+            native_tap_build.native_tap_binaries(
+                self.root, run=self._run_writing_nothing, log=self.logs.append
+            )
+        message = str(ctx.exception)
+        self.assertIn(self.dylib, message)
+        self.assertIn("Python", message)
+        self.assertIn("leak", message)
+        self.assertEqual(self.logs, [])
+
+    def test_missing_build_script_is_a_systemexit(self):
+        os.remove(self.build_py)
+        with self.assertRaises(SystemExit):
+            native_tap_build.native_tap_binaries(
+                self.root, run=self._run_writing_nothing, log=self.logs.append
+            )
+        self.assertEqual(self.runs, [])
+
+    def test_spec_helper_delegates_to_the_script(self):
+        """Mouser-mac.spec must call the shared helper (no private copy with
+        check=False can creep back in)."""
+        with open(os.path.join(REPO_ROOT, "Mouser-mac.spec"), encoding="utf-8") as fh:
+            spec = fh.read()
+        start = spec.index("def _native_tap_binaries():")
+        end = spec.index("a = Analysis(")
+        helper = spec[start:end]
+        self.assertIn("from scripts.native_tap_build import native_tap_binaries", helper)
+        self.assertNotIn("check=False", helper)
+        self.assertNotIn("subprocess.run", helper)
 
 
 if __name__ == "__main__":

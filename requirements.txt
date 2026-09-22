@@ -2,6 +2,6 @@ pyinstaller>=6.0
 hidapi>=0.14
 PySide6>=6.6
 Pillow>=10.0
-pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"
-pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
+pyobjc-framework-Quartz==12.1; sys_platform == "darwin"
+pyobjc-framework-Cocoa==12.1; sys_platform == "darwin"
 evdev>=1.6; sys_platform == "linux"

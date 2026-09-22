@@ -1,0 +1,24 @@
+# Frozen from the macbookpro .venv on 2026-09-22 (Python 3.13.2).
+# Install with: python -m pip install -r requirements.lock
+# scripts/build_and_install.py verify_python_provenance checks pyobjc-core and
+# PySide6 against this file and the interpreter minor against .python-version.
+altgraph==0.17.5
+hidapi==0.15.0
+iniconfig==2.3.0
+macholib==1.16.4
+numpy==2.4.4
+packaging==26.2
+pillow==12.2.0
+pluggy==1.6.0
+Pygments==2.20.0
+pyinstaller==6.20.0
+pyinstaller-hooks-contrib==2026.5
+pyobjc-core==12.1
+pyobjc-framework-Cocoa==12.1
+pyobjc-framework-Quartz==12.1
+PySide6==6.11.0
+PySide6_Addons==6.11.0
+PySide6_Essentials==6.11.0
+pytest==9.0.3
+setuptools==82.0.1
+shiboken6==6.11.0
