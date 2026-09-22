@@ -1,7 +1,9 @@
 import contextlib
 import importlib
 import os
+import plistlib
 import sys
+import tempfile
 import threading
 import types
 import unittest
@@ -15,15 +17,26 @@ from core import app_detector
 # ----------------------------------------------------------------------
 
 class _FakeRunningApp:
-    def __init__(self, bundle_id=None, exe_path=None, name=None):
+    """NSRunningApplication stand-in. Only processIdentifier() may be read;
+    every LaunchServices-backed accessor counts a call (must stay 0)."""
+
+    ls_calls = 0
+
+    def __init__(self, pid, bundle_id=None, exe_path=None, name=None):
+        self._pid = pid
         self._bundle_id = bundle_id
         self._exe_path = exe_path
         self._name = name
 
+    def processIdentifier(self):
+        return self._pid
+
     def bundleIdentifier(self):
+        _FakeRunningApp.ls_calls += 1
         return self._bundle_id
 
     def executableURL(self):
+        _FakeRunningApp.ls_calls += 1
         if self._exe_path is None:
             return None
         url = MagicMock()
@@ -31,6 +44,7 @@ class _FakeRunningApp:
         return url
 
     def localizedName(self):
+        _FakeRunningApp.ls_calls += 1
         return self._name
 
 
@@ -66,9 +80,8 @@ class _FakeNotificationCenter:
 
 
 class _FakeWorkspace:
-    def __init__(self, center, frontmost):
+    def __init__(self, center):
         self._center = center
-        self.frontmost = frontmost
         self.frontmost_calls = 0
 
     def notificationCenter(self):
@@ -76,7 +89,7 @@ class _FakeWorkspace:
 
     def frontmostApplication(self):
         self.frontmost_calls += 1
-        return self.frontmost
+        return None
 
 
 def _fake_objc_module():
@@ -105,9 +118,57 @@ class _Collector:
         return len(self.seen) >= count
 
 
+_ACTIVATE = "NSWorkspaceDidActivateApplicationNotification"
+_TERMINATE = "NSWorkspaceDidTerminateApplicationNotification"
+
+
 class AppDetectorMacOSTests(unittest.TestCase):
-    def _darwin_module(self, center, frontmost):
-        workspace = _FakeWorkspace(center, frontmost)
+    """macOS detector: pid in, identifier out, zero LaunchServices calls."""
+
+    def setUp(self):
+        _FakeRunningApp.ls_calls = 0
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        # pid -> executable path, standing in for proc_pidpath.
+        self.paths = {}
+        self.focused = [None]  # what focused_pid() returns
+        self.focused_calls = 0
+        self.resolve_calls = 0
+        self.frontmost_module = importlib.import_module("core.macos_frontmost")
+        self.frontmost_module.clear_cache()
+        self.addCleanup(self.frontmost_module.clear_cache)
+        real_resolve = self.frontmost_module._resolve_bundle_id
+
+        def counted_resolve(path):
+            self.resolve_calls += 1
+            return real_resolve(path)
+
+        def focused_pid():
+            self.focused_calls += 1
+            return self.focused[0]
+
+        self.enterContext(patch.object(self.frontmost_module, "focused_pid", focused_pid))
+        self.enterContext(patch.object(self.frontmost_module, "_proc_pidpath", self.paths.get))
+        self.enterContext(patch.object(self.frontmost_module, "_resolve_bundle_id", counted_resolve))
+
+    def _app(self, pid, name, bundle_id=None):
+        """Register a fake process: a .app bundle when bundle_id is given,
+        else a bare executable."""
+        if bundle_id:
+            app = os.path.join(self.tmp.name, f"{name}.app")
+            os.makedirs(os.path.join(app, "Contents", "MacOS"), exist_ok=True)
+            with open(os.path.join(app, "Contents", "Info.plist"), "wb") as fh:
+                plistlib.dump({"CFBundleIdentifier": bundle_id}, fh)
+            path = os.path.join(app, "Contents", "MacOS", name)
+        else:
+            path = os.path.join(self.tmp.name, name)
+        with open(path, "wb") as fh:
+            fh.write(b"bin")
+        self.paths[pid] = path
+        return _FakeRunningApp(pid, bundle_id=bundle_id, exe_path=path, name=name)
+
+    def _darwin_module(self, center):
+        workspace = _FakeWorkspace(center)
         appkit = types.ModuleType("AppKit")
         appkit.NSWorkspace = MagicMock()
         appkit.NSWorkspace.sharedWorkspace.return_value = workspace
@@ -119,11 +180,11 @@ class AppDetectorMacOSTests(unittest.TestCase):
         self.addCleanup(importlib.reload, app_detector)
         return app_detector, workspace
 
-    def test_observer_registered_once_and_no_polling(self):
+    def test_observers_registered_once_and_no_polling(self):
         center = _FakeNotificationCenter()
-        module, workspace = self._darwin_module(
-            center, _FakeRunningApp(bundle_id="com.apple.Finder")
-        )
+        module, workspace = self._darwin_module(center)
+        self._app(100, "Finder", "com.apple.Finder")
+        self.focused[0] = 100
         collector = _Collector()
         detector = module.AppDetector(collector, interval=0.01)
 
@@ -132,95 +193,153 @@ class AppDetectorMacOSTests(unittest.TestCase):
         self.assertTrue(collector.wait(1))
         self.assertEqual(collector.seen, ["com.apple.Finder"])
 
-        # Steady state: no further frontmostApplication() reads.
+        # Steady state: one AX read at start, no LaunchServices at all.
         threading.Event().wait(0.15)
-        self.assertEqual(workspace.frontmost_calls, 1)
-        self.assertEqual(len(center.add_calls), 1)
-        self.assertEqual(
-            center.add_calls[0][0], "NSWorkspaceDidActivateApplicationNotification"
-        )
+        self.assertEqual(self.focused_calls, 1)
+        self.assertEqual(workspace.frontmost_calls, 0)
+        self.assertEqual(_FakeRunningApp.ls_calls, 0)
+        names = [c[0] for c in center.add_calls]
+        self.assertEqual(names, [_ACTIVATE, _TERMINATE])
         self.assertEqual(center.add_calls[0][1:3], (None, None))
 
-        # A second start() while running must not register a second observer.
+        # A second start() while running must not register again.
         detector.start()
-        self.assertEqual(len(center.add_calls), 1)
+        self.assertEqual(len(center.add_calls), 2)
 
-    def test_notification_fires_callback_with_same_payload(self):
+    def test_notification_pid_resolves_to_bundle_id_or_basename(self):
         center = _FakeNotificationCenter()
-        module, workspace = self._darwin_module(
-            center, _FakeRunningApp(bundle_id="com.apple.Finder")
-        )
+        module, workspace = self._darwin_module(center)
+        self._app(100, "Finder", "com.apple.Finder")
+        self.focused[0] = 100
         collector = _Collector()
         detector = module.AppDetector(collector)
         detector.start()
         self.addCleanup(detector.stop)
         self.assertTrue(collector.wait(1))
 
-        center.post(
-            "NSWorkspaceDidActivateApplicationNotification",
-            _FakeRunningApp(bundle_id="com.google.Chrome"),
-        )
+        center.post(_ACTIVATE, self._app(200, "Chrome", "com.google.Chrome"))
         self.assertTrue(collector.wait(2))
-        # Same identifier rules as get_foreground_exe(): bundle id, else exe
-        # basename, else localized name.
-        center.post(
-            "NSWorkspaceDidActivateApplicationNotification",
-            _FakeRunningApp(exe_path="/Applications/X.app/Contents/MacOS/xbin"),
-        )
+        # No bundle: executable basename.
+        center.post(_ACTIVATE, self._app(300, "xbin"))
         self.assertTrue(collector.wait(3))
-        center.post(
-            "NSWorkspaceDidActivateApplicationNotification",
-            _FakeRunningApp(name="Nameless"),
-        )
-        self.assertTrue(collector.wait(4))
-        # Re-activation of the same app is deduplicated.
-        center.post(
-            "NSWorkspaceDidActivateApplicationNotification",
-            _FakeRunningApp(name="Nameless"),
-        )
+        # Re-activation of the same pid is deduplicated before resolution.
+        resolves = self.resolve_calls
+        center.post(_ACTIVATE, _FakeRunningApp(300))
         threading.Event().wait(0.05)
 
-        self.assertEqual(
-            collector.seen,
-            ["com.apple.Finder", "com.google.Chrome", "xbin", "Nameless"],
-        )
-        # Callbacks are delivered from the detector thread, not the poster.
+        self.assertEqual(collector.seen, ["com.apple.Finder", "com.google.Chrome", "xbin"])
+        self.assertEqual(self.resolve_calls, resolves)
         self.assertTrue(all(t == "AppDetector" for t in collector.threads))
-        self.assertEqual(workspace.frontmost_calls, 1)
+        self.assertEqual(workspace.frontmost_calls, 0)
+        self.assertEqual(_FakeRunningApp.ls_calls, 0)
 
-    def test_notification_without_app_is_ignored(self):
+    def test_notification_without_app_or_pid_is_ignored(self):
         center = _FakeNotificationCenter()
-        module, _ = self._darwin_module(center, _FakeRunningApp(bundle_id="a.b"))
+        module, _ = self._darwin_module(center)
+        self._app(100, "a", "a.b")
+        self.focused[0] = 100
         collector = _Collector()
         detector = module.AppDetector(collector)
         detector.start()
         self.addCleanup(detector.stop)
         self.assertTrue(collector.wait(1))
 
-        center.post("NSWorkspaceDidActivateApplicationNotification", None)
+        center.post(_ACTIVATE, None)
+        center.post(_ACTIVATE, _FakeRunningApp(0))
+        center.post(_ACTIVATE, _FakeRunningApp(999))  # unknown pid: no path
         threading.Event().wait(0.05)
         self.assertEqual(collector.seen, ["a.b"])
 
-    def test_stop_removes_observer(self):
+    def test_terminate_notification_evicts_the_cache(self):
         center = _FakeNotificationCenter()
-        module, _ = self._darwin_module(center, _FakeRunningApp(bundle_id="a.b"))
+        module, _ = self._darwin_module(center)
+        app = self._app(100, "a", "a.b")
+        self.focused[0] = 100
         detector = module.AppDetector(_Collector())
         detector.start()
-        token = center.add_calls[0][3]
+        self.addCleanup(detector.stop)
+        threading.Event().wait(0.05)
+        self.assertEqual(self.frontmost_module.cache_size(), 1)
+
+        center.post(_TERMINATE, app)
+        self.assertEqual(self.frontmost_module.cache_size(), 0)
+        self.assertEqual(_FakeRunningApp.ls_calls, 0)
+
+    def test_stop_removes_both_observers(self):
+        center = _FakeNotificationCenter()
+        module, _ = self._darwin_module(center)
+        detector = module.AppDetector(_Collector())
+        detector.start()
+        tokens = [c[3] for c in center.add_calls]
 
         detector.stop()
 
-        self.assertEqual(center.remove_calls, [token])
+        self.assertEqual(sorted(center.remove_calls), sorted(tokens))
         self.assertFalse(detector._thread.is_alive())
         # Idempotent: a second stop() must not remove twice.
         detector.stop()
-        self.assertEqual(center.remove_calls, [token])
+        self.assertEqual(len(center.remove_calls), 2)
+
+    def test_idle_watchdog_is_an_ax_pid_compare(self):
+        """The 30 s watchdog only re-reads the pid; it resolves nothing
+        unless the observer missed a switch."""
+        center = _FakeNotificationCenter()
+        module, workspace = self._darwin_module(center)
+        self._app(100, "a", "a.b")
+        self._app(200, "b", "b.c")
+        self.focused[0] = 100
+        collector = _Collector()
+        detector = module.AppDetector(collector)
+        detector._idle_check()
+        self.assertEqual(collector.seen, ["a.b"])
+        resolves = self.resolve_calls
+        for _ in range(50):
+            detector._idle_check()
+        self.assertEqual(self.resolve_calls, resolves)
+        # A missed switch is caught by the watchdog.
+        self.focused[0] = 200
+        detector._idle_check()
+        self.assertEqual(collector.seen, ["a.b", "b.c"])
+        self.assertEqual(workspace.frontmost_calls, 0)
+        self.assertEqual(_FakeRunningApp.ls_calls, 0)
+        self.assertEqual(module.FALLBACK_POLL_INTERVAL, 30.0)
+
+    def test_soak_no_launchservices_calls_and_bounded_resolution(self):
+        """10 000 idle ticks + 1 000 activations over 5 pids: zero
+        bundleIdentifier()/frontmostApplication() calls, <= 5 resolutions."""
+        center = _FakeNotificationCenter()
+        module, workspace = self._darwin_module(center)
+        apps = [self._app(100 + i, f"app{i}", f"com.example.app{i}") for i in range(5)]
+        self.focused[0] = 100
+        collector = _Collector()
+        detector = module.AppDetector(collector)
+        detector.start()
+        self.addCleanup(detector.stop)
+        self.assertTrue(collector.wait(1))
+
+        for i in range(1_000):
+            center.post(_ACTIVATE, apps[i % 5])
+        for i in range(10_000):
+            self.focused[0] = 100 + (i % 5)
+            detector._idle_check()
+        # Drain the activation queue.
+        for _ in range(200):
+            if detector._events.empty():
+                break
+            threading.Event().wait(0.01)
+        threading.Event().wait(0.05)
+
+        self.assertEqual(workspace.frontmost_calls, 0)
+        self.assertEqual(_FakeRunningApp.ls_calls, 0)
+        self.assertLessEqual(self.resolve_calls, 5)
+        self.assertLessEqual(self.frontmost_module.cache_size(), 5)
+        self.assertEqual(set(collector.seen), {f"com.example.app{i}" for i in range(5)})
 
     def test_fallback_poll_when_observer_install_raises(self):
         center = _FakeNotificationCenter(fail_add=True)
-        module, workspace = self._darwin_module(
-            center, _FakeRunningApp(bundle_id="a.b")
-        )
+        module, workspace = self._darwin_module(center)
+        self._app(100, "a", "a.b")
+        self.focused[0] = 100
         collector = _Collector()
         detector = module.AppDetector(collector, interval=0.01)
 
@@ -232,7 +351,8 @@ class AppDetectorMacOSTests(unittest.TestCase):
             threading.Event().wait(0.1)
 
         self.assertEqual(collector.seen, ["a.b"])
-        self.assertGreaterEqual(workspace.frontmost_calls, 2)
+        self.assertGreaterEqual(self.focused_calls, 2)
+        self.assertEqual(workspace.frontmost_calls, 0)
         self.assertEqual(center.remove_calls, [])
         # Logged exactly once.
         msgs = [c.args[0] for c in fake_print.call_args_list if c.args]
@@ -242,16 +362,26 @@ class AppDetectorMacOSTests(unittest.TestCase):
 
     def test_fallback_uses_slow_interval_not_caller_interval(self):
         center = _FakeNotificationCenter(fail_add=True)
-        module, workspace = self._darwin_module(
-            center, _FakeRunningApp(bundle_id="a.b")
-        )
+        module, _ = self._darwin_module(center)
+        self._app(100, "a", "a.b")
+        self.focused[0] = 100
         detector = module.AppDetector(_Collector(), interval=0.001)
         with patch("builtins.print"):
             detector.start()
         self.addCleanup(detector.stop)
         threading.Event().wait(0.1)
-        # At 5 s fallback only the initial read happens within 100 ms.
-        self.assertEqual(workspace.frontmost_calls, 1)
+        # At the 30 s fallback only the initial read happens within 100 ms.
+        self.assertEqual(self.focused_calls, 1)
+
+    def test_get_foreground_exe_uses_ax_pid_and_resolver(self):
+        center = _FakeNotificationCenter()
+        module, workspace = self._darwin_module(center)
+        self._app(100, "Finder", "com.apple.Finder")
+        self.focused[0] = 100
+        self.assertEqual(module.get_foreground_exe(), "com.apple.Finder")
+        self.focused[0] = None
+        self.assertIsNone(module.get_foreground_exe())
+        self.assertEqual(workspace.frontmost_calls, 0)
 
 
 class AppDetectorPollingPlatformTests(unittest.TestCase):

@@ -2,8 +2,12 @@
 Foreground application detector — watches the active window and fires
 a callback when the foreground app changes.
 Windows: GetForegroundWindow + QueryFullProcessImageNameW (with UWP resolution).
-macOS:   NSWorkspaceDidActivateApplicationNotification (initial read via
-         NSWorkspace.sharedWorkspace().frontmostApplication()).
+macOS:   NSWorkspaceDidActivateApplicationNotification carries the pid;
+         pid -> identifier goes through core.macos_frontmost (ctypes AX /
+         libproc / Info.plist), never NSRunningApplication.bundleIdentifier()
+         or NSWorkspace.frontmostApplication() -- each of those opens a
+         GamePolicy NSXPCConnection on macOS 26 that is never invalidated
+         (Leak B, ~1.9 GB / 81 h at the old 300 ms poll).
 """
 
 import os
@@ -179,6 +183,8 @@ elif sys.platform == "darwin":
             "`python -m pip install -r requirements.txt`."
         ) from exc
 
+    from core import macos_frontmost as _frontmost
+
     def _autoreleased(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
@@ -187,62 +193,86 @@ elif sys.platform == "darwin":
         return wrapper
 
     _ACTIVATE_NOTIFICATION = "NSWorkspaceDidActivateApplicationNotification"
+    _TERMINATE_NOTIFICATION = "NSWorkspaceDidTerminateApplicationNotification"
     _APPLICATION_KEY = "NSWorkspaceApplicationKey"
 
-    def _app_identifier(app) -> str | None:
-        """Stable identifier for an NSRunningApplication (bundle id, exe name, or name)."""
-        if app is None:
-            return None
-        ident = app.bundleIdentifier()
-        if ident:
-            return ident
-        url = app.executableURL()
-        if url:
-            return os.path.basename(url.path())
-        return app.localizedName()
+    def _identifier_for_pid(pid: int) -> str | None:
+        """Bundle id (else executable basename) for *pid*; LRU-cached."""
+        return _frontmost.bundle_id_for_pid(pid)
 
-    @_autoreleased
+    def _read_foreground_pid() -> int | None:
+        """Frontmost pid via AX / CGWindowList -- no LaunchServices."""
+        return _frontmost.focused_pid()
+
     def get_foreground_exe() -> str | None:
         """Return a stable app identifier for the frontmost app on macOS."""
         try:
-            from AppKit import NSWorkspace
-            return _app_identifier(NSWorkspace.sharedWorkspace().frontmostApplication())
+            pid = _read_foreground_pid()
+            if pid is None:
+                return None
+            return _identifier_for_pid(pid)
         except Exception:
             return None
+
+    def _notification_pid(notification) -> int | None:
+        """Only ``processIdentifier()`` is read from the NSRunningApplication:
+        it is a plain int already on the object, no XPC round trip."""
+        info = notification.userInfo()
+        app = info.get(_APPLICATION_KEY) if info is not None else None
+        if app is None:
+            return None
+        pid = int(app.processIdentifier())
+        return pid if pid > 0 else None
 
     def _install_activation_observer(handler):
         """Observe NSWorkspaceDidActivateApplicationNotification.
 
-        ``handler(ident)`` is invoked from the notification's posting thread
-        (the main run loop) with the same identifier ``get_foreground_exe``
-        would return. Returns a zero-arg ``remove`` callable. Raises when the
-        observer cannot be installed so the caller can fall back to polling.
+        ``handler(pid)`` is invoked from the notification's posting thread
+        (the main run loop) with the activated app's pid; the detector
+        thread resolves it. A second observer on
+        NSWorkspaceDidTerminateApplicationNotification evicts the pid from
+        the identifier cache. Returns a zero-arg ``remove`` callable. Raises
+        when the observers cannot be installed so the caller can fall back
+        to polling.
         """
         from AppKit import NSWorkspace
 
         center = NSWorkspace.sharedWorkspace().notificationCenter()
 
         def _on_activate(notification):
-            # Autorelease pool per delivery: the NSRunningApplication/NSURL
-            # proxies created while extracting the identifier are released
-            # as soon as the string has been handed off.
+            # Autorelease pool per delivery: the userInfo dictionary proxy is
+            # released as soon as the pid has been handed off.
             with _objc.autorelease_pool():
-                ident = None
                 try:
-                    info = notification.userInfo()
-                    app = info.get(_APPLICATION_KEY) if info is not None else None
-                    ident = _app_identifier(app)
+                    pid = _notification_pid(notification)
                 except Exception:
-                    ident = None
-                if ident:
-                    handler(ident)
+                    pid = None
+                if pid is not None:
+                    handler(pid)
 
-        token = center.addObserverForName_object_queue_usingBlock_(
+        def _on_terminate(notification):
+            with _objc.autorelease_pool():
+                try:
+                    pid = _notification_pid(notification)
+                except Exception:
+                    pid = None
+                if pid is not None:
+                    _frontmost.evict(pid)
+
+        activate_token = center.addObserverForName_object_queue_usingBlock_(
             _ACTIVATE_NOTIFICATION, None, None, _on_activate,
         )
+        try:
+            terminate_token = center.addObserverForName_object_queue_usingBlock_(
+                _TERMINATE_NOTIFICATION, None, None, _on_terminate,
+            )
+        except Exception:
+            center.removeObserver_(activate_token)
+            raise
 
         def _remove():
-            center.removeObserver_(token)
+            center.removeObserver_(activate_token)
+            center.removeObserver_(terminate_token)
 
         return _remove
 
@@ -305,8 +335,13 @@ else:
 
 _STOP_SENTINEL = object()
 
-# Poll period used only when the OS cannot push activation events to us.
-FALLBACK_POLL_INTERVAL = 5.0
+# Poll period used only when the OS cannot push activation events to us, and
+# the idle watchdog period on macOS (an AX pid compare, no LaunchServices).
+FALLBACK_POLL_INTERVAL = 30.0
+
+if sys.platform != "darwin":
+    _identifier_for_pid = None
+    _read_foreground_pid = None
 
 
 class AppDetector:
@@ -315,16 +350,18 @@ class AppDetector:
     from the detector thread when it changes.
 
     On macOS the change is pushed by
-    ``NSWorkspaceDidActivateApplicationNotification`` (one initial
-    ``frontmostApplication()`` read, then no polling). If that observer cannot
-    be installed the detector falls back to a slow safety poll. Other
-    platforms poll every *interval* seconds as before.
+    ``NSWorkspaceDidActivateApplicationNotification`` as a pid; an idle
+    watchdog re-reads the frontmost pid through AX every
+    ``FALLBACK_POLL_INTERVAL`` and both paths funnel through ``_deliver``.
+    If the observer cannot be installed the detector falls back to a slow
+    safety poll. Other platforms poll every *interval* seconds as before.
     """
 
     def __init__(self, on_change, interval: float = 0.3):
         self._on_change = on_change
         self._interval = interval
         self._last_exe: str | None = None
+        self._last_pid: int | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._events: queue.Queue = queue.Queue()
@@ -368,27 +405,51 @@ class AppDetector:
             return None
 
     @staticmethod
-    def _read_foreground() -> str | None:
+    def _read_foreground():
+        """Current foreground item: a pid on macOS, an exe path elsewhere."""
         try:
+            if _read_foreground_pid is not None:
+                return _read_foreground_pid()
             return get_foreground_exe()
         except Exception:
             return None
 
-    def _deliver(self, exe: str | None):
+    def _deliver(self, item):
+        """Funnel for every source (activation pid, idle AX pid, poll exe).
+
+        A pid equal to the last delivered one is dropped before any
+        resolution, so repeated activations of the same app cost nothing.
+        """
         try:
+            if item is None:
+                return
+            if isinstance(item, int):
+                if item == self._last_pid:
+                    return
+                exe = _identifier_for_pid(item) if _identifier_for_pid else None
+                if not exe:
+                    return
+                self._last_pid = item
+            else:
+                exe = item
             if exe and exe != self._last_exe:
                 self._last_exe = exe
                 self._on_change(exe)
         except Exception:
             pass
 
+    def _idle_check(self):
+        """Watchdog tick: AX pid compare only; resolves nothing unless the
+        pid actually changed (the observer missed a switch)."""
+        self._deliver(self._read_foreground())
+
     def _run_observer(self):
         # One initial read so the profile matches the app that was already in
         # front when we started; everything after this is event-driven.
-        self._deliver(self._read_foreground())
+        self._idle_check()
         # Watchdog: if the observer installed but never fires (starved run
-        # loop, coalesced switches, background apps), fall back to one read
-        # every FALLBACK_POLL_INTERVAL of idle. 16x cheaper than the old poll.
+        # loop, coalesced switches, background apps), compare the AX pid
+        # once every FALLBACK_POLL_INTERVAL of idle.
         idle = 0.0
         while not self._stop.is_set():
             try:
@@ -397,7 +458,7 @@ class AppDetector:
                 idle += 1.0
                 if idle >= FALLBACK_POLL_INTERVAL:
                     idle = 0.0
-                    self._deliver(self._read_foreground())
+                    self._idle_check()
                 continue
             idle = 0.0
             if item is _STOP_SENTINEL:
