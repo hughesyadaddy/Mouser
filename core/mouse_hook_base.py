@@ -473,10 +473,11 @@ class BaseMouseHook:
 
     def _dispatch(self, event):
         callbacks = self._callbacks.get(event.event_type, [])
-        self._emit_debug(
-            f"Dispatch {event.event_type}"
-            f"{format_debug_details(event.raw_data)} callbacks={len(callbacks)}"
-        )
+        if self.debug_mode:
+            self._emit_debug(
+                f"Dispatch {event.event_type}"
+                f"{format_debug_details(event.raw_data)} callbacks={len(callbacks)}"
+            )
         if event.event_type.startswith("gesture_"):
             self._emit_gesture_event(
                 {
@@ -678,18 +679,22 @@ class BaseMouseHook:
 
             self._gesture_delta_x += delta_x
             self._gesture_delta_y += delta_y
-            self._emit_debug(
-                f"Gesture segment source={source} "
-                f"accum_x={self._gesture_delta_x} accum_y={self._gesture_delta_y}"
-            )
-            self._emit_gesture_event(
-                {
-                    "type": "segment",
-                    "source": source,
-                    "dx": self._gesture_delta_x,
-                    "dy": self._gesture_delta_y,
-                }
-            )
+            if self.debug_mode:
+                # Both the f-string and the event dict are built per motion
+                # report; neither has a consumer unless debug_mode is on
+                # (_emit_gesture_event gates on it too).
+                self._emit_debug(
+                    f"Gesture segment source={source} "
+                    f"accum_x={self._gesture_delta_x} accum_y={self._gesture_delta_y}"
+                )
+                self._emit_gesture_event(
+                    {
+                        "type": "segment",
+                        "source": source,
+                        "dx": self._gesture_delta_x,
+                        "dy": self._gesture_delta_y,
+                    }
+                )
 
             # Fire mid-hold as soon as the stroke is unambiguous, so a
             # hold-and-slide lands while the finger is still down -- the
