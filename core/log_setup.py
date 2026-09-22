@@ -3,6 +3,7 @@ log_setup.py — Redirect all print() output to a rotating log file.
 
 Call setup_logging() once, early in main_qml.py, before Qt and core imports.
 """
+import collections
 import io
 import json
 import logging
@@ -16,6 +17,10 @@ DEFAULT_LOG_LEVEL = "INFO"
 #: After the first occurrence, a repeated Qt/QML message is logged again
 #: only every this many repeats (with its running count).
 QT_MESSAGE_REPEAT_EVERY = 100
+#: Distinct dedupe keys kept; the oldest is evicted past this.
+QT_MESSAGE_MAX_KEYS = 1000
+#: Without a source location the key is this prefix of the message text.
+QT_MESSAGE_KEY_CHARS = 120
 
 # QtMsgType -> logging level, by enum name (PySide6 exposes an IntEnum)
 # and by raw value (Qt: Debug=0, Warning=1, Critical=2, Fatal=3, Info=4).
@@ -134,23 +139,38 @@ class QtMessageBridge:
     """
 
     def __init__(self, logger: logging.Logger | None = None,
-                 repeat_every: int = QT_MESSAGE_REPEAT_EVERY):
+                 repeat_every: int = QT_MESSAGE_REPEAT_EVERY,
+                 max_keys: int = QT_MESSAGE_MAX_KEYS):
         self._logger = logger or logging.getLogger("qt")
         self._repeat_every = max(1, int(repeat_every))
-        self._counts: dict[str, int] = {}
+        self._max_keys = max(1, int(max_keys))
+        # Bounded: keyed by (file, line) when Qt gives a source location,
+        # else by a prefix of the text (messages that embed a changing
+        # value would otherwise grow the dict without limit).
+        self._counts: "collections.OrderedDict[tuple, int]" = collections.OrderedDict()
         self._lock = threading.Lock()
 
     @property
-    def counts(self) -> dict[str, int]:
+    def counts(self) -> dict:
         with self._lock:
             return dict(self._counts)
+
+    @staticmethod
+    def _key(context, text):
+        file = getattr(context, "file", None)
+        if file:
+            return (str(file), int(getattr(context, "line", 0) or 0))
+        return (text[:QT_MESSAGE_KEY_CHARS],)
 
     def __call__(self, mode, context, message) -> None:
         try:
             text = str(message)
+            key = self._key(context, text)
             with self._lock:
-                count = self._counts.get(text, 0) + 1
-                self._counts[text] = count
+                count = self._counts.pop(key, 0) + 1
+                self._counts[key] = count           # most recent last
+                while len(self._counts) > self._max_keys:
+                    self._counts.popitem(last=False)
             if count != 1 and count % self._repeat_every != 0:
                 return
             where = ""

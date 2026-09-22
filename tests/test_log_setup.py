@@ -62,7 +62,27 @@ class QtMessageBridgeTests(unittest.TestCase):
         self.assertNotIn("repeated", msgs[0])
         self.assertIn("[repeated x100]", msgs[1])
         self.assertIn("[repeated x200]", msgs[2])
-        self.assertEqual(bridge.counts["Binding loop detected for property \"width\""], 250)
+        self.assertEqual(bridge.counts[("qrc:/ui/qml/MousePage.qml", 42)], 250)
+
+    def test_keys_are_source_location_else_text_prefix_and_bounded(self):
+        bridge = log_setup.QtMessageBridge(logger=self.logger, max_keys=3)
+        ctx = type("Ctx", (), {"file": "A.qml", "line": 7})()
+        # Same location, changing text (an embedded value): one key.
+        for i in range(5):
+            bridge(1, ctx, f"value is {i}")
+        self.assertEqual(bridge.counts, {("A.qml", 7): 5})
+        self.assertEqual(len(self.records), 1)
+        # No location: keyed by the first QT_MESSAGE_KEY_CHARS chars.
+        long = "x" * log_setup.QT_MESSAGE_KEY_CHARS
+        bridge(1, None, long + "-1")
+        bridge(1, None, long + "-2")
+        self.assertEqual(bridge.counts[(long,)], 2)
+        # Bounded: the oldest key is evicted past max_keys.
+        bridge(1, None, "b")
+        bridge(1, None, "c")
+        self.assertEqual(len(bridge.counts), 3)
+        self.assertNotIn(("A.qml", 7), bridge.counts)
+        self.assertIn(("c",), bridge.counts)
 
     def test_distinct_messages_dedupe_independently(self):
         bridge = log_setup.QtMessageBridge(logger=self.logger)
