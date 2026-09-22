@@ -926,7 +926,7 @@ def _install_native_macos_status_item(qmenu, on_left_click):
         status_bar.removeStatusItem_(status_item)
         return None
     button.setImage_(ns_image)
-    button.setToolTip_("Mouser")
+    button.setToolTip_(_STATUS_TOOLTIP)
 
     target = _MACOS_NATIVE_STATUS_TARGET
     if target is None:
@@ -1344,6 +1344,49 @@ def _schedule_engine_start(engine, *, accessibility_granted: bool) -> bool:
     return True
 
 
+# Menu-bar tooltip; replaced by the restart notice until the process restarts.
+_STATUS_TOOLTIP = "Mouser"
+RESTART_NOTICE_TITLE = "Mouser needs a restart"
+RESTART_NOTICE_MS = 15000
+
+
+def _set_status_tooltip(tray, text: str) -> None:
+    """Tooltip on whichever menu-bar item is showing: the Qt tray icon and,
+    on macOS, the native NSStatusItem that replaces its icon surface."""
+    global _STATUS_TOOLTIP
+    _STATUS_TOOLTIP = text
+    try:
+        tray.setToolTip(text)
+    except Exception as exc:  # noqa: BLE001 - never let a tooltip break the notice
+        print(f"[Mouser] tray tooltip failed: {exc}")
+    item = _MACOS_NATIVE_STATUS_ITEM
+    if item is None:
+        return
+    try:
+        button = item.button()
+        if button is not None:
+            button.setToolTip_(text)
+    except Exception as exc:  # noqa: BLE001 - AppKit boundary
+        print(f"[Mouser] status item tooltip failed: {exc}")
+
+
+def _show_restart_notice(tray, reason: str) -> None:
+    """Watchdog verdict on a seat launchd does not own: a tray notification
+    (the only surface a hidden window cannot swallow) plus a tooltip that
+    stays until the restart. The log line is written by the watchdog."""
+    tray.showMessage(
+        RESTART_NOTICE_TITLE,
+        reason,
+        QSystemTrayIcon.MessageIcon.Warning,
+        RESTART_NOTICE_MS,
+    )
+    _set_status_tooltip(tray, f"{RESTART_NOTICE_TITLE}: {reason}")
+
+
+def _connect_restart_notice(backend, tray) -> None:
+    backend.restartRequired.connect(lambda reason: _show_restart_notice(tray, reason))
+
+
 def _schedule_tray_minimized_notice(tray, locale_mgr) -> None:
     def _tray_minimized_notice():
         tray.showMessage(
@@ -1739,6 +1782,7 @@ def main():
         QSystemTrayIcon.MessageIcon.Information,
         8000,
     ))
+    _connect_restart_notice(backend, tray)
 
     tray.setContextMenu(tray_menu)
     tray.activated.connect(lambda reason: (

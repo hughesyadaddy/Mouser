@@ -41,16 +41,27 @@ HEARTBEAT_TRIP_TICKS = 2
 HEARTBEAT_SUSPEND_S = TICK_S
 EXIT_STATUS = 3
 
-# Memory guard. The slope is a least-squares fit over the last
-# MEM_WINDOW_SAMPLES ticks (one hour at TICK_S); it must exceed
-# MEM_GROWTH_TRIP_MB_H continuously for MEM_GROWTH_SUSTAIN_S before it
-# trips, so a one-off allocation burst (opening the window, an update
-# check) never counts. The success criterion for a fixed build is
-# <= 0.1 MB/h, so 20 MB/h is unambiguous: it is the 2026-09 leak rate.
+# Memory guard. The ``[mem]`` line reports a least-squares slope over the
+# last MEM_WINDOW_SAMPLES ticks (one hour at TICK_S). The growth trip is a
+# windowed rule over a MEM_GROWTH_SUSTAIN_S ring (three hours) that no
+# small periodic release can defeat: the ring must be full, the footprint
+# must be at least MEM_NET_GROWTH_TRIP_MB above the ring's minimum, the
+# three-hour slope must be at least MEM_GROWTH_TRIP_MB_H, and every third
+# of the ring must itself slope at least MEM_PART_SLOPE_MB_H, so a single
+# level step (opening the window, an update check) inside an otherwise
+# flat window does not count as growth. The success criterion for a fixed
+# build is <= 0.1 MB/h, so 20 MB/h is unambiguous: it is the 2026-09 rate.
 MEM_WINDOW_SAMPLES = 60
 MEM_MIN_SLOPE_SAMPLES = 10
 MEM_GROWTH_TRIP_MB_H = 20.0
 MEM_GROWTH_SUSTAIN_S = 3 * 3600.0
+MEM_SUSTAIN_SAMPLES = int(MEM_GROWTH_SUSTAIN_S / TICK_S)
+MEM_NET_GROWTH_TRIP_MB = MEM_GROWTH_TRIP_MB_H * MEM_GROWTH_SUSTAIN_S / 3600.0
+MEM_SUSTAIN_PARTS = 3
+MEM_PART_SLOPE_MB_H = MEM_GROWTH_TRIP_MB_H / 2
+# A gap between samples this long is a suspend: the ring restarts, since a
+# fit across the gap says nothing about the rate on either side of it.
+MEM_GAP_RESET_S = 2 * TICK_S
 MEM_FOOTPRINT_TRIP_MB = 1500.0
 MEM_LOG_INTERVAL_S = 60.0
 # After a memory trip that could not exit (no supervisor), stay quiet for
@@ -151,6 +162,36 @@ def growth_slope_mb_h(samples) -> float | None:
     return cov / var_t * 3600.0
 
 
+def sustained_growth_mb_h(ring) -> float | None:
+    """The three-hour growth rate when the ring proves a sustained leak,
+    else None. Conditions (all required): the ring is full; the last
+    sample sits at least MEM_NET_GROWTH_TRIP_MB above the ring's minimum
+    (net growth that small periodic releases cannot hide); the full-ring
+    slope is at least MEM_GROWTH_TRIP_MB_H; and each of the
+    MEM_SUSTAIN_PARTS consecutive slices slopes at least
+    MEM_PART_SLOPE_MB_H, which rules out one level step in a flat window
+    (a step's least-squares slope is confined to the slice holding it)."""
+    if len(ring) < ring.maxlen:
+        return None
+    samples = list(ring)
+    net = samples[-1][1] - min(mb for _, mb in samples)
+    if net < MEM_NET_GROWTH_TRIP_MB:
+        return None
+    slope = growth_slope_mb_h(samples)
+    if slope is None or slope < MEM_GROWTH_TRIP_MB_H:
+        return None
+    part = len(samples) // MEM_SUSTAIN_PARTS
+    for i in range(MEM_SUSTAIN_PARTS):
+        part_slope = growth_slope_mb_h(samples[i * part:(i + 1) * part])
+        if part_slope is None or part_slope < MEM_PART_SLOPE_MB_H:
+            return None
+    return slope
+
+
+def _is_mem_reason(reason: str) -> bool:
+    return reason.startswith("mem ")
+
+
 class SelfWatchdog:
     def __init__(
         self,
@@ -186,10 +227,10 @@ class SelfWatchdog:
         self._hot_ticks = 0
         self._late_ticks = 0
         self._tap_reenable_window = deque(maxlen=int(3600 / tick_s) or 1)
-        # Memory: (monotonic, MB) samples, the fitted slope, and when the
-        # slope first crossed the trip rate (None while below it).
+        # Memory: one hour of (monotonic, MB) samples for the reported
+        # slope, three hours for the sustained-growth trip.
         self._mem_samples = deque(maxlen=MEM_WINDOW_SAMPLES)
-        self._mem_growth_since = None
+        self._mem_ring = deque(maxlen=MEM_SUSTAIN_SAMPLES)
         self._mem_last_log = None
         self._mem_muted_until = None
         self.footprint_mb = None
@@ -263,13 +304,16 @@ class SelfWatchdog:
         if self.consecutive_trips >= 2:
             self._exit_for_respawn(reasons, now)
             return reasons
-        self._hot_ticks = 0
-        self._late_ticks = 0
-        self._tap_reenable_window.clear()
-        try:
-            self._reconnect()
-        except Exception as exc:  # noqa: BLE001 - recovery must not raise into Qt
-            self._log(f"[Watchdog] reconnect request failed: {exc!r}")
+        if not any(_is_mem_reason(reason) for reason in reasons):
+            # Only a spinning/stalled listener is helped by a reconnect;
+            # memory is fixed by nothing short of a restart.
+            self._hot_ticks = 0
+            self._late_ticks = 0
+            self._tap_reenable_window.clear()
+            try:
+                self._reconnect()
+            except Exception as exc:  # noqa: BLE001 - recovery must not raise into Qt
+                self._log(f"[Watchdog] reconnect request failed: {exc!r}")
         return reasons
 
     def _sample_memory(self, now: float) -> list[str]:
@@ -284,14 +328,12 @@ class SelfWatchdog:
         mb = float(mb)
         self.footprint_mb = mb
         self.peak_mb = mb if self.peak_mb is None else max(self.peak_mb, mb)
+        if self._mem_ring and now - self._mem_ring[-1][0] > MEM_GAP_RESET_S:
+            self._mem_samples.clear()
+            self._mem_ring.clear()
         self._mem_samples.append((now, mb))
+        self._mem_ring.append((now, mb))
         self.growth_mb_h = growth_slope_mb_h(self._mem_samples)
-
-        if self.growth_mb_h is not None and self.growth_mb_h > MEM_GROWTH_TRIP_MB_H:
-            if self._mem_growth_since is None:
-                self._mem_growth_since = now
-        else:
-            self._mem_growth_since = None
 
         if self._mem_last_log is None or now - self._mem_last_log >= MEM_LOG_INTERVAL_S:
             self._mem_last_log = now
@@ -306,12 +348,10 @@ class SelfWatchdog:
             self._mem_muted_until = None
 
         reasons = []
-        if self._mem_growth_since is not None:
-            sustained = now - self._mem_growth_since
-            if sustained >= MEM_GROWTH_SUSTAIN_S:
-                reasons.append(
-                    f"mem growth/h={self.growth_mb_h:.1f} over {sustained / 3600.0:.1f}h"
-                )
+        sustained = sustained_growth_mb_h(self._mem_ring)
+        if sustained is not None:
+            span_h = (now - self._mem_ring[0][0]) / 3600.0
+            reasons.append(f"mem growth/h={sustained:.1f} over {span_h:.1f}h")
         if mb > MEM_FOOTPRINT_TRIP_MB:
             reasons.append(f"mem footprint_mb={mb:.0f} > {MEM_FOOTPRINT_TRIP_MB:.0f}")
         return reasons
@@ -320,7 +360,7 @@ class SelfWatchdog:
         if not self._exit_enabled():
             self._log("[Watchdog] exit disabled (no supervisor or watchdog_exit=false); staying up")
             self._status("Mouser needs a restart: " + ", ".join(reasons))
-            if any(reason.startswith("mem ") for reason in reasons):
+            if any(_is_mem_reason(reason) for reason in reasons):
                 # Nothing short of a restart fixes memory; do not re-trip
                 # every minute on a seat that cannot respawn.
                 self._mem_muted_until = (

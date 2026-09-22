@@ -215,6 +215,9 @@ class Backend(QObject):
     profilesChanged = Signal()
     activeProfileChanged = Signal()
     statusMessage = Signal(str)
+    # Watchdog verdict on a seat that cannot respawn: main_qml routes it to
+    # the tray (notification + tooltip); the window may be hidden for days.
+    restartRequired = Signal(str)
     dpiFromDevice = Signal(int)
     smartShiftChanged = Signal()
     mouseConnectedChanged = Signal()
@@ -421,8 +424,8 @@ class Backend(QObject):
             reconnect=self._watchdog_reconnect,
             exit_enabled=self._watchdog_exit_enabled,
             # A seat launchd does not own cannot respawn; the watchdog asks
-            # the user for a restart from the status bar instead.
-            status=self.statusMessage.emit,
+            # the user for a restart through the tray instead.
+            status=self.restartRequired.emit,
         )
         self._watchdog_timer = QTimer(self)
         # A coarse 60 s timer may land 3 s late by design (5 % tolerance),

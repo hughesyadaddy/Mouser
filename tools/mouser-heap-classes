@@ -21,7 +21,10 @@ reports a per-class slope.
 ``--parse FILE`` reads a saved ``heap -s`` report instead of a process.
 
 Exit status: 0 on success, 1 on usage errors, 2 when ``heap`` is missing,
-cannot attach (needs ``get-task-allow`` or sudo) or the process is gone.
+cannot attach (needs ``get-task-allow`` or sudo), the process is gone, or
+the output does not have the COUNT/BYTES/AVG/CLASS_NAME table this
+parser expects. The JSON keys (``pid``, ``ts``, ``classes``,
+``total_bytes``) are consumed by ``fleet-soak``; keep them stable.
 Stdlib only.
 """
 
@@ -50,9 +53,18 @@ _TOTAL = re.compile(r"^All zones:\s+(\d+)\s+nodes\s+\((\d+)\s+bytes\)")
 _TYPES = {"ObjC", "CFType", "C++", "C", "Swift"}
 
 
+class HeapFormatError(ValueError):
+    """The text is not a ``heap -s`` report (no COUNT/BYTES/CLASS_NAME table)."""
+
+
+_HEADER_COLUMNS = ("COUNT", "BYTES", "AVG", "CLASS_NAME")
+
+
 def parse_heap_s(text: str) -> dict:
     """Parse ``heap -s`` output into ``{"classes": {...}, "total_bytes": int,
-    "nodes": int}``. Classes absent from the report count as 0."""
+    "nodes": int}``. Classes absent from the report count as 0. Raises
+    HeapFormatError when the per-class table header is missing or its
+    columns are not the ones this parser was written against."""
     classes = dict.fromkeys(CLASSES, 0)
     total_bytes = 0
     nodes = 0
@@ -64,7 +76,12 @@ def parse_heap_s(text: str) -> dict:
             total_bytes = int(total.group(2))
             continue
         stripped = line.strip()
-        if stripped.startswith("COUNT") and "CLASS_NAME" in stripped:
+        if not in_table and stripped.startswith("COUNT"):
+            if tuple(stripped.split()[:4]) != _HEADER_COLUMNS:
+                raise HeapFormatError(
+                    f"unexpected heap -s columns: {stripped!r} "
+                    f"(want {' '.join(_HEADER_COLUMNS)} ...)"
+                )
             in_table = True
             continue
         if not in_table or not stripped or stripped.startswith("====="):
@@ -82,6 +99,8 @@ def parse_heap_s(text: str) -> dict:
             continue
         if name in classes:
             classes[name] += count
+    if not in_table:
+        raise HeapFormatError("no per-class table (COUNT BYTES AVG CLASS_NAME) found")
     return {"classes": classes, "total_bytes": total_bytes, "nodes": nodes}
 
 
@@ -112,7 +131,7 @@ def run_heap(pid: int) -> str:
         result = subprocess.run([heap, "-s", str(pid)], capture_output=True, text=True)
     except OSError as exc:
         raise RuntimeError(f"could not run heap: {exc}") from exc
-    if result.returncode != 0 or "COUNT" not in result.stdout:
+    if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip().splitlines()
         message = detail[-1] if detail else f"heap exited {result.returncode}"
         raise RuntimeError(
@@ -152,7 +171,11 @@ def main(argv=None) -> int:
             print(f"mouser-heap-classes: {exc}", file=sys.stderr)
             return 2
 
-    parsed = parse_heap_s(text)
+    try:
+        parsed = parse_heap_s(text)
+    except HeapFormatError as exc:
+        print(f"mouser-heap-classes: {exc}", file=sys.stderr)
+        return 2
     report = {
         "pid": pid,
         "ts": int(time.time()),

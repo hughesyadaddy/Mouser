@@ -67,15 +67,24 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(parsed["total_bytes"], 300)
 
     def test_rows_before_the_table_header_are_ignored(self):
-        text = "  12 34 5.0 CGEvent  CFType  SkyLight\nno table here\n"
+        text = (
+            "  12 34 5.0 CGEvent  CFType  SkyLight\n"
+            "   COUNT      BYTES       AVG   CLASS_NAME     TYPE    BINARY\n"
+        )
         parsed = self.tool.parse_heap_s(text)
         self.assertEqual(parsed["classes"]["CGEvent"], 0)
         self.assertEqual(parsed["total_bytes"], 0)
 
-    def test_empty_report_gives_zeroes(self):
-        parsed = self.tool.parse_heap_s("")
-        self.assertEqual(set(parsed["classes"]), set(self.tool.CLASSES))
-        self.assertTrue(all(v == 0 for v in parsed["classes"].values()))
+    def test_missing_table_is_a_format_error(self):
+        with self.assertRaises(self.tool.HeapFormatError):
+            self.tool.parse_heap_s("")
+        with self.assertRaises(self.tool.HeapFormatError):
+            self.tool.parse_heap_s("Process: Mouser [1]\nno table here\n")
+
+    def test_unexpected_columns_are_a_format_error(self):
+        text = "   COUNT      AVG       BYTES   CLASS_NAME     TYPE    BINARY\n"
+        with self.assertRaises(self.tool.HeapFormatError):
+            self.tool.parse_heap_s(text)
 
 
 class CliTests(unittest.TestCase):
@@ -120,6 +129,13 @@ class CliTests(unittest.TestCase):
         report = json.loads(result.stdout)
         self.assertEqual(report["pid"], 4242)
         self.assertEqual(report["classes"]["HIDEvent"], _EXPECTED["HIDEvent"])
+
+    def test_heap_output_without_the_table_exits_2(self):
+        fake = self._fake_heap_dir("echo 'Process 4242: 0 zones'\nexit 0\n")
+        result = self._run("--pid", "4242", path=fake)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("no per-class table", result.stderr)
+        self.assertEqual(result.stdout, "")
 
     def test_heap_missing_exits_2(self):
         empty = tempfile.mkdtemp()

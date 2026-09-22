@@ -146,7 +146,9 @@ class TapCallbackSoak(_hook._MacOSHookCase, _SoakCase):
         hook = self._hook()
         # Blocked xbutton1: the OtherMouseDown/Up pair is swallowed (returns
         # None) and lands on the bounded dispatch queue; moves and wheel
-        # ticks pass through and exercise the deferred-release guard.
+        # ticks pass through the guard's bookkeeping (_prev_passthrough).
+        # The fake event is a plain object, so the Py_DecRef branch is NOT
+        # taken here; DeferredReleaseGuardSoak below covers it on macOS.
         hook.block(MouseEvent.XBUTTON1_DOWN)
         self.fields[_hook._F_BUTTON] = 3
         cg_event = object()

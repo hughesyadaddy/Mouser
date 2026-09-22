@@ -36,7 +36,10 @@ a `None` sample disables the memory checks for that tick without touching
 the CPU, tap and heartbeat checks.
 
 * Samples go into a 60-entry deque of `(monotonic, MB)`; a least-squares
-  fit over the window gives `growth_mb_h` once at least 10 samples exist.
+  fit over that hour gives the reported `growth_mb_h` once at least 10
+  samples exist. A second, 180-entry ring (three hours) feeds the trip.
+  A gap of more than two ticks between samples (sleep) clears both: a fit
+  across a gap says nothing about the rate on either side of it.
 * One log line per tick, never more often than every 60 s:
 
       [mem] footprint_mb=182.4 peak_mb=190.1 growth_mb_h=0.3
@@ -44,25 +47,39 @@ the CPU, tap and heartbeat checks.
   `growth_mb_h=n/a` for the first ten minutes. `fleet-health` and
   `fleet-soak` grep this line.
 * Trip reasons, appended to the existing `[Watchdog] trip n=… consecutive=… tap=…` line:
-  * `mem growth/h=25.0 over 3.1h` when the fitted slope has stayed above
-    20 MB/h for three hours without interruption (a burst that stops
-    resets the clock; a fixed build sits at 0.1 MB/h, the 2026-09 leaks ran
-    at 20 to 70 MB/h);
+  * `mem growth/h=25.0 over 3.0h` when the three-hour ring proves
+    sustained growth. All four hold at once: the ring is full; the current
+    footprint is at least 60 MB (20 MB/h x 3 h) above the ring's minimum;
+    the three-hour least-squares slope is at least 20 MB/h; and each of
+    the three one-hour thirds slopes at least 10 MB/h. The rule is
+    windowed, not a clock, so nothing resets it: a permanent -4 MB release
+    or -5 MB freed every 2.5 h (which defeats a "slope above 20 MB/h
+    continuously" clock forever) still trips at 3.0 h, a -60 MB release
+    only delays the trip to 5.0 h, and a +175 MB level step (opening the
+    window) never trips because the thirds outside the step are flat. A
+    fixed build sits at 0.1 MB/h; the 2026-09 leaks ran at 20 to 70 MB/h.
+    `tests/test_self_watchdog.py::MemoryGuardTests` runs the reviewer's
+    series (`review-pr2/slope2.py`);
   * `mem footprint_mb=1600 > 1500` immediately when the footprint passes
     1.5 GB.
-* Policy is the existing one. First trip: log line and a listener
-  reconnect. Second consecutive trip: exit 3 for the launchd respawn when
-  launchd owns the process and `watchdog_exit` is not `false`. Otherwise
-  the process stays up, logs `exit disabled`, posts
-  `Mouser needs a restart: …` to the status bar (`Backend.statusMessage`)
-  and mutes the memory reasons for an hour so the seat is not nagged every
-  minute. Memory is the one symptom a reconnect cannot fix, so a memory
-  trip escalates on the very next tick.
+* Policy is the existing one, minus the reconnect. First trip: log line
+  (memory reasons skip the HID reconnect, which cannot free anything).
+  Second consecutive trip: exit 3 for the launchd respawn when launchd
+  owns the process and `watchdog_exit` is not `false`. Otherwise the
+  process stays up, logs `exit disabled`, emits `Backend.restartRequired`,
+  which `main_qml._show_restart_notice` turns into a tray notification
+  ("Mouser needs a restart: …", `tray.showMessage`, the surface a hidden
+  window cannot swallow) and a menu-bar tooltip on both the Qt tray icon
+  and the native NSStatusItem that stays until the restart, and mutes the
+  memory reasons for an hour so the seat is not nagged every minute.
+  A memory trip persists, so it escalates on the very next tick.
 
 Tests: `tests/test_self_watchdog.py::MemoryGuardTests` (flat, 2 h of
-growth, 3.5 h of growth, growth that stops, 1.6 GB, escalation with and
-without a supervisor, line format and rate, sampler failure, slope fit,
-the real sampler on macOS).
+growth, 3.5 h of growth, the reviewer's release/step/sleep series, 1.6 GB,
+no reconnect on memory trips, escalation with and without a supervisor,
+line format and rate, sampler failure, slope fit, the real sampler on
+macOS); `tests/test_restart_notice.py` and `tests/test_backend.py` for
+the tray route.
 
 ## The soak test (`tests/test_memory_soak.py`)
 
@@ -93,7 +110,11 @@ holder the guard skips the event (a leak of one proxy, never a crash).
 
 Prints one JSON object with the counts of the fingerprint classes above
 (`CGEvent`, `CGSEventAppendix`, `HIDEvent`, `NSXPCConnection`,
-`GPProcessMonitor`, `CGImage`, `non-object`) and `total_bytes`.
+`GPProcessMonitor`, `CGImage`, `non-object`) and `total_bytes`. The keys
+`pid`, `ts`, `classes`, `total_bytes` are the contract with `fleet-soak`;
+keep them stable. Output without the `COUNT BYTES AVG CLASS_NAME` table
+(a newer `heap` layout, a truncated capture) exits 2 rather than
+reporting zeroes.
 `deskflow/tools/fleet-soak --heap-classes` records it per sample and
 reports a per-class slope (`--class-slope-max 10/h`), which says *which*
 leak is back rather than only that memory grows. `heap` is part of the
