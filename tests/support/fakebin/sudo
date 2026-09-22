@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "tests must never invoke real sudo (shim from tests/support/fakebin); argv: $*" >&2
+exit 97

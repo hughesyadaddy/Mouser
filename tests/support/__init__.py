@@ -13,3 +13,7 @@ import tempfile as _tempfile
 
 if not _os.environ.get("MOUSER_LOG_DIR"):
     _os.environ["MOUSER_LOG_DIR"] = _tempfile.mkdtemp(prefix="mouser-tests-logs-")
+
+# Tests must never reach the real sudo (this Mac has passwordless sudo). A shim
+# on PATH fails loudly instead; tests that need sudo behaviour mock it explicitly.
+_os.environ["PATH"] = _os.path.join(_os.path.dirname(__file__), "fakebin") + _os.pathsep + _os.environ.get("PATH", "")
