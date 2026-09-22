@@ -3,6 +3,7 @@
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+import tests.support  # noqa: E402,F401  (offscreen Qt, tmp MOUSER_LOG_DIR before main_qml import)
 
 try:
     import main_qml

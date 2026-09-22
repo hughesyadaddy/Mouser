@@ -1,6 +1,10 @@
+import hashlib
+import io
 import os
 import sys
+import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -151,6 +155,124 @@ class InstallLifecycleTests(unittest.TestCase):
             install_from_dist.install_macos_from_dist()
         stop.assert_called_once_with()
         launch.assert_called_once()
+
+
+def hash_tree(root: Path) -> dict[str, str]:
+    """{relative path: sha256} for every file under root (byte-identical proof)."""
+    out = {}
+    for p in sorted(root.rglob("*")):
+        if p.is_file():
+            out[str(p.relative_to(root))] = hashlib.sha256(p.read_bytes()).hexdigest()
+    return out
+
+
+class SettingsSurvivalTests(unittest.TestCase):
+    """The installer and the login-startup sync never write Mouser's config dir."""
+
+    CONFIG = (
+        '{"version": 12, "settings": {"start_at_login": true, "scroll": {"speed": 3}},'
+        ' "buttons": ["a", "b"]}'
+    )
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name) / "home"
+        self.config_dir = self.home / "Library" / "Application Support" / "Mouser"
+        self.config_dir.mkdir(parents=True)
+        (self.config_dir / "config.json").write_text(self.CONFIG, encoding="utf-8")
+        (self.config_dir / "last_device.json").write_text('{"vid": 1133}', encoding="utf-8")
+        (self.config_dir / "config.json.bak").write_text("{}", encoding="utf-8")
+        # HOME -> tmp, and core.config's import-time paths re-pointed the same way.
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.home)}, clear=False))
+        self.enterContext(mock.patch.object(core.config, "CONFIG_DIR", str(self.config_dir)))
+        self.enterContext(
+            mock.patch.object(core.config, "CONFIG_FILE", str(self.config_dir / "config.json"))
+        )
+        self.before = hash_tree(self.config_dir)
+
+    def test_build_and_install_macos_leaves_config_dir_byte_identical(self):
+        from scripts import build_and_install as installer
+
+        root = Path(self.tmp.name) / "repo"
+        root.mkdir()
+        install_dir = Path(self.tmp.name) / "Applications"
+        install_dir.mkdir()
+        dist = root / "dist" / installer.MACOS_APP_NAME
+        commands = []
+
+        def fake_run_command(args, **kwargs):
+            argv = [str(a) for a in args]
+            commands.append(argv)
+            if argv and argv[-1].endswith("build_macos_app.sh"):
+                (dist / "Contents" / "MacOS").mkdir(parents=True, exist_ok=True)
+                (dist / "Contents" / "MacOS" / "Mouser").write_bytes(b"\xcf\xfa\xed\xfe")
+            elif argv and argv[0] == "ditto":
+                # a real ditto copies the bundle byte-for-byte; ctl start needs the executable
+                dest = install_dir / installer.MACOS_APP_NAME / "Contents" / "MacOS"
+                dest.mkdir(parents=True, exist_ok=True)
+                (dest / "Mouser").write_bytes(b"\xcf\xfa\xed\xfe")
+                (dest / "Mouser").chmod(0o755)
+
+        signed = (
+            "Executable={path}\nCodeDirectory v=20500 size=1 flags=0x10000(runtime) hashes=1+1 location=embedded\n"
+            "Authority=Apple Development: X (J5KPG8ZR5C)\nTeamIdentifier=J5KPG8ZR5C\n"
+        )
+        with (
+            mock.patch.object(installer, "ROOT", root),
+            mock.patch.object(installer.sys, "platform", "darwin"),
+            mock.patch.object(install_lifecycle.sys, "platform", "darwin"),
+            mock.patch.object(installer, "resolve_macos_sign_identity", return_value="A" * 40),
+            mock.patch.object(installer, "resolve_python", return_value=(Path("/py"), "test")),
+            mock.patch.object(installer, "verify_python_provenance"),
+            mock.patch.object(installer, "run_command", side_effect=fake_run_command),
+            mock.patch.object(installer.shutil, "which", return_value="/usr/bin/codesign"),
+            mock.patch.object(installer, "codesign_info", side_effect=lambda p: signed.format(path=p)),
+            # ctl stop / ctl start are stubbed: no process is touched, but the
+            # real sync_login_startup_after_install runs against the tmp config.
+            mock.patch.object(install_lifecycle, "run_ctl", return_value=0) as run_ctl,
+            mock.patch("core.startup.supports_login_startup", return_value=True),
+            mock.patch("core.startup.apply_login_startup") as apply_login,
+            mock.patch("core.config.save_config") as save_config,
+            mock.patch.dict(os.environ, {"MOUSER_INSTALL_DIR": str(install_dir), "MOUSER_RESTART": "1"}),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(io.StringIO()),
+        ):
+            installer.build_and_install_macos()
+
+        self.assertEqual(hash_tree(self.config_dir), self.before)
+        self.assertEqual([c.args[0] for c in run_ctl.call_args_list], ["stop", "start"])
+        self.assertTrue(any(c[0] == "ditto" for c in commands))
+        save_config.assert_not_called()
+        # start_at_login is true in the fixture, so the login item is (re)applied
+        # from the config -- read-only with respect to the config dir.
+        apply_login.assert_called_once()
+        self.assertTrue(apply_login.call_args.args[0])
+
+    def test_sync_login_startup_never_writes_config(self):
+        app = self.home / "Applications" / "Mouser.app"
+        (app / "Contents" / "MacOS").mkdir(parents=True)
+        (app / "Contents" / "MacOS" / "Mouser").write_bytes(b"\xcf\xfa\xed\xfe")
+        with (
+            mock.patch.object(install_lifecycle.sys, "platform", "darwin"),
+            mock.patch("core.startup.supports_login_startup", return_value=True),
+            mock.patch("core.startup.apply_login_startup") as apply_login,
+            mock.patch("core.config.save_config") as save_config,
+            redirect_stdout(io.StringIO()),
+        ):
+            install_lifecycle.sync_login_startup_after_install(app)
+            apply_login.assert_called_once()
+            # and with start_at_login false nothing at all happens
+            (self.config_dir / "config.json").write_text(
+                self.CONFIG.replace('"start_at_login": true', '"start_at_login": false'), encoding="utf-8"
+            )
+            before = hash_tree(self.config_dir)
+            install_lifecycle.sync_login_startup_after_install(app)
+            apply_login.assert_called_once()
+        save_config.assert_not_called()
+        self.assertEqual(hash_tree(self.config_dir), before)
+        self.assertEqual(sorted(p.name for p in self.config_dir.iterdir()),
+                         ["config.json", "config.json.bak", "last_device.json"])
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 import inspect
 import unittest
+import tests.support  # noqa: E402,F401  (offscreen Qt, tmp MOUSER_LOG_DIR before main_qml import)
 
 try:
     import main_qml
