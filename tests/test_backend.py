@@ -1101,6 +1101,21 @@ class BackendDeviceLayoutTests(unittest.TestCase):
         with patch("ui.backend.sys.platform", "linux"):
             self.assertTrue(backend.supportsGestureDirections)
 
+    def test_silent_refresh_is_throttled_and_rescan_forces(self):
+        # M5 audit R6: the picker asks for a refresh on every open; the
+        # /Applications walk must not repeat within the throttle window.
+        backend = self._make_backend()
+        with (
+            patch("ui.backend.app_catalog.get_app_catalog") as get_catalog,
+            patch("ui.backend.get_icon_for_exe", return_value=""),
+        ):
+            get_catalog.return_value = []
+            backend.refreshKnownAppsSilently()
+            backend.rescanKnownApps()
+        self.assertEqual(get_catalog.call_args_list[0].kwargs, {"refresh": True})
+        self.assertEqual(
+            get_catalog.call_args_list[1].kwargs, {"refresh": True, "force": True})
+
     def test_known_apps_include_paths_and_refresh_signal(self):
         backend = self._make_backend()
         fake_catalog = [

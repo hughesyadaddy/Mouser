@@ -1816,7 +1816,16 @@ class Backend(QObject):
 
     @Slot()
     def refreshKnownAppsSilently(self):
+        """Picker-open refresh: re-walks the app locations at most once per
+        ``app_catalog.CATALOG_REFRESH_MIN_INTERVAL_S``; otherwise serves the
+        cached catalog."""
         app_catalog.get_app_catalog(refresh=True)
+        self.knownAppsChanged.emit()
+
+    @Slot()
+    def rescanKnownApps(self):
+        """Explicit user rescan: bypasses the refresh throttle."""
+        app_catalog.get_app_catalog(refresh=True, force=True)
         self.knownAppsChanged.emit()
 
     @Slot(str)
