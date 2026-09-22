@@ -939,39 +939,60 @@ class PumpNoSourcesTests(unittest.TestCase):
         self.assertEqual(cf.CFRunLoopRunInMode.call_count, 1)
         self.assertEqual(clock.sleeps, [0.1])
 
-    def test_handled_source_does_not_sleep(self):
+    def _pump_with_rc(self, rc):
         m = self._manager()
         clock = _FakeClock()
-        cf = SimpleNamespace(CFRunLoopRunInMode=Mock(return_value=2))
+        cf = SimpleNamespace(CFRunLoopRunInMode=Mock(return_value=rc))
         with (
             patch.object(hid_gesture, "_cf", cf),
             patch.object(hid_gesture, "time", clock),
         ):
             m.pump(0.1)
-        self.assertEqual(clock.sleeps, [])
+        return clock.sleeps
+
+    def test_handled_source_does_not_sleep(self):
+        # 4 = kCFRunLoopRunHandledSource: a callback ran, the wait was real.
+        self.assertEqual(self._pump_with_rc(4), [])
+
+    def test_stopped_does_not_sleep(self):
+        # 2 = kCFRunLoopRunStopped (CFRunLoopStop from close()): return so
+        # the caller sees _running / the manager state, never spin-sleep.
+        self.assertEqual(self._pump_with_rc(2), [])
 
 
-class SleepingMouseBackoffTests(unittest.TestCase):
-    """Three consecutive HID++ timeouts take ~45 s; the session-age test
-    then called the session healthy, reset the backoff to 2 s and re-ran
-    the candidate re-probe every ~47 s for as long as the mouse slept."""
+class SleepingMouseFastResumeTests(unittest.TestCase):
+    """Three consecutive HID++ timeouts take ~45 s per session while the
+    mouse sleeps. Base re-ran the full enumeration + 7-slot probe on every
+    ~47 s cycle; the first batch-1 fix climbed the backoff instead and left
+    gesture input dead for up to 60 s after the wake (review wake_gap.py:
+    nothing fires a device-arrival when a sleeping mouse wakes). Now the
+    dead session's interface is re-opened directly on a flat 2 s cadence.
+    """
 
-    def test_timeouts_stay_unhealthy_regardless_of_session_age(self):
+    CANDIDATE = {"info": _candidate_info(), "dev_idx": 2}
+
+    def _wake_gap(self, sleep_sessions):
         listener = hid_gesture.HidGestureListener()
         clock = _FakeClock()
         connects = []
+        state = {"asleep": True, "woke_at": None}
 
         def on_connect():
             connects.append(clock.now)
-            if len(connects) >= 4:
+            if len(connects) >= sleep_sessions + 1:
                 listener._running = False
 
         def rx(_timeout_ms=1000):
-            # Session lives 45 s and ends with the third request timeout
-            # (the loop raises on the next iteration).
-            clock.sleep(45.0)
-            listener._consecutive_request_timeouts = 3
-            return None
+            if state["asleep"]:
+                clock.sleep(45.0)
+                listener._consecutive_request_timeouts = 3
+                if len(connects) >= sleep_sessions:
+                    # The mouse wakes just as this session dies.
+                    state["asleep"] = False
+                    state["woke_at"] = clock.now
+                return None
+            clock.sleep(0.2)
+            return [0x11, 0x01, 0x05, 0x00]
 
         listener._on_connect = on_connect
         listener._running = True
@@ -981,13 +1002,101 @@ class SleepingMouseBackoffTests(unittest.TestCase):
             patch.object(listener, "_try_connect", return_value=True),
             patch.object(listener, "_rx", side_effect=rx),
             patch.object(listener, "_undivert"),
+            patch.object(listener, "_on_report"),
             patch("builtins.print"),
         ):
             listener._run_main_loop()
+        first_after = next(c for c in connects if c >= state["woke_at"])
+        return round(first_after - state["woke_at"], 3), listener
 
+    def test_wake_reconnects_within_2s_however_long_the_mouse_slept(self):
+        for sessions in (1, 3, 6, 8):
+            gap, listener = self._wake_gap(sessions)
+            self.assertLessEqual(gap, 2.0, f"{sessions} sleeping sessions: gap {gap}s")
+            self.assertEqual(listener._reconnect_backoff_s, 0.0)
+
+    def _sleeping_loop(self, resume_ok=True, sessions=4):
+        listener = hid_gesture.HidGestureListener()
+        clock = _FakeClock()
+        connects = []
+        usb_calls = []
+        enumerations = []
+
+        def on_connect():
+            connects.append(clock.now)
+            if len(connects) >= sessions:
+                listener._running = False
+
+        def rx(_timeout_ms=1000):
+            clock.sleep(45.0)
+            listener._consecutive_request_timeouts = 3
+            return None
+
+        def enumerate_candidates():
+            enumerations.append(clock.now)
+            return [_candidate_info()]
+
+        def try_connect_usb(infos, resume_dev_idx=None):
+            usb_calls.append((len(infos), resume_dev_idx))
+            if resume_dev_idx is not None and not resume_ok:
+                return False
+            listener._session_candidate = dict(self.CANDIDATE)
+            return True
+
+        listener._on_connect = on_connect
+        listener._running = True
+        listener._iokit_manager = None
+        with (
+            patch.object(hid_gesture, "time", clock),
+            patch.object(listener, "_enumerate_candidates", side_effect=enumerate_candidates),
+            patch.object(listener, "_try_connect_usb", side_effect=try_connect_usb),
+            patch.object(listener, "_rx", side_effect=rx),
+            patch.object(listener, "_undivert"),
+            patch("builtins.print"),
+        ):
+            listener._run_main_loop()
         gaps = [round(b - a, 3) for a, b in zip(connects, connects[1:])]
-        self.assertEqual(gaps, [47.0, 49.0, 53.0])
+        return gaps, usb_calls, enumerations, listener
+
+    def test_asleep_reconnects_on_cached_path_without_enumerating(self):
+        gaps, usb_calls, enumerations, listener = self._sleeping_loop()
+        # Flat 2 s cadence: 45 s session + 2 s wait, never climbing.
+        self.assertEqual(gaps, [47.0, 47.0, 47.0])
+        # One enumeration (the first connect); every reconnect went straight
+        # to the dead session's interface and probed its devIdx only.
+        self.assertEqual(len(enumerations), 1)
+        self.assertEqual(usb_calls, [(1, None), (1, 2), (1, 2), (1, 2)])
+        self.assertEqual(listener.fast_resume_total, 3)
+        self.assertEqual(listener._reconnect_backoff_s, 0.0)
+
+    def test_failed_fast_resume_escalates_and_rescans(self):
+        gaps, usb_calls, enumerations, listener = self._sleeping_loop(resume_ok=False)
+        # Resume fails -> escalate the timeout ladder -> full scan in the
+        # same attempt (which succeeds here), so each cycle costs one extra
+        # probe but still no climbing wait while the scan keeps working.
+        self.assertEqual(usb_calls[:3], [(1, None), (1, 2), (1, None)])
+        self.assertEqual(len(enumerations), 4)
+        # Three failed resumes: 2 -> 4 -> 8 s on the timeout ladder.
         self.assertEqual(listener._reconnect_backoff_s, 8.0)
+
+    def test_escalated_ladder_governs_the_present_retry(self):
+        listener = hid_gesture.HidGestureListener()
+        listener._last_failed_scan = {"digest": "x", "keys": (), "at": 0.0}
+        listener._reconnect_backoff_s = 8.0
+        with patch("builtins.print"):
+            self.assertEqual(listener._next_retry_delay(present=True), 8.0)
+        listener._reconnect_backoff_s = 0.0
+        self.assertEqual(listener._next_retry_delay(present=True), 2.0)
+
+    def test_attach_generation_change_resets_present_ladder(self):
+        listener = hid_gesture.HidGestureListener()
+        listener._running = True
+        listener._present_backoff_s = 16.0
+        listener._attach_gen_seen = listener._attach_gen
+        listener._attach_gen += 1
+        with patch.object(hid_gesture, "time", _FakeClock()):
+            listener._wait_reconnect(30.0)
+        self.assertEqual(listener._present_backoff_s, 0.0)
 
 
 if __name__ == "__main__":

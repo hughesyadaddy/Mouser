@@ -1585,6 +1585,14 @@ class HidGestureListener:
         # tight loop -- thousands of cycles per second.)
         self._attach_gen = 0
         self._attach_gen_seen = 0
+        # Fast resume after a timeout death (device asleep): the candidate
+        # and devIdx of the session that just died, re-opened directly on
+        # the next attempt -- no enumeration, one probe slot -- on the flat
+        # 2 s cadence. Only a failed fast resume escalates the backoff.
+        self._session_candidate = None
+        self._resume_candidate = None
+        self._resume_pending = False
+        self.fast_resume_total = 0
         # (timestamp, infos) memo for _vendor_hid_infos; see VENDOR_INFOS_MEMO_S.
         self._vendor_infos_memo = None
         # Reconnect-storm protection: when a session dies from consecutive
@@ -1679,7 +1687,8 @@ class HidGestureListener:
             self._deskflow_attach_ready = None
             self._pending_decode_update = None
             self._attach_gen += 1
-        self._deskflow_readonly = False
+        # _deskflow_readonly is left for the main-loop cleanup: it is what
+        # tells the cleanup the dying session was the shared sink.
         self._deskflow_paused = False
         from core.hid_deskflow_backend import flush_deskflow_sink
 
@@ -3393,6 +3402,19 @@ class HidGestureListener:
                 if self._deskflow_attach == attach:
                     self._deskflow_attach = None
                     self._deskflow_attach_ready = None
+        if self._resume_pending:
+            self._resume_pending = False
+            resume, self._resume_candidate = self._resume_candidate, None
+            if resume is not None:
+                self.fast_resume_total += 1
+                if self._try_connect_usb(
+                    [dict(resume["info"])], resume_dev_idx=resume["dev_idx"]
+                ):
+                    return True
+                print("[HidGesture] Fast resume failed; falling back to a full scan")
+            # The cached path did not come back: escalate the timeout
+            # ladder (honoured by _next_retry_delay) and scan normally.
+            self._update_reconnect_backoff(False, True)
         if self._should_skip_enumeration():
             self._enumeration_skips += 1
             # Still "present": the last real scan saw candidates and no
@@ -3466,8 +3488,12 @@ class HidGestureListener:
             "at": time.time(),
         }
 
-    def _try_connect_usb(self, infos):
-        """Probe local USB/BLE Logitech interfaces."""
+    def _try_connect_usb(self, infos, resume_dev_idx=None):
+        """Probe local USB/BLE Logitech interfaces.
+
+        ``resume_dev_idx`` is the fast-resume path: ``infos`` is the one
+        candidate the previous session ran on and only that devIdx is
+        probed (no 7-slot sweep, no candidate-block log)."""
         if self._deskflow_attach is not None:
             return False
 
@@ -3501,7 +3527,7 @@ class HidGestureListener:
         # not once per attempt. At the old 4 Hz retry this was ~30 log
         # lines per second for hours while the mouse sat on the other host.
         digest = _scan_digest(infos)
-        if digest != self._last_logged_scan_digest:
+        if resume_dev_idx is None and digest != self._last_logged_scan_digest:
             self._last_logged_scan_digest = digest
             print(f"[HidGesture] Backend preference: {_BACKEND_PREFERENCE}")
             print(f"[HidGesture] Candidate HID interfaces: {len(infos)} (set {digest})")
@@ -3536,6 +3562,7 @@ class HidGestureListener:
             source = info.get("source", "unknown")
             # Snapshot before inner branches rebind `info` to HID++ responses.
             candidate_signature = _candidate_signature(info)
+            candidate_info = dict(info)
             cache_key = _signature_key(candidate_signature)
             failed_at = self._reprog_negative_cache.get(cache_key)
             if failed_at is not None:
@@ -3652,7 +3679,9 @@ class HidGestureListener:
                     cached_dev_idx = int(cached_device.get("dev_idx"))
                 except (TypeError, ValueError):
                     cached_dev_idx = None
-            if cached_dev_idx is not None:
+            if resume_dev_idx is not None:
+                idx_order = (int(resume_dev_idx),)
+            elif cached_dev_idx is not None:
                 idx_order = (cached_dev_idx,) + tuple(
                     i for i in default_idx_order if i != cached_dev_idx
                 )
@@ -3851,6 +3880,9 @@ class HidGestureListener:
                             )
                         except Exception as exc:
                             print(f"[HidGesture] Cache write skipped: {exc}")
+                        self._session_candidate = {
+                            "info": candidate_info, "dev_idx": int(idx),
+                        }
                         return True
                     continue     # divert failed -- try next receiver slot
             if not reprog_found:
@@ -3891,6 +3923,23 @@ class HidGestureListener:
                   f"reconnect backoff {self._reconnect_backoff_s:.0f} s")
         return max(2.0, self._reconnect_backoff_s)
 
+    def _arm_fast_resume(self):
+        """A session died by consecutive HID++ timeouts (device asleep or
+        power-cycled). Queue a direct re-open of the interface it ran on
+        and return the flat 2 s cadence.
+
+        The backoff is deliberately NOT climbed here: nothing fires a
+        device-arrival when a sleeping mouse wakes (the receiver never
+        unplugs, and the closed device delivers no report), so any wait
+        longer than this is dead gesture input after the wake. What the
+        fast resume saves is the full enumeration + 7-slot probe the old
+        "healthy session" reset re-ran every ~47 s while the mouse slept;
+        only a fast resume that fails escalates (see _try_connect).
+        """
+        self._resume_pending = True
+        self._resume_candidate = self._session_candidate
+        return RECONNECT_BACKOFF_MIN_S
+
     def _readonly_retry_delay(self, session_healthy):
         """Delay before re-opening the Deskflow sink after a read-only
         session ended. Uses the present-but-not-connectable ladder
@@ -3922,6 +3971,8 @@ class HidGestureListener:
         gen_seen = self._attach_gen_seen
         while self._running and time.time() < deadline:
             if self._attach_gen != gen_seen:
+                # A new attach/clear starts the present ladder over.
+                self._present_backoff_s = 0.0
                 return
             if self._device_arrival.is_set():
                 self._device_arrival.clear()
@@ -3958,7 +4009,8 @@ class HidGestureListener:
                 cap,
                 max(PRESENT_BACKOFF_MIN_S, self._present_backoff_s * 2),
             )
-            return self._present_backoff_s
+            # A failed fast resume escalated the timeout ladder; honour it.
+            return max(self._present_backoff_s, self._reconnect_backoff_s)
         return (
             ABSENT_POLL_NOTIFIED_S
             if self._has_arrival_notifications()
@@ -4115,12 +4167,20 @@ class HidGestureListener:
             # The Deskflow sink is process-global and close() is terminal:
             # closing it here and re-attaching the same object left read()
             # returning None instantly, which spun this thread at 100 %.
+            # Gate on identity, not on _deskflow_readonly: clear_deskflow_
+            # attach() used to flip that flag before this cleanup ran, so a
+            # bye / dead-link clear closed the sink for the process lifetime
+            # and every later attach was rejected as "sink is closed".
+            from core.hid_deskflow_backend import peek_deskflow_sink
+
             try:
-                if self._dev and not _was_readonly:
+                if self._dev and self._dev is not peek_deskflow_sink():
                     self._dev.close()
             except Exception:
                 pass
             self._dev = None
+            _died_candidate = self._session_candidate
+            self._session_candidate = None
             self._feat_idx = None
             self._dpi_idx = None
             self._smart_shift_idx = None
@@ -4173,7 +4233,10 @@ class HidGestureListener:
             if self._running:
                 if _was_readonly:
                     delay = self._readonly_retry_delay(_session_healthy)
+                elif _timed_out_disconnect:
+                    self._session_candidate = _died_candidate
+                    delay = self._arm_fast_resume()
                 else:
                     delay = self._update_reconnect_backoff(
-                        _session_healthy, _timed_out_disconnect)
+                        _session_healthy, False)
                 self._wait_reconnect(delay)
