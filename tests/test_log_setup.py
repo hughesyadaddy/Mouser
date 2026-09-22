@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
+import tests.support  # noqa: F401 - offscreen Qt before any PySide6 import
 from core import log_setup
 
 
