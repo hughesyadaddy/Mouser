@@ -98,9 +98,10 @@ class QmlStructureTests(unittest.TestCase):
         self.assertRegex(MOUSE_PAGE_QML, r"Loader \{\s*id: debugCardLoader")
         self.assertRegex(MOUSE_PAGE_QML, re.compile(r"id: debugCardLoader.*?active: backend\.debugMode", re.S))
 
-    def test_dismiss_clears_hotspot_selection(self):
+    def test_dismiss_clears_hotspot_selection_only_in_teardown_mode(self):
         self.assertIn("function clearSelection()", MOUSE_PAGE_QML)
         dismiss = re.search(r"function dismiss\(\) \{.*?\n    \}", MAIN_QML, re.S).group(0)
+        self.assertRegex(dismiss, r"if \(windowTeardownEnabled && mousePageLoader\.item\)")
         self.assertIn("clearSelection()", dismiss)
 
 
@@ -215,6 +216,13 @@ class MainWindowHostLiveTests(unittest.TestCase):
             qml_path=str(QML_DIR / "GestureHud.qml"),
             context_properties=cls.context,
         )
+
+    @classmethod
+    def tearDownClass(cls):
+        # Drop the HUD engine while backend / uiState still exist, otherwise
+        # its bindings re-evaluate against null at interpreter exit.
+        cls.hud.release()
+        _pump(50)
 
     def _make_host(self, **kwargs):
         kwargs.setdefault("teardown_delay_ms", 50)
@@ -440,6 +448,7 @@ class MainWindowHostLiveTests(unittest.TestCase):
         page = self._mouse_page()
         picker = self._child(page, "pickerLoader")
         self.assertIsNone(picker.property("item"))
+        self.assertIs(self.host.engine().rootContext().contextProperty("windowTeardownEnabled"), True)
         QMetaObject.invokeMethod(page, "selectHScroll")
         _pump(50)
         self.assertEqual(page.property("selectedButton"), "hscroll_left")
@@ -452,6 +461,25 @@ class MainWindowHostLiveTests(unittest.TestCase):
         self.assertFalse(self.host.is_visible())
         self.assertEqual(page.property("selectedButton"), "")
         self.assertIsNone(picker.property("item"))
+
+    def test_dismiss_keeps_selection_in_hide_only_mode(self):
+        host = self._make_host(teardown_enabled=False)
+        self._extra_hosts.append(host)
+        host.show()
+        _pump(100)
+        self.assertIs(host.engine().rootContext().contextProperty("windowTeardownEnabled"), False)
+        loader = self._child(host.window(), "mousePageLoader")
+        page = loader.property("item")
+        QMetaObject.invokeMethod(page, "selectHScroll")
+        _pump(50)
+        QMetaObject.invokeMethod(host.window(), "dismiss")
+        self.assertFalse(host.is_visible())
+        self.assertEqual(page.property("selectedButton"), "hscroll_left")
+        picker = self._child(page, "pickerLoader")
+        self.assertIsNotNone(picker.property("item"))
+        host.show()
+        _pump(50)
+        self.assertEqual(page.property("selectedButton"), "hscroll_left")
 
     def test_debug_card_loads_only_in_debug_mode(self):
         self.host.show()

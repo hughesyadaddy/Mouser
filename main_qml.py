@@ -161,12 +161,13 @@ def _start_raise_server(app: QApplication, server_name: str) -> "QLocalServer | 
 
 
 def _app_icon() -> QIcon:
-    """Build the QIcon for the window title bar. On macOS, hand QIcon the
-    full-resolution 1024px PNG so AppKit's setApplicationIconImage_
-    (called via QApplication.setWindowIcon) renders crisply at the full
-    Dock tile size instead of the upscaled-256px blur the pre-scaled
-    pixmap path produced. Logs and returns an empty QIcon if the asset
-    file is missing.
+    """Build the QIcon for the window title bar (Linux / Windows only).
+
+    Never used on macOS: libqcocoa forwards ``QApplication.setWindowIcon``
+    to ``NSApp.setApplicationIconImage:``, which renders and retains a
+    32 MiB Dock tile (see ``_install_macos_dock_icon``); macOS has no
+    title-bar icon and the bundle's ``CFBundleIconFile`` covers the Dock.
+    Logs and returns an empty QIcon if the asset file is missing.
     """
     if sys.platform == "linux":
         icon_path = linux_runtime_icon_path()
@@ -663,6 +664,15 @@ def _configure_macos_app_mode():
     only) until the window opens, at which point we promote to Regular so
     Mouser becomes a real Cmd+Tab-able foreground app."""
     _set_macos_activation_policy(regular=False)
+
+
+def _install_window_icon(app) -> None:
+    """``app.setWindowIcon`` everywhere except macOS, where the call costs a
+    32 MiB retained Dock tile per invocation (audit R4) and paints nothing
+    the bundle icon does not already cover."""
+    if sys.platform == "darwin":
+        return
+    app.setWindowIcon(_app_icon())
 
 
 def _install_macos_dock_icon():
@@ -1399,6 +1409,10 @@ class MainWindowHost(QObject):
         for name, value in self._context_properties.items():
             context.setContextProperty(name, value)
         context.setContextProperty("launchHidden", self._launch_hidden)
+        # Main.qml dismiss() resets transient page state (hotspot selection)
+        # only when the engine is going away anyway; hide-only mode keeps
+        # the previous UX (last selection / picker survive a re-open).
+        context.setContextProperty("windowTeardownEnabled", self._teardown_enabled)
         self._launch_hidden = False
         engine.load(QUrl.fromLocalFile(self._qml_path))
         roots = engine.rootObjects()
@@ -1735,7 +1749,7 @@ def main():
     _configure_linux_desktop_file_name(app)
     if sys.platform == "linux":
         sync_linux_icon_theme()
-    app.setWindowIcon(_app_icon())
+    _install_window_icon(app)
     app.setQuitOnLastWindowClosed(False)
     _configure_macos_app_mode()
     _install_macos_dock_icon()

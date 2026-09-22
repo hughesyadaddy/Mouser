@@ -666,9 +666,11 @@ ApplicationWindow {
         if (!root.visible) {
             return
         }
-        // Drop the hotspot selection so no pulse animation / action picker
-        // keeps the hidden window's render loop busy.
-        if (mousePageLoader.item) {
+        // With engine teardown armed the selection would be lost anyway, so
+        // drop it now and stop the pulse animation / action picker keeping
+        // the hidden window's render loop busy. In hide-only mode keep it:
+        // re-opening lands on the same hotspot and picker.
+        if (windowTeardownEnabled && mousePageLoader.item) {
             mousePageLoader.item.clearSelection()
         }
         root.hide()

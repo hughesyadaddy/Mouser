@@ -48,6 +48,8 @@ def _parse_args():
                     help="control run: hide only, never release the engine")
     ap.add_argument("--no-page-switch", action="store_true",
                     help="control run: stay on page 0 (no MousePage/ScrollPage Loader churn)")
+    ap.add_argument("--layout", default="mx_master",
+                    help="device layout key to seed (default mx_master: 6 hotspots); 'none' = disconnected")
     ap.add_argument("--vmmap-all", action="store_true",
                     help="print the largest vmmap region deltas after every step (slow)")
     return ap.parse_args()
@@ -168,6 +170,19 @@ def main() -> int:
         patch("ui.backend.supports_login_startup", return_value=False),
     ):
         backend = Backend(engine=None, root_dir=ROOT)
+    if args.layout != "none":
+        # Backend(engine=None) reports no device, so MousePage would render
+        # neither the device image nor any HotspotDot. Seed a connected
+        # device with a real layout so the lifecycle measures the real page.
+        from core.device_layouts import get_device_layout
+
+        layout = get_device_layout(args.layout)
+        backend._mouse_connected = True
+        backend._device_layout = layout
+        backend.mouseConnectedChanged.emit()
+        backend.deviceLayoutChanged.emit()
+        backend.deviceInfoChanged.emit()
+        print(f"[measure] seeded layout {layout['key']}: {len(layout.get('hotspots', []))} hotspots")
     ui_state = main_qml.UiState(app)
     locale_mgr = LocaleManager(language="en")
     context = {

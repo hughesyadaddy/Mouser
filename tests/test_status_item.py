@@ -11,7 +11,7 @@ import gc
 import unittest
 import weakref
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 try:
     import main_qml
@@ -417,6 +417,30 @@ class DockIconTests(_StatusItemTestCase):
         self.assertEqual(nsapp.icon_sets, 0)
         self.assertEqual(_FakeNSImage.instances, 0)
         self.assertIsNone(main_qml._MACOS_DOCK_ICON_NSIMAGE)
+
+    def test_window_icon_never_reaches_appkit_on_darwin(self):
+        # libqcocoa turns QApplication.setWindowIcon into
+        # NSApp.setApplicationIconImage: (a 32 MiB retained Dock tile).
+        app = MagicMock(spec=main_qml.QApplication)
+        with (
+            patch.object(main_qml.sys, "platform", "darwin"),
+            patch.object(main_qml.QApplication, "setWindowIcon") as class_set,
+        ):
+            main_qml._install_window_icon(app)
+            for _ in range(10):
+                main_qml._set_macos_activation_policy(regular=True)
+                main_qml._set_macos_activation_policy(regular=False)
+        app.setWindowIcon.assert_not_called()
+        class_set.assert_not_called()
+
+    def test_window_icon_is_set_off_darwin(self):
+        app = MagicMock(spec=main_qml.QApplication)
+        with (
+            patch.object(main_qml.sys, "platform", "linux"),
+            patch.object(main_qml, "_app_icon", return_value="icon"),
+        ):
+            main_qml._install_window_icon(app)
+        app.setWindowIcon.assert_called_once_with("icon")
 
     def test_show_hide_storm_sets_dock_icon_at_most_once(self):
         status_bar = _FakeStatusBar()
