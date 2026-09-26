@@ -148,8 +148,26 @@ def installed_program_arguments(install_root: Path) -> list[str]:
 
 def sync_login_startup_after_install(install_root: Path) -> None:
     """Ensure OS login startup matches config after installing a build."""
-    from core.config import load_config
-    from core.startup import apply_login_startup, supports_login_startup
+    # The app is already built, signed and installed by the time this runs
+    # (called right after "Installed: ..." is printed) -- syncing the OS
+    # login-startup entry is a best-effort convenience on top of that, never
+    # something that should take the whole install down. 2026-09-26
+    # (hackintosh): a system libexpat/pyexpat ABI mismatch on that seat made
+    # even importing core.config (-> core.app_catalog -> plistlib ->
+    # xml.parsers.expat) raise ImportError, which escaped uncaught from here
+    # and killed build_and_install.py entirely -- well after Mouser itself
+    # was done, and before the CALLER's (fleet-deploy-macos.sh) own
+    # end-of-run root-steps gate ever got to run for the OTHER app
+    # (Deskflow) it deploys in the same pass.
+    try:
+        from core.config import load_config
+        from core.startup import apply_login_startup, supports_login_startup
+    except Exception as exc:
+        print(
+            f"[startup] Could not import login-startup support, skipping: {exc}",
+            file=sys.stderr,
+        )
+        return
 
     if not supports_login_startup():
         return

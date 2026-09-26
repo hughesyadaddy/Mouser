@@ -274,6 +274,24 @@ class SettingsSurvivalTests(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in self.config_dir.iterdir()),
                          ["config.json", "config.json.bak", "last_device.json"])
 
+    def test_sync_login_startup_after_install_survives_a_broken_import(self):
+        # 2026-09-26 (hackintosh): a system libexpat/pyexpat ABI mismatch made
+        # `from core.config import load_config` itself raise ImportError --
+        # before the try/except around the load_config() *call* even ran --
+        # which escaped this function uncaught and killed the whole install
+        # script after the app was already built, signed and installed.
+        # `None` in sys.modules is the documented way to force ImportError on
+        # a specific import without touching the real module for other tests.
+        app = Path(self.tmp.name) / "Broken.app"
+        (app / "Contents" / "MacOS").mkdir(parents=True)
+        (app / "Contents" / "MacOS" / "Mouser").write_bytes(b"\xcf\xfa\xed\xfe")
+        with (
+            mock.patch.dict(sys.modules, {"core.config": None}),
+            redirect_stderr(io.StringIO()) as err,
+        ):
+            install_lifecycle.sync_login_startup_after_install(app)  # must not raise
+        self.assertIn("Could not import login-startup support", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
