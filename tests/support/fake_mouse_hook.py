@@ -42,6 +42,9 @@ class FakeMouseHook:
     def set_connection_change_callback(self, cb):
         self._connection_change_callback = cb
 
+    def set_focus_change_callback(self, cb):
+        self._focus_change_callback = cb
+
     def configure_gestures(self, **kwargs):
         self._gesture_config = kwargs
 
@@ -62,6 +65,13 @@ class FakeMouseHook:
 
     def set_remote_forwarder(self, forwarder):
         self._remote_forwarder = forwarder
+        if forwarder is not None:
+            forwarder.on_focus_change = self._on_remote_focus_change
+
+    def _on_remote_focus_change(self):
+        cb = getattr(self, "_focus_change_callback", None)
+        if cb:
+            cb()
 
     def gesture_decode_context(self):
         return None

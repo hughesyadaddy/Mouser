@@ -93,8 +93,35 @@ class HookPredicateTests(unittest.TestCase):
 
         self.hook.set_remote_forwarder(forwarder)
 
-        self.assertIs(forwarder.on_focus_change, self.hook.sync_hook_state)
         self.assertEqual(synced, [True])
+        # Bound methods aren't interned (obj.m is obj.m is False even for the
+        # same instance/function), so compare by value, not identity.
+        self.assertEqual(forwarder.on_focus_change, self.hook._on_remote_focus_change)
+
+        # A later focus flip must keep re-syncing, same as before this was
+        # routed through _on_remote_focus_change instead of sync_hook_state
+        # directly.
+        forwarder.on_focus_change()
+        self.assertEqual(synced, [True, True])
+
+    def test_remote_focus_change_notifies_registered_focus_callback(self):
+        seen = []
+        self.hook.set_focus_change_callback(lambda: seen.append(True))
+        forwarder = SimpleNamespace(should_forward=lambda: False)
+        self.hook.set_remote_forwarder(forwarder)
+
+        forwarder.on_focus_change()
+
+        self.assertEqual(seen, [True])
+
+    def test_remote_focus_change_swallows_callback_exception(self):
+        self.hook.set_focus_change_callback(
+            lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+        forwarder = SimpleNamespace(should_forward=lambda: False)
+        self.hook.set_remote_forwarder(forwarder)
+
+        forwarder.on_focus_change()  # must not raise
 
     def test_hid_connect_and_disconnect_trigger_sync(self):
         synced = []

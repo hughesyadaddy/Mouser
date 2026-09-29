@@ -40,6 +40,7 @@ class BaseMouseHook:
         self._hid_gesture = None
         self._device_connected = False
         self._connection_change_cb = None
+        self._focus_change_cb = None
         self.divert_mode_shift = False
         self.divert_dpi_switch = False
         self._gesture_direction_enabled = False
@@ -144,6 +145,11 @@ class BaseMouseHook:
 
     def set_connection_change_callback(self, cb):
         self._connection_change_cb = cb
+
+    def set_focus_change_callback(self, cb):
+        """``cb()`` runs on every KVM focus flip reported by whichever
+        object currently owns the focus gate (see set_remote_forwarder)."""
+        self._focus_change_cb = cb
 
     @property
     def device_connected(self):
@@ -284,8 +290,16 @@ class BaseMouseHook:
         self._remote_forwarder = forwarder
         if forwarder is not None:
             # Focus flips change _should_intercept_events; follow them.
-            forwarder.on_focus_change = self.sync_hook_state
+            forwarder.on_focus_change = self._on_remote_focus_change
         self.sync_hook_state()
+
+    def _on_remote_focus_change(self):
+        self.sync_hook_state()
+        if self._focus_change_cb:
+            try:
+                self._focus_change_cb()
+            except Exception as exc:  # noqa: BLE001 - callback boundary
+                print(f"[MouseHook] focus_change_cb raised: {exc!r}")
 
     def _maybe_forward_raw_report(self, raw) -> bool:
         """Listener raw-report tap.

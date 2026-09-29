@@ -27,6 +27,11 @@ from core.logi_devices import clamp_dpi
 
 HSCROLL_ACTION_COOLDOWN_S = 0.35
 HSCROLL_VOLUME_COOLDOWN_S = 0.06
+# How long a KVM focus flip waits for more flips before realigning firmware
+# wheel invert (see Engine._on_kvm_focus_change). Long enough that ordinary
+# screen-edge crossings and a reconnect storm both collapse to one write;
+# short enough that a deliberate switch is corrected before the user notices.
+KVM_WHEEL_REALIGN_DEBOUNCE_S = 2.0
 _VOLUME_ACTIONS = {"volume_up", "volume_down"}
 
 
@@ -92,11 +97,20 @@ class Engine:
         self._wheel_divert_change_cb = None
         self._wheel_divert_active_local = False
         self._last_native_invert_target = None
+        # KVM focus flips far outnumber real "the user switched machines"
+        # events (screen-edge crossings, and a Deskflow reconnect storm can
+        # produce hundreds in a few seconds -- see _on_kvm_focus_change), so
+        # the firmware realign they trigger is coalesced onto one cancel-and
+        # -reschedule timer rather than running once per flip.
+        self._wheel_realign_lock = threading.Lock()
+        self._wheel_realign_timer = None
+        self._wheel_realign_generation = 0
         self.hook.set_debug_callback(self._emit_debug)
         self.hook.set_gesture_callback(self._emit_gesture_event)
         self.hook.set_status_callback(self._emit_status)
         self._setup_hooks()
         self.hook.set_connection_change_callback(self._on_connection_change)
+        self.hook.set_focus_change_callback(self._on_kvm_focus_change)
         # Apply persisted DPI setting
         dpi = self.cfg.get("settings", {}).get("dpi", 1000)
         try:
@@ -935,6 +949,67 @@ class Engine:
                 except Exception as exc:  # noqa: BLE001 - relay boundary
                     print(f"[Engine] bridge decode notify failed: {exc!r}")
 
+    def _on_kvm_focus_change(self):
+        """A KVM focus flip on whichever object owns the focus gate.
+
+        Firmware wheel invert is only writable from the machine the mouse
+        is physically attached to (``device_readonly`` is False there), and
+        ``_undivert``'s revert-on-disconnect write is best-effort and often
+        fails, so the device's actual firmware state can silently drift from
+        the saved setting between one focus hand-off and the next. Realign
+        it the same way ``_apply_wheel_invert_setting(force=True)`` already
+        does after sleep. A read-only or deviceless hook has nothing to
+        realign here.
+
+        Focus flips fire far more often than real "the user switched
+        machines" events -- routine screen-edge crossings, and a Deskflow
+        reconnect storm has been observed producing ~170 flips in 3 seconds
+        on this fleet -- so this schedules one debounced, cancel-and
+        -reschedule realign rather than running per flip (see
+        _schedule_wheel_invert_realign). It deliberately does NOT go through
+        the full _request_saved_settings_replay: that also writes DPI and
+        Smart Shift and sleeps for seconds per attempt, none of which is
+        what a focus flip needs, and would turn a reconnect storm into a
+        sustained hot loop of unrelated device writes.
+        """
+        if self.connected_device is None or self.device_readonly:
+            return
+        self._schedule_wheel_invert_realign()
+
+    def _schedule_wheel_invert_realign(self):
+        with self._wheel_realign_lock:
+            if self._wheel_realign_timer is not None:
+                self._wheel_realign_timer.cancel()
+            # threading.Timer.cancel() cannot guarantee a timer that is
+            # already about to fire won't run anyway. Tag this schedule with
+            # a generation so a stale firing (racing a newer reschedule) can
+            # tell it's been superseded instead of clobbering the slot the
+            # newer timer owns or re-issuing an already-superseded write.
+            self._wheel_realign_generation += 1
+            generation = self._wheel_realign_generation
+            timer = threading.Timer(
+                KVM_WHEEL_REALIGN_DEBOUNCE_S,
+                self._run_wheel_invert_realign,
+                args=(generation,),
+            )
+            timer.daemon = True
+            self._wheel_realign_timer = timer
+            timer.start()
+
+    def _run_wheel_invert_realign(self, generation):
+        with self._wheel_realign_lock:
+            if generation != self._wheel_realign_generation:
+                return  # superseded; a newer timer owns the slot now
+            self._wheel_realign_timer = None
+        # Re-check: the device may have disconnected or gone read-only while
+        # this was waiting out the debounce window.
+        if self.connected_device is None or self.device_readonly:
+            return
+        try:
+            self._apply_wheel_invert_setting(force=True)
+        except Exception as exc:  # noqa: BLE001 - timer-thread boundary
+            print(f"[Engine] KVM focus realign failed: {exc!r}")
+
     def _retire_battery_poller(self):
         """Signal the current poller to exit; never block on it.
 
@@ -1243,6 +1318,10 @@ class Engine:
             return
         if getattr(self.hook, "_remote_forwarder", None) is server:
             self.hook.set_remote_forwarder(None)
+        # A retired server's own teardown can still run its session-end path
+        # on another thread; clear the slot so it can't fire a focus change
+        # into the hook after this object is no longer the focus gate.
+        server.on_focus_change = None
         try:
             server.stop(reason)
         except Exception as exc:  # noqa: BLE001 - shutdown must complete
@@ -1348,10 +1427,14 @@ class Engine:
     def _stop_remote_forwarder(self):
         if self._remote_forwarder is None:
             return
+        forwarder = self._remote_forwarder
         # Hand the focus gate back to the bridge (or clear it).
         self.hook.set_remote_forwarder(self._remote_device_server)
+        # Same reasoning as _stop_remote_device_server: don't let the old
+        # forwarder's own stop()/session-end path fire a stale focus change.
+        forwarder.on_focus_change = None
         try:
-            self._remote_forwarder.stop()
+            forwarder.stop()
         except Exception as exc:  # noqa: BLE001 - shutdown must complete
             print(f"[Engine] stop: remote forwarder raised: {exc!r}")
         self._remote_forwarder = None

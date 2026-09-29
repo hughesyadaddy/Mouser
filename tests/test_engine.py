@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 
 from core.config import DEFAULT_CONFIG
 from core.mouse_hook import MouseEvent
-from core.mouse_hook_types import HidRuntimeState
+from core.mouse_hook_types import DEVICE_SOURCE_DESKFLOW_SHIM, HidRuntimeState
 from tests.support.engine_test_helpers import engine_start_without_kvm
 from tests.support.fake_mouse_hook import FakeMouseHook as _FakeMouseHook
 
@@ -50,6 +50,32 @@ class _RecordedThread:
         if self._target:
             return self._target(*self._args, **self._kwargs)
         return None
+
+
+class _RecordedTimer:
+    """Fake threading.Timer: records every instance so a test can assert on
+    cancellation across a burst, and fires synchronously instead of waiting
+    out the real interval."""
+
+    instances = []
+
+    def __init__(self, interval, function, args=None, kwargs=None):
+        self.interval = interval
+        self.function = function
+        self.args = args or ()
+        self.kwargs = kwargs or {}
+        self.cancelled = False
+        self.daemon = False
+        type(self).instances.append(self)
+
+    def start(self):
+        pass
+
+    def cancel(self):
+        self.cancelled = True
+
+    def fire(self):
+        self.function(*self.args, **self.kwargs)
 
 
 class EngineHorizontalScrollTests(unittest.TestCase):
@@ -607,6 +633,138 @@ class EngineDeskflowIntegrationTests(unittest.TestCase):
         self.assertEqual(engine.cfg["settings"]["bridge_proto"], 2)
         forwarder.stop.assert_called_once()
         self.assertIsNone(engine._remote_forwarder)
+
+    def test_kvm_focus_change_schedules_realign_on_writable_device(self):
+        # 2026-09-28: firmware wheel invert only gets (re)armed when the
+        # local HidGestureListener freshly connects, and _undivert's
+        # revert-on-disconnect write is best-effort and fails in practice,
+        # so a KVM focus hand-off away from this machine and back could
+        # leave the device's actual invert state stale with nothing to
+        # notice. A focus flip must schedule a realign, same as after sleep
+        # -- but see the debounce tests below for why it's not immediate.
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        engine, _server_cls = self._engine(cfg, None, [])
+        forwarder = Mock()
+        engine.hook.set_remote_forwarder(forwarder)
+        engine.hook.connected_device = SimpleNamespace(source="usb-local")
+        with patch.object(engine, "_schedule_wheel_invert_realign") as schedule:
+            forwarder.on_focus_change()
+        schedule.assert_called_once()
+
+    def test_kvm_focus_change_does_nothing_when_device_is_readonly(self):
+        # The read-only Deskflow-ingress side can never write firmware
+        # settings (see HidGesture.request_wheel_native_invert); scheduling
+        # a realign there would only produce a spurious "could not restore
+        # settings" status message for nothing to actually restore.
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        engine, _server_cls = self._engine(cfg, None, [])
+        forwarder = Mock()
+        engine.hook.set_remote_forwarder(forwarder)
+        engine.hook.connected_device = SimpleNamespace(source=DEVICE_SOURCE_DESKFLOW_SHIM)
+        with patch.object(engine, "_schedule_wheel_invert_realign") as schedule:
+            forwarder.on_focus_change()
+        schedule.assert_not_called()
+
+    def test_kvm_focus_change_does_nothing_without_a_device(self):
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        engine, _server_cls = self._engine(cfg, None, [])
+        forwarder = Mock()
+        engine.hook.set_remote_forwarder(forwarder)
+        engine.hook.connected_device = None
+        with patch.object(engine, "_schedule_wheel_invert_realign") as schedule:
+            forwarder.on_focus_change()
+        schedule.assert_not_called()
+
+    def test_rapid_focus_flips_coalesce_into_one_realign(self):
+        # A Deskflow reconnect storm has been observed producing ~170 focus
+        # flips in 3 seconds on this fleet (deskflow_kvm_autoswitch death-
+        # spiral). Each flip must cancel any pending timer and reschedule,
+        # never fire its own -- otherwise a storm becomes a hot loop of real
+        # HID++ writes to the physical mouse.
+        _RecordedTimer.instances = []
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        engine, _server_cls = self._engine(cfg, None, [])
+        forwarder = Mock()
+        engine.hook.set_remote_forwarder(forwarder)
+        engine.hook.connected_device = SimpleNamespace(source="usb-local")
+        with (
+            patch("core.engine.threading.Timer", _RecordedTimer),
+            patch.object(engine, "_apply_wheel_invert_setting") as apply_setting,
+        ):
+            for _ in range(170):
+                forwarder.on_focus_change()
+            self.assertEqual(len(_RecordedTimer.instances), 170)
+            self.assertTrue(all(t.cancelled for t in _RecordedTimer.instances[:-1]))
+            last = _RecordedTimer.instances[-1]
+            self.assertFalse(last.cancelled)
+            last.fire()
+        apply_setting.assert_called_once_with(force=True)
+
+    def test_stale_timer_firing_after_a_newer_reschedule_is_a_no_op(self):
+        # threading.Timer.cancel() cannot guarantee a timer already about to
+        # fire won't run anyway. A stale firing racing a newer reschedule
+        # must not clobber the slot the newer timer owns, and must not
+        # re-issue a write for a switch that's already been superseded.
+        _RecordedTimer.instances = []
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        engine, _server_cls = self._engine(cfg, None, [])
+        forwarder = Mock()
+        engine.hook.set_remote_forwarder(forwarder)
+        engine.hook.connected_device = SimpleNamespace(source="usb-local")
+        with (
+            patch("core.engine.threading.Timer", _RecordedTimer),
+            patch.object(engine, "_apply_wheel_invert_setting") as apply_setting,
+        ):
+            forwarder.on_focus_change()  # schedules timer #1
+            forwarder.on_focus_change()  # (would) cancel #1, schedules #2
+            stale, current = _RecordedTimer.instances
+
+            stale.fire()  # simulate #1 winning the race and firing anyway
+            apply_setting.assert_not_called()
+            self.assertIs(engine._wheel_realign_timer, current)
+
+            current.fire()  # the still-current timer must still work
+        apply_setting.assert_called_once_with(force=True)
+
+    def test_realign_rechecks_readonly_state_when_it_fires(self):
+        # The device can go read-only (KVM focus moved away for good, or the
+        # bridge attached a virtual device) while the debounce timer is
+        # still waiting; the write must not happen against stale state.
+        _RecordedTimer.instances = []
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        engine, _server_cls = self._engine(cfg, None, [])
+        forwarder = Mock()
+        engine.hook.set_remote_forwarder(forwarder)
+        engine.hook.connected_device = SimpleNamespace(source="usb-local")
+        with (
+            patch("core.engine.threading.Timer", _RecordedTimer),
+            patch.object(engine, "_apply_wheel_invert_setting") as apply_setting,
+        ):
+            forwarder.on_focus_change()
+            engine.hook.connected_device = SimpleNamespace(
+                source=DEVICE_SOURCE_DESKFLOW_SHIM
+            )
+            _RecordedTimer.instances[-1].fire()
+        apply_setting.assert_not_called()
+
+    def test_stopping_forwarder_clears_its_focus_callback(self):
+        # A retired forwarder's own stop()/session-end path can still run on
+        # another thread; on_focus_change must not survive past this call,
+        # or a late focus notice would drive a realign for a switch that is
+        # no longer this engine's concern.
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        engine, _server_cls = self._engine(cfg, None, [])
+        forwarder = Mock()
+        engine._remote_forwarder = forwarder
+        engine.hook.set_remote_forwarder(forwarder)
+        engine._stop_remote_forwarder()
+        self.assertIsNone(forwarder.on_focus_change)
+
+    def test_stopping_remote_device_server_clears_its_focus_callback(self):
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        engine, server_cls = self._engine(cfg, None, [])
+        engine._stop_remote_device_server()
+        self.assertIsNone(server_cls.return_value.on_focus_change)
 
 
 if __name__ == "__main__":
