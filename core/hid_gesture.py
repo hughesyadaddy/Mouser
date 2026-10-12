@@ -1609,6 +1609,9 @@ class HidGestureListener:
         # without any WM_DEVICECHANGE, so entries must expire on their own.
         self._reprog_negative_cache = {}
         self._device_arrival = threading.Event()
+        # Bumped with every arrival: a probe consumes the arrival it answered
+        # only when no newer one landed while it was enumerating.
+        self._arrival_gen = 0
         self._last_scan_had_candidates = False
         self._last_arrival_clear = 0.0
         # Present-but-not-connectable backoff (see PRESENT_BACKOFF_*).
@@ -1637,7 +1640,7 @@ class HidGestureListener:
             ready.set()
 
     def request_deskflow_attach(self, decode, product_id=None, product_name=None):
-        """Queue a read-only Deskflow sink connection (no USB probe).
+        """Queue a read-only Deskflow sink connection (the local-first fallback).
 
         Idempotent while the ingress is already live on the same device:
         Deskflow re-announces the device on a cadence, and every announcement
@@ -1667,6 +1670,17 @@ class HidGestureListener:
             self._deskflow_attach = request
             self._deskflow_attach_ready = ready
             self._attach_gen += 1
+            local_session = self._connected and not self._deskflow_readonly
+        if local_session:
+            # A local Logitech device is live: it wins. The request stays
+            # queued as the fallback for when that device goes away, and the
+            # caller hears "not attached" now instead of after a 5 s wait
+            # (Deskflow re-announces on a cadence).
+            print(
+                "[HidGesture] Deskflow attach deferred: a local Logitech device "
+                "is connected (ingress is the fallback)"
+            )
+            return False
         if self._connected:
             self._reconnect_requested = True
         return ready.wait(timeout=5.0)
@@ -1862,6 +1876,7 @@ class HidGestureListener:
         self._reprog_negative_cache.clear()
         self._last_failed_scan = None
         self._vendor_infos_memo = None
+        self._arrival_gen += 1
         self._device_arrival.set()
 
     def _on_iokit_device_arrival(self):
@@ -1877,6 +1892,7 @@ class HidGestureListener:
         """
         self._last_failed_scan = None
         self._vendor_infos_memo = None
+        self._arrival_gen += 1
         self._device_arrival.set()
         now = time.time()
         if now - self._last_arrival_clear < ARRIVAL_CLEAR_MIN_INTERVAL_S:
@@ -3384,13 +3400,21 @@ class HidGestureListener:
         per-slot timeout. On divert success the working tuple is
         persisted so the next launch hits the warm path.
 
-        When no local USB device is available, a pending Deskflow attach
-        opens the in-process sink (Tier 1.5 hidapi shim). While a Deskflow
-        attach is pending, skip USB probing so KVM ingress connects promptly.
+        Local first. A physically present Logitech device ALWAYS wins over
+        the relayed one: the local probe runs before a pending Deskflow
+        attach is honoured, and the attach (Tier 1.5 hidapi shim, the
+        in-process sink) is the fallback for when nothing local connects.
+        remote_device applies the same rule to a new attach while a local
+        device is connected; this is the rule for the listener's own
+        reconnects -- a sleeping mouse that wakes, or a Bluetooth mouse
+        Easy-Switched to this seat while the ingress is live, used to lose
+        to the ingress until the ingress died.
         """
         with self._deskflow_control_lock:
             attach = self._deskflow_attach
             self._attach_gen_seen = self._attach_gen
+        if self._try_connect_local():
+            return True
         if attach is not None:
             if self._try_connect_deskflow(attach):
                 return True
@@ -3402,6 +3426,15 @@ class HidGestureListener:
                 if self._deskflow_attach == attach:
                     self._deskflow_attach = None
                     self._deskflow_attach_ready = None
+        return False
+
+    def _try_connect_local(self):
+        """Fast resume, then the (skip-aware) enumerate-and-probe of local
+        USB/BLE Logitech interfaces. A device-arrival event is CONSUMED by
+        the probe it triggered (cleared once the candidate set has been
+        read, resetting the backoff like _wait_reconnect does), so a probe
+        that then falls back to the Deskflow ingress does not see the same
+        arrival again and tear the ingress down in a loop."""
         if self._resume_pending:
             self._resume_pending = False
             resume, self._resume_candidate = self._resume_candidate, None
@@ -3421,7 +3454,16 @@ class HidGestureListener:
             # removal callback has fired since.
             self._last_scan_had_candidates = True
             return False
+        arrival_pending = self._device_arrival.is_set()
+        arrival_gen = self._arrival_gen
         infos = self._enumerate_candidates()
+        if arrival_pending and self._arrival_gen == arrival_gen:
+            # This scan is the answer to that arrival. One landing DURING
+            # the enumeration (or the probe below) keeps the flag set and
+            # is honoured by _note_failed_scan / _wait_reconnect as before.
+            self._device_arrival.clear()
+            self._reconnect_backoff_s = 0.0
+            self._present_backoff_s = 0.0
         if infos:
             if self._try_connect_usb(infos):
                 return True
@@ -3493,10 +3535,8 @@ class HidGestureListener:
 
         ``resume_dev_idx`` is the fast-resume path: ``infos`` is the one
         candidate the previous session ran on and only that devIdx is
-        probed (no 7-slot sweep, no candidate-block log)."""
-        if self._deskflow_attach is not None:
-            return False
-
+        probed (no 7-slot sweep, no candidate-block log). Runs whether or
+        not a Deskflow attach is pending: local wins (see _try_connect)."""
         cached = _load_last_device_cache()
         cached_candidate = (
             cached.get("candidate") if isinstance(cached, dict) else None
@@ -3553,8 +3593,6 @@ class HidGestureListener:
 
         shared_manager = self._mac_manager()
         for info in infos:
-            if self._deskflow_attach is not None:
-                return False
             pid = info.get("product_id", 0)
             up = info.get("usage_page", 0)
             usage = info.get("usage", 0)
@@ -3690,14 +3728,6 @@ class HidGestureListener:
             reprog_found = False
             hidpp_name = None
             for idx in idx_order:
-                if self._deskflow_attach is not None:
-                    try:
-                        if self._dev:
-                            self._dev.close()
-                    except Exception:
-                        pass
-                    self._dev = None
-                    return False
                 self._dev_idx = idx
                 fi = self._find_feature(FEAT_REPROG_V4, timeout_ms=400)
                 if fi is not None:
@@ -4085,6 +4115,15 @@ class HidGestureListener:
                     if self._reconnect_requested:
                         self._reconnect_requested = False
                         raise IOError("reconnect requested")
+                    if self._deskflow_readonly and self._device_arrival.is_set():
+                        # Local first: a Logitech device just appeared here
+                        # (plugged in, woke up, Easy-Switched to this seat).
+                        # Rebuild so _try_connect can take it over the
+                        # relayed ingress; the attach stays queued as the
+                        # fallback if the probe finds nothing usable.
+                        raise IOError(
+                            "local device arrived -- preferring it over the Deskflow ingress"
+                        )
                     self._apply_pending_decode_update()
                     # If too many consecutive HID++ requests timed out, the
                     # device likely went to sleep or power-cycled.  Force a

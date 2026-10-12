@@ -250,6 +250,7 @@ class DeskflowAttachIdempotencyTests(unittest.TestCase):
         """Short-circuiting here would report success for an attach that never
         happened -- the ingress is not live yet."""
         self.listener._deskflow_readonly = False
+        self.listener._connected = False
         self.listener._deskflow_attach = {
             "decode": dict(DECODE),
             "product_id": 0xB042,
@@ -263,7 +264,16 @@ class DeskflowAttachIdempotencyTests(unittest.TestCase):
                     dict(DECODE), product_id=0xB042, product_name="MX Master 4"
                 )
             )
-        self.assertTrue(self.listener._reconnect_requested)
+        self.assertIsNotNone(self.listener._deskflow_attach)
+
+    def test_a_live_local_session_is_never_torn_down_for_an_attach(self):
+        """Local first: a physically connected Logitech device wins. The
+        request is queued as the fallback and answered "not attached" at
+        once, without the 5 s wait and without killing the local session."""
+        self.listener._deskflow_readonly = False   # connected to a local device
+        self.assertFalse(self._attach())
+        self.assertFalse(self.listener._reconnect_requested)
+        self.assertIsNotNone(self.listener._deskflow_attach)
 
     def test_first_attach_is_never_short_circuited(self):
         self.assertIsNone(self.listener._deskflow_attach)

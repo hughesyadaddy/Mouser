@@ -750,6 +750,9 @@ class ReadonlyReconnectChurnTests(unittest.TestCase):
             patch.object(hid_gesture, "time", self.clock),
             patch.object(hid_gesture, "INSTANT_NONE_LIMIT", 1),
             patch.object(listener, "_rx", side_effect=rx),
+            # Local first: every attempt looks for a local device before the
+            # ingress; none here.
+            patch.object(listener, "_enumerate_candidates", return_value=[]),
             patch("builtins.print"),
         ):
             listener._run_main_loop()
@@ -758,10 +761,8 @@ class ReadonlyReconnectChurnTests(unittest.TestCase):
         self.assertEqual(len(self.connects), 6)
         self.assertGreaterEqual(min(gaps), 1.0)
         self.assertEqual(gaps, [1.0, 2.0, 4.0, 8.0, 16.0])
-        # The request is still queued (Deskflow never withdrew it) ...
+        # The request is still queued (Deskflow never withdrew it).
         self.assertIsNotNone(listener._deskflow_attach)
-        # ... and nothing was enumerated in the meantime.
-        self.assertIsNone(listener._vendor_infos_memo)
 
     def test_healthy_readonly_session_resets_ladder(self):
         listener = self.listener
@@ -806,6 +807,154 @@ class ReadonlyReconnectChurnTests(unittest.TestCase):
         ):
             self.assertTrue(listener._try_connect())
         self.assertEqual(listener._attach_gen_seen, listener._attach_gen)
+
+
+class LocalFirstTests(unittest.TestCase):
+    """A physically present Logitech device always wins over the relayed
+    one. The Deskflow ingress is the fallback, never the preference: with
+    an attach pending the local probe still runs first, and a device that
+    arrives while the ingress is live takes over from it."""
+
+    DECODE = {"feat_idx": 5, "gesture_cid": "0x00C3"}
+
+    def setUp(self):
+        from core.hid_deskflow_backend import reset_deskflow_sink_for_tests
+
+        reset_deskflow_sink_for_tests()
+        self.listener = hid_gesture.HidGestureListener()
+        self.listener._iokit_manager = None
+        with self.listener._deskflow_control_lock:
+            self.listener._deskflow_attach = {
+                "decode": dict(self.DECODE),
+                "product_id": 0xC548,
+                "product_name": "MX Master 3S",
+            }
+            self.listener._attach_gen += 1
+
+    def tearDown(self):
+        from core.hid_deskflow_backend import reset_deskflow_sink_for_tests
+
+        reset_deskflow_sink_for_tests()
+
+    def test_local_candidate_wins_over_pending_attach(self):
+        listener = self.listener
+        deskflow = Mock(return_value=True)
+        with (
+            patch.object(listener, "_enumerate_candidates", return_value=[_candidate_info()]),
+            patch.object(listener, "_try_connect_usb", return_value=True) as usb,
+            patch.object(listener, "_try_connect_deskflow", deskflow),
+            patch("builtins.print"),
+        ):
+            self.assertTrue(listener._try_connect())
+        usb.assert_called_once()
+        deskflow.assert_not_called()
+        # The attach stays queued: it is the fallback for when the local
+        # device goes away.
+        self.assertIsNotNone(listener._deskflow_attach)
+
+    def test_no_local_candidate_falls_back_to_ingress(self):
+        listener = self.listener
+        deskflow = Mock(return_value=True)
+        with (
+            patch.object(listener, "_enumerate_candidates", return_value=[]),
+            patch.object(listener, "_try_connect_usb") as usb,
+            patch.object(listener, "_try_connect_deskflow", deskflow),
+            patch("builtins.print"),
+        ):
+            self.assertTrue(listener._try_connect())
+        usb.assert_not_called()
+        deskflow.assert_called_once()
+
+    def test_local_probe_failure_falls_back_to_ingress(self):
+        listener = self.listener
+        deskflow = Mock(return_value=True)
+        with (
+            patch.object(listener, "_enumerate_candidates", return_value=[_candidate_info()]),
+            patch.object(listener, "_try_connect_usb", return_value=False) as usb,
+            patch.object(listener, "_try_connect_deskflow", deskflow),
+            patch("builtins.print"),
+        ):
+            self.assertTrue(listener._try_connect())
+        usb.assert_called_once()
+        deskflow.assert_called_once()
+
+    def test_usb_probe_runs_while_attach_pending(self):
+        # _try_connect_usb used to return False on the spot whenever an
+        # attach was queued, so the local device was never even opened.
+        listener = self.listener
+        info = _candidate_info()
+        with _HidapiFailingConnect(listener, [info]) as ctx:
+            self.assertFalse(listener._try_connect_usb([dict(info)]))
+            self.assertTrue(ctx.fake_dev.open_path.called)
+
+    def test_arrival_is_consumed_by_the_probe_it_triggered(self):
+        # Otherwise a probe that finds nothing and falls back to the ingress
+        # would see the same arrival from the read loop and tear the fresh
+        # ingress session down again, forever.
+        listener = self.listener
+        listener._device_arrival.set()
+        listener._reconnect_backoff_s = 16.0
+        with (
+            patch.object(listener, "_enumerate_candidates", return_value=[]),
+            patch.object(listener, "_try_connect_deskflow", return_value=True),
+            patch("builtins.print"),
+        ):
+            self.assertTrue(listener._try_connect())
+        self.assertFalse(listener._device_arrival.is_set())
+        self.assertEqual(listener._reconnect_backoff_s, 0.0)
+
+    def test_arrival_during_live_ingress_rebuilds_toward_local(self):
+        listener = self.listener
+        connects = []
+        reasons = []
+        listener._on_connect = lambda: connects.append(len(connects))
+        listener._running = True
+        enumerate = Mock(return_value=[])
+
+        def rx(_timeout_ms=1000):
+            if len(connects) == 1:
+                # The Bluetooth mouse was Easy-Switched to this seat.
+                listener._device_arrival.set()
+            if len(connects) >= 2:
+                listener._running = False
+            return b"\x11\x01\x05\x00"  # a live, well-behaved sink
+
+        real_print = print
+
+        def capture(*args, **kwargs):
+            reasons.append(" ".join(str(a) for a in args))
+
+        with (
+            patch.object(listener, "_rx", side_effect=rx),
+            patch.object(listener, "_enumerate_candidates", enumerate),
+            patch.object(listener, "_on_report", lambda raw: None),
+            patch.object(listener, "_wait_reconnect", lambda delay: None),
+            patch("builtins.print", side_effect=capture),
+        ):
+            listener._run_main_loop()
+        del real_print
+
+        self.assertEqual(len(connects), 2)
+        self.assertTrue(
+            any("local device arrived" in line for line in reasons), reasons
+        )
+        # The rebuild looked for a local device (and, finding none, came
+        # back to the ingress with the attach still queued).
+        self.assertGreaterEqual(enumerate.call_count, 2)
+        self.assertIsNotNone(listener._deskflow_attach)
+        self.assertFalse(listener._device_arrival.is_set())
+
+    def test_attach_request_defers_to_live_local_session(self):
+        listener = hid_gesture.HidGestureListener()
+        listener._connected = True
+        listener._deskflow_readonly = False
+        with patch("builtins.print"):
+            self.assertFalse(
+                listener.request_deskflow_attach(dict(self.DECODE), product_id=0xC548)
+            )
+        # Queued as the fallback, but the local session is left alone.
+        self.assertIsNotNone(listener._deskflow_attach)
+        self.assertFalse(listener._reconnect_requested)
 
 
 class AttachContentCompareTests(unittest.TestCase):
