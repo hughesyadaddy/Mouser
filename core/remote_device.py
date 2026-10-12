@@ -371,7 +371,7 @@ class RemoteDeviceServer:
     def _handle_binary_report(self, payload):
         if self._paused or not self._owns_connection():
             return
-        if self._listener_ingress:
+        if self._uses_ingress():
             get_deskflow_sink().feed_report(payload)
             return
         if self._raw_decoder is None:
@@ -413,24 +413,43 @@ class RemoteDeviceServer:
         else:
             self._send(conn, {"ok": False, "error": "unknown_message_type"})
 
+    def _ingress_live(self) -> bool:
+        """The main HID listener is running a read-only Deskflow ingress
+        session. Derived from the listener, not from our own bookkeeping:
+        the listener attaches the ingress whenever its local probe finds
+        nothing and an attach is queued -- including an attach we answered
+        "failed" because the probe outlived the 5 s wait, or "physical
+        device present" while a local device was still connected. That
+        session is ours to feed either way; keying on the reply flag left a
+        ghost session nobody fed and every retry refused."""
+        hg = getattr(self._hook, "_hid_gesture", None)
+        return bool(
+            getattr(self._hook, "_device_connected", False)
+            and hg is not None
+            and getattr(hg, "_deskflow_readonly", False)
+        )
+
+    def _uses_ingress(self) -> bool:
+        return self._listener_ingress or self._ingress_live()
+
     def _owns_connection(self) -> bool:
+        if self._ingress_live():
+            return True
         if self._listener_ingress:
-            hg = getattr(self._hook, "_hid_gesture", None)
-            return bool(
-                getattr(self._hook, "_device_connected", False)
-                and hg is not None
-                and getattr(hg, "_deskflow_readonly", False)
-            )
+            return False
         return (
             self._virtual_device is not None
             and self._hook.connected_device is self._virtual_device
         )
 
-    def _handle_connect(self, msg):
-        if self._hook.connected_device is not None and not self._owns_connection():
-            # A physically attached Logitech always wins over a remote one.
-            return {"ok": False, "error": "physical_device_present"}
+    def _physical_device_present(self) -> bool:
+        device = self._hook.connected_device
+        if device is None or self._owns_connection():
+            return False
+        # The listener's own ingress session reports a shim-sourced device.
+        return getattr(device, "source", None) != DEVICE_SOURCE_DESKFLOW_SHIM
 
+    def _handle_connect(self, msg):
         device = msg.get("device")
         if not isinstance(device, dict):
             return {"ok": False, "error": "missing_device"}
@@ -441,11 +460,24 @@ class RemoteDeviceServer:
             return {"ok": False, "error": "missing_device_identity"}
 
         decode = device.get("decode") or self._decode_override
-        if (
+        ingress_capable = (
             self._transparent_transport
             and isinstance(decode, dict)
             and hasattr(self._hook, "attach_deskflow_ingress")
-        ):
+        )
+        if self._physical_device_present():
+            # A physically attached Logitech always wins over a remote one.
+            # Still hand the request to the listener: it answers "not now"
+            # at once and keeps it queued as the fallback for when that
+            # device goes away (the ingress then comes up on its own and
+            # the peer's next connect/attach is answered ok).
+            if ingress_capable:
+                self._hook.attach_deskflow_ingress(
+                    decode, product_id=product_id, product_name=product_name
+                )
+            return {"ok": False, "error": "physical_device_present"}
+
+        if ingress_capable:
             if not self._hook.attach_deskflow_ingress(
                 decode, product_id=product_id, product_name=product_name
             ):
@@ -513,7 +545,7 @@ class RemoteDeviceServer:
         decode = msg.get("decode")
         if not isinstance(decode, dict):
             return {"ok": False, "error": "missing_decode"}
-        if self._listener_ingress:
+        if self._uses_ingress():
             hg = getattr(self._hook, "_hid_gesture", None)
             if hg is None or not hg.queue_decode_update(decode):
                 return {"ok": False, "error": "invalid_decode"}
@@ -616,7 +648,7 @@ class RemoteDeviceServer:
             raw = bytes.fromhex(data)
         except ValueError:
             return {"ok": False, "error": "malformed_hex"}
-        if self._listener_ingress:
+        if self._uses_ingress():
             get_deskflow_sink().feed_report(raw)
             return {"ok": True}
         if self._raw_decoder is None:
@@ -630,7 +662,7 @@ class RemoteDeviceServer:
 
     def _virtual_disconnect(self):
         self._paused = False
-        if self._listener_ingress:
+        if self._uses_ingress():
             self._listener_ingress = False
             if hasattr(self._hook, "detach_deskflow_ingress"):
                 self._hook.detach_deskflow_ingress()

@@ -1740,11 +1740,17 @@ class HidGestureListener:
         self._deskflow_paused = False
 
     def queue_decode_update(self, decode):
-        """Apply decode context on the listener thread (thread-safe)."""
+        """Apply decode context on the listener thread (thread-safe).
+
+        The queued attach learns the new decode too: a rebuild (local
+        device arrived, sink hiccup) re-seeds from the attach, and seeding
+        from the attach-time decode would silently undo this update."""
         if not isinstance(decode, dict):
             return False
         with self._deskflow_control_lock:
             self._pending_decode_update = dict(decode)
+            if self._deskflow_attach is not None:
+                self._deskflow_attach["decode"] = dict(decode)
         return True
 
     def _apply_pending_decode_update(self):
@@ -3415,6 +3421,11 @@ class HidGestureListener:
             self._attach_gen_seen = self._attach_gen
         if self._try_connect_local():
             return True
+        if attach is not None and self._device_arrival.is_set():
+            # A device landed while the probe ran: attaching the ingress now
+            # would only be torn down by that arrival on the first read.
+            # Let _wait_reconnect consume it and probe again.
+            return False
         if attach is not None:
             if self._try_connect_deskflow(attach):
                 return True
@@ -3457,11 +3468,19 @@ class HidGestureListener:
         arrival_pending = self._device_arrival.is_set()
         arrival_gen = self._arrival_gen
         infos = self._enumerate_candidates()
-        if arrival_pending and self._arrival_gen == arrival_gen:
+        # Remembered for the ingress read loop: an arrival that leaves the
+        # candidate set exactly as this probe saw it (a sleeping device
+        # re-announcing, a devnode storm) is noise, not a new device.
+        self._last_probe_digest = _scan_digest(infos)
+        if arrival_pending:
             # This scan is the answer to that arrival. One landing DURING
-            # the enumeration (or the probe below) keeps the flag set and
-            # is honoured by _note_failed_scan / _wait_reconnect as before.
+            # the enumeration (or the probe below) must stay visible to
+            # _note_failed_scan / _wait_reconnect: clear, then re-set if a
+            # newer arrival was counted meanwhile (the hook thread may have
+            # bumped the generation between our check and the clear).
             self._device_arrival.clear()
+            if self._arrival_gen != arrival_gen:
+                self._device_arrival.set()
             self._reconnect_backoff_s = 0.0
             self._present_backoff_s = 0.0
         if infos:
@@ -3469,6 +3488,18 @@ class HidGestureListener:
                 return True
             self._note_failed_scan(infos)
         return False
+
+    def _local_candidates_changed(self):
+        """Consume a device-arrival event during a live ingress session and
+        report whether the local candidate set differs from what the probe
+        that led to this session saw. A re-announce by a device that was
+        already there (and already failed) is noise -- tearing the ingress
+        down for it cost a gesture mid-stroke and a 1-9 s blackout, once
+        per IOKit callback / devnode change."""
+        infos = self._enumerate_candidates()
+        self._device_arrival.clear()
+        changed = bool(infos) and _scan_digest(infos) != getattr(self, "_last_probe_digest", None)
+        return changed
 
     def _enumerate_candidates(self):
         """``_vendor_hid_infos`` memoised for ``VENDOR_INFOS_MEMO_S``.
@@ -4115,15 +4146,23 @@ class HidGestureListener:
                     if self._reconnect_requested:
                         self._reconnect_requested = False
                         raise IOError("reconnect requested")
-                    if self._deskflow_readonly and self._device_arrival.is_set():
-                        # Local first: a Logitech device just appeared here
-                        # (plugged in, woke up, Easy-Switched to this seat).
-                        # Rebuild so _try_connect can take it over the
-                        # relayed ingress; the attach stays queued as the
-                        # fallback if the probe finds nothing usable.
-                        raise IOError(
-                            "local device arrived -- preferring it over the Deskflow ingress"
-                        )
+                    if self._deskflow_readonly:
+                        # The IOKit matching callback only fires while its
+                        # run loop is pumped, and a sink read pumps nothing:
+                        # without this an arrival during a live ingress
+                        # session was never seen on macOS.
+                        manager = self._iokit_manager
+                        if manager is not None:
+                            manager.pump(0.0)
+                        if self._device_arrival.is_set() and self._local_candidates_changed():
+                            # Local first: a Logitech device just appeared
+                            # here (plugged in, Easy-Switched to this seat).
+                            # Rebuild so _try_connect can take it over the
+                            # relayed ingress; the attach stays queued as
+                            # the fallback if the probe finds nothing.
+                            raise IOError(
+                                "local device arrived -- preferring it over the Deskflow ingress"
+                            )
                     self._apply_pending_decode_update()
                     # If too many consecutive HID++ requests timed out, the
                     # device likely went to sleep or power-cycled.  Force a

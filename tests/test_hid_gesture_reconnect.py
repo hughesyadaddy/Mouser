@@ -903,46 +903,63 @@ class LocalFirstTests(unittest.TestCase):
         self.assertFalse(listener._device_arrival.is_set())
         self.assertEqual(listener._reconnect_backoff_s, 0.0)
 
-    def test_arrival_during_live_ingress_rebuilds_toward_local(self):
+    def _run_ingress_session_with_arrival(self, candidates_after_arrival):
+        """Ingress live (probe saw no local device); an arrival lands; the
+        candidate set then enumerates as ``candidates_after_arrival``.
+        Returns (connects, printed lines, enumerate mock)."""
         listener = self.listener
         connects = []
-        reasons = []
+        lines = []
+        arrived = {"yes": False}
         listener._on_connect = lambda: connects.append(len(connects))
         listener._running = True
-        enumerate = Mock(return_value=[])
+
+        def enumerate():
+            return list(candidates_after_arrival) if arrived["yes"] else []
+
+        enumerate_mock = Mock(side_effect=enumerate)
+        polls = {"n": 0}
 
         def rx(_timeout_ms=1000):
-            if len(connects) == 1:
-                # The Bluetooth mouse was Easy-Switched to this seat.
+            polls["n"] += 1
+            if len(connects) == 1 and polls["n"] == 2:
+                arrived["yes"] = True
+                listener._arrival_gen += 1
                 listener._device_arrival.set()
-            if len(connects) >= 2:
+            if len(connects) >= 2 or polls["n"] >= 6:
                 listener._running = False
             return b"\x11\x01\x05\x00"  # a live, well-behaved sink
 
-        real_print = print
-
-        def capture(*args, **kwargs):
-            reasons.append(" ".join(str(a) for a in args))
-
         with (
             patch.object(listener, "_rx", side_effect=rx),
-            patch.object(listener, "_enumerate_candidates", enumerate),
+            patch.object(listener, "_enumerate_candidates", enumerate_mock),
+            patch.object(listener, "_try_connect_usb", return_value=False),
             patch.object(listener, "_on_report", lambda raw: None),
             patch.object(listener, "_wait_reconnect", lambda delay: None),
-            patch("builtins.print", side_effect=capture),
+            patch("builtins.print", side_effect=lambda *a, **k: lines.append(" ".join(str(x) for x in a))),
         ):
             listener._run_main_loop()
-        del real_print
+        return connects, lines, enumerate_mock
 
+    def test_arrival_during_live_ingress_rebuilds_toward_local(self):
+        # The Bluetooth mouse was Easy-Switched to this seat: a candidate the
+        # probe never saw. The ingress session is torn down and rebuilt so
+        # the local probe gets its chance (it fails here, so the attach --
+        # still queued -- brings the ingress back).
+        connects, lines, _ = self._run_ingress_session_with_arrival([_candidate_info()])
         self.assertEqual(len(connects), 2)
-        self.assertTrue(
-            any("local device arrived" in line for line in reasons), reasons
-        )
-        # The rebuild looked for a local device (and, finding none, came
-        # back to the ingress with the attach still queued).
-        self.assertGreaterEqual(enumerate.call_count, 2)
-        self.assertIsNotNone(listener._deskflow_attach)
-        self.assertFalse(listener._device_arrival.is_set())
+        self.assertTrue(any("local device arrived" in line for line in lines), lines)
+        self.assertIsNotNone(self.listener._deskflow_attach)
+        self.assertFalse(self.listener._device_arrival.is_set())
+
+    def test_arrival_without_new_candidate_is_noise(self):
+        # A devnode storm or a sleeping device re-announcing: the candidate
+        # set is exactly what the probe saw, so the live ingress (and any
+        # gesture mid-stroke) is left alone and the arrival is consumed.
+        connects, lines, _ = self._run_ingress_session_with_arrival([])
+        self.assertEqual(len(connects), 1)
+        self.assertFalse(any("local device arrived" in line for line in lines), lines)
+        self.assertFalse(self.listener._device_arrival.is_set())
 
     def test_attach_request_defers_to_live_local_session(self):
         listener = hid_gesture.HidGestureListener()

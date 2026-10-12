@@ -255,5 +255,108 @@ class RemoteDeviceServerTests(unittest.TestCase):
         self.assertEqual(resp["error"], "unknown_message_type")
 
 
+
+class FallbackIngressOwnershipTests(unittest.TestCase):
+    """Local first means an attach can be answered "failed" (the local probe
+    outlived the 5 s wait) or "physical device present" while the request
+    stays queued. When the listener later attaches the ingress from that
+    queue, remote_device must treat the session as its own: feed reports
+    into it, answer the peer's next connect ok, and detach it on disconnect.
+    Keying ownership on the earlier reply left a ghost session nobody fed."""
+
+    DECODE = {"feat_idx": 5, "gesture_cid": "0x00C3"}
+
+    def setUp(self):
+        from core.hid_deskflow_backend import reset_deskflow_sink_for_tests
+
+        reset_deskflow_sink_for_tests()
+        from core import hid_gesture
+
+        self.hook = _StubHook()
+        self.listener = hid_gesture.HidGestureListener()
+        self.listener._iokit_manager = None
+        self.hook._hid_gesture = self.listener
+        self.server = RemoteDeviceServer(
+            self.hook, token=TOKEN, port=0, transparent_transport=True
+        )
+        self.msg = {"device": {"product_id": "0xC548", "product_name": "MX Master 3S",
+                               "decode": dict(self.DECODE)}}
+
+    def tearDown(self):
+        from core.hid_deskflow_backend import reset_deskflow_sink_for_tests
+
+        reset_deskflow_sink_for_tests()
+
+    def _listener_falls_back_to_ingress(self):
+        from unittest.mock import patch
+
+        with (
+            patch.object(self.listener, "_enumerate_candidates", return_value=[]),
+            patch("builtins.print"),
+        ):
+            self.assertTrue(self.listener._try_connect())
+        # What the listener's main loop does on a successful connect.
+        self.listener._connected = True
+        self.hook._connected_device = self.listener.connected_device
+        self.hook._device_connected = True
+
+    def test_timed_out_attach_still_yields_an_owned_session(self):
+        import threading
+        from unittest.mock import patch
+
+        with (
+            patch.object(threading.Event, "wait", return_value=False),
+            patch("builtins.print"),
+        ):
+            resp = self.server._handle_connect(self.msg)
+        self.assertEqual(resp, {"ok": False, "error": "deskflow_attach_failed"})
+        self.assertIsNotNone(self.listener._deskflow_attach)
+
+        self._listener_falls_back_to_ingress()
+        self.assertTrue(self.server._owns_connection())
+
+        # The peer's next connect is answered ok (idempotent on a live ingress).
+        with patch("builtins.print"):
+            resp = self.server._handle_connect(self.msg)
+        self.assertTrue(resp["ok"], resp)
+        self.assertTrue(self.server._listener_ingress)
+
+        # Reports reach the sink.
+        with patch("core.remote_device.get_deskflow_sink") as sink:
+            self.assertEqual(self.server._handle_report({"data": "11010500"}), {"ok": True})
+        sink.return_value.feed_report.assert_called_once_with(bytes.fromhex("11010500"))
+
+        # Disconnect tears the ingress down through the listener.
+        with patch("builtins.print"):
+            self.server._virtual_disconnect()
+        self.assertIsNone(self.listener._deskflow_attach)
+        self.assertTrue(self.listener._reconnect_requested)
+
+    def test_physical_device_refusal_still_queues_the_fallback(self):
+        from unittest.mock import patch
+
+        # A local mouse is live on the listener.
+        self.listener._connected = True
+        self.listener._deskflow_readonly = False
+        self.hook._connected_device = object()
+        self.hook._device_connected = True
+        with patch("builtins.print"):
+            resp = self.server._handle_connect(self.msg)
+        self.assertEqual(resp, {"ok": False, "error": "physical_device_present"})
+        # Queued as the fallback, local session untouched.
+        self.assertIsNotNone(self.listener._deskflow_attach)
+        self.assertFalse(self.listener._reconnect_requested)
+
+        # The local mouse goes away; the listener rebuilds onto the ingress
+        # and remote_device feeds it without a new connect.
+        self.listener._connected = False
+        self.hook._connected_device = None
+        self.hook._device_connected = False
+        self._listener_falls_back_to_ingress()
+        self.assertTrue(self.server._owns_connection())
+        with patch("core.remote_device.get_deskflow_sink") as sink:
+            self.assertEqual(self.server._handle_report({"data": "11010500"}), {"ok": True})
+        sink.return_value.feed_report.assert_called_once()
+
 if __name__ == "__main__":
     unittest.main()
