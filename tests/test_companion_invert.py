@@ -49,3 +49,16 @@ class CompanionSweepTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SweepSchedulingTests(unittest.TestCase):
+    def test_realign_same_intent_does_not_resweep(self):
+        l = hid_gesture.HidGestureListener()
+        l._dev = Mock(); l._hires_wheel_idx = 0x12; l._thumbwheel_idx = 0x13
+        l._set_native_wheel_invert_vertical = lambda inv: True
+        l._set_native_wheel_invert_horizontal = lambda inv: True
+        for expect in (True, False):
+            l._pending_companion_sweep = False
+            l._pending_wheel_divert = (True, True)
+            l._apply_pending_native_wheel_invert()
+            self.assertEqual(l._pending_companion_sweep, expect)

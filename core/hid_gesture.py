@@ -3102,8 +3102,14 @@ class HidGestureListener:
         # Lease bookkeeping: True iff any axis is firmware-inverted, so teardown
         # knows to revert (reverting an already-off axis is a harmless no-op).
         self._wheel_divert_state = bool(ok_v or ok_h)
-        self._companion_invert_target = (invert_v, invert_h)
-        self._pending_companion_sweep = True
+        # Sweep companions only when the intent changed or a new session
+        # started (the per-switch realignment would otherwise probe five
+        # receiver slots on every KVM focus change).
+        if (getattr(self, "_companion_invert_target", None) != (invert_v, invert_h)
+                or getattr(self, "_companion_swept_session", None) != id(self._dev)):
+            self._companion_invert_target = (invert_v, invert_h)
+            self._companion_swept_session = id(self._dev)
+            self._pending_companion_sweep = True
         with self._wheel_divert_lock:
             self._wheel_divert_result = (ok_v, ok_h)
             self._pending_wheel_divert = None
