@@ -1308,6 +1308,8 @@ def _linux_logitech_hidraw_nodes(base="/sys/class/hidraw"):
 
 
 SHORT_ID       = 0x10        # HID++ short report (7 bytes total)
+_DJ_DEVICE_CONNECTION = 0x41  # HID++ 1.0 receiver notice: device (dis)connected
+_LINK_REAPPLY_DEBOUNCE_S = 5.0
 LONG_ID        = 0x11        # HID++ long  report (20 bytes total)
 SHORT_LEN      = 7
 LONG_LEN       = 20
@@ -3316,7 +3318,11 @@ class HidGestureListener:
         msg = _parse(raw)
         if msg is None:
             return
-        _, feat, func, _sw, params = msg
+        dev, feat, func, _sw, params = msg
+
+        if feat == _DJ_DEVICE_CONNECTION and self._is_connection_notice(raw, dev):
+            self._on_device_connection_notice(params)
+            return
 
         if feat != self._feat_idx:
             return
@@ -3393,6 +3399,48 @@ class HidGestureListener:
                         cb()
                     except Exception as e:
                         print(f"[HidGesture] extra up callback error: {e}")
+
+    def _is_connection_notice(self, raw, dev):
+        """True for a receiver's HID++ 1.0 device-connection notice (short
+        report, sub_id 0x41) about OUR paired slot. A direct (USB/BLE) device
+        uses devIdx 0xFF and never gets one."""
+        if dev == 0xFF or dev != getattr(self, "_dev_idx", None):
+            return False
+        if raw and raw[0] in (SHORT_ID, LONG_ID) and raw[0] != SHORT_ID:
+            return False
+        return True
+
+    def _on_device_connection_notice(self, params):
+        """The mouse re-linked to the receiver (woke from sleep, power cycle,
+        Easy-Switch back). The receiver HID device never went away, so no
+        IOKit removal/arrival fired -- but the mouse firmware reset its
+        diverts, wheel invert and Smart Shift. Re-run the full connect so
+        every setting is re-applied. Debounced: one re-apply per burst."""
+        flags = params[0] if params else 0
+        link_lost = bool(flags & 0x40)
+        now = time.monotonic()
+        if link_lost:
+            self._link_lost_seen = True
+            print("[HidGesture] receiver: device link lost (mouse asleep/off)")
+            return
+        last = getattr(self, "_last_link_reapply", 0.0)
+        if now - last < _LINK_REAPPLY_DEBOUNCE_S:
+            return
+        self._last_link_reapply = now
+        self._link_lost_seen = False
+        print("[HidGesture] receiver: device link established -- re-applying settings")
+        self.force_reconnect()
+
+    def _enable_receiver_notifications(self):
+        """Best effort: ask the receiver to report wireless (dis)connections
+        (HID++ 1.0 register 0x00, flags wireless|software-present). Without
+        it some receivers never send the 0x41 notice handled above."""
+        if getattr(self, "_dev_idx", 0xFF) == 0xFF or self._deskflow_readonly:
+            return
+        try:
+            self._dev.write([SHORT_ID, 0xFF, 0x80, 0x00, 0x00, 0x09, 0x00])
+        except Exception as e:
+            print(f"[HidGesture] receiver notification enable failed: {e}")
 
     # ── connect / main loop ───────────────────────────────────────
 
@@ -4128,6 +4176,7 @@ class HidGestureListener:
             self._reconnect_requested = False
 
             self._connected = True
+            self._enable_receiver_notifications()
             if self._on_connect:
                 try:
                     self._on_connect()
