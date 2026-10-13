@@ -17,3 +17,12 @@ if not _os.environ.get("MOUSER_LOG_DIR"):
 # Tests must never reach the real sudo (this Mac has passwordless sudo). A shim
 # on PATH fails loudly instead; tests that need sudo behaviour mock it explicitly.
 _os.environ["PATH"] = _os.path.join(_os.path.dirname(__file__), "fakebin") + _os.pathsep + _os.environ.get("PATH", "")
+
+# Tests must never write the seat's real config (~/Library/Application Support/
+# Mouser/config.json). test_main_window_host saved DEFAULT_CONFIG over it on
+# 2026-10-13 (inverted scroll, gestures and back/forward lost). Point the module
+# paths at a per-process temp dir; tests that patch them themselves still win.
+from core import config as _config  # noqa: E402
+
+_config.CONFIG_DIR = _tempfile.mkdtemp(prefix="mouser-tests-config-")
+_config.CONFIG_FILE = _os.path.join(_config.CONFIG_DIR, "config.json")
