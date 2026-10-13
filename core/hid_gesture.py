@@ -3102,6 +3102,8 @@ class HidGestureListener:
         # Lease bookkeeping: True iff any axis is firmware-inverted, so teardown
         # knows to revert (reverting an already-off axis is a harmless no-op).
         self._wheel_divert_state = bool(ok_v or ok_h)
+        self._companion_invert_target = (invert_v, invert_h)
+        self._pending_companion_sweep = True
         with self._wheel_divert_lock:
             self._wheel_divert_result = (ok_v, ok_h)
             self._pending_wheel_divert = None
@@ -3117,6 +3119,54 @@ class HidGestureListener:
                 f"vertical={'OK' if ok_v else 'FAIL'} "
                 f"thumb={'OK' if ok_h else 'FAIL'}"
             )
+
+    #: Receiver slots probed for companion devices (Unifying/Bolt pair up to 6).
+    _COMPANION_SLOTS = range(1, 7)
+    _COMPANION_TIMEOUT_MS = 300
+
+    def _sweep_companion_wheel_invert(self) -> None:
+        """Apply the wheel-invert intent to EVERY other mouse paired to the
+        bound receiver, not just the one Mouser holds the HID++ session with.
+
+        All mice on one receiver share a single macOS HID device, so the OS
+        layer cannot tell them apart; the firmware is the only place invert
+        can be set per mouse. Before this, a second mouse (or a different one
+        switched onto the receiver) scrolled un-inverted while the UI showed
+        reverse scroll on. Listener-thread only. Offline/unpaired slots answer
+        with an HID++ error or time out quickly and are skipped."""
+        self._pending_companion_sweep = False
+        target = getattr(self, "_companion_invert_target", None)
+        bound = getattr(self, "_dev_idx", 0xFF)
+        if target is None or bound == 0xFF or self._dev is None or self._deskflow_readonly:
+            return
+        invert_v, invert_h = target
+        saved = (self._dev_idx, self._hires_wheel_idx, self._thumbwheel_idx,
+                 self._hires_wheel_mode_initial, self._consecutive_request_timeouts)
+        results = {}
+        try:
+            for slot in self._COMPANION_SLOTS:
+                if slot == bound:
+                    continue
+                self._dev_idx = slot
+                self._hires_wheel_mode_initial = None
+                hw = self._find_feature(FEAT_HIRES_WHEEL_ENHANCED, timeout_ms=self._COMPANION_TIMEOUT_MS)
+                if hw is None:
+                    continue
+                self._hires_wheel_idx = hw
+                self._thumbwheel_idx = self._find_feature(FEAT_THUMB_WHEEL, timeout_ms=self._COMPANION_TIMEOUT_MS)
+                ok_v = self._set_native_wheel_invert_vertical(invert_v)
+                ok_h = self._set_native_wheel_invert_horizontal(invert_h) if self._thumbwheel_idx else (not invert_h)
+                results[slot] = (ok_v, ok_h)
+        except Exception as e:
+            print(f"[HidGesture] companion invert sweep error: {e}")
+        finally:
+            (self._dev_idx, self._hires_wheel_idx, self._thumbwheel_idx,
+             self._hires_wheel_mode_initial, self._consecutive_request_timeouts) = saved
+        self.companion_invert_state = results
+        if results:
+            print("[HidGesture] companion wheel invert: " + ", ".join(
+                f"devIdx=0x{k:02X} v={'OK' if v[0] else 'FAIL'} h={'OK' if v[1] else 'FAIL'}"
+                for k, v in sorted(results.items())))
 
     def _abort_pending_wheel_divert(self) -> None:
         """Wake any waiter with result=False when the connection drops
@@ -3322,6 +3372,12 @@ class HidGestureListener:
 
         if feat == _DJ_DEVICE_CONNECTION and self._is_connection_notice(raw, dev):
             self._on_device_connection_notice(params)
+            return
+        if (feat == _DJ_DEVICE_CONNECTION and dev not in (0xFF, getattr(self, "_dev_idx", None))
+                and raw and raw[0] == SHORT_ID):
+            if not (params and params[0] & 0x40):
+                print(f"[HidGesture] receiver: companion devIdx=0x{dev:02X} linked -- re-applying wheel invert")
+                self._pending_companion_sweep = True
             return
 
         if feat != self._feat_idx:
@@ -4230,6 +4286,8 @@ class HidGestureListener:
                             self._apply_pending_smart_shift()
                         if self._pending_wheel_divert is not None:
                             self._apply_pending_native_wheel_invert()
+                        if getattr(self, "_pending_companion_sweep", False):
+                            self._sweep_companion_wheel_invert()
                         if self._pending_battery is not None:
                             self._apply_pending_read_battery()
                     _rx_started = time.monotonic()

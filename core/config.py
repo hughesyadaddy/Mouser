@@ -240,6 +240,77 @@ def get_icon_for_exe(exe_name: str) -> str:
     return ""
 
 
+# ── fleet-baked settings (core/fleet_defaults.py) ─────────────────────
+# Tests disable the layer (tests/support) unless they exercise it.
+BAKED_ENABLED = True
+
+
+def _baked_items():
+    from core import fleet_defaults as fd
+    for k, v in fd.BAKED_SETTINGS.items():
+        yield ("settings", k), v
+    for k, v in fd.BAKED_DEFAULT_MAPPINGS.items():
+        yield ("mapping", k), v
+
+
+def _baked_get(cfg, where):
+    kind, key = where
+    if kind == "settings":
+        return cfg.get("settings", {}).get(key, _MISSING)
+    return cfg.get("profiles", {}).get("default", {}).get("mappings", {}).get(key, _MISSING)
+
+
+def _baked_set(cfg, where, value):
+    kind, key = where
+    if kind == "settings":
+        cfg.setdefault("settings", {})[key] = value
+    else:
+        cfg.setdefault("profiles", {}).setdefault("default", {}).setdefault("mappings", {})[key] = value
+
+
+_MISSING = object()
+
+
+def _override_id(where):
+    return f"{where[0]}:{where[1]}"
+
+
+def apply_baked(cfg):
+    """Force every baked key to its baked value unless the user overrode it
+    in the UI on this seat (see fleet_defaults)."""
+    if not BAKED_ENABLED:
+        return cfg
+    from core.fleet_defaults import OVERRIDES_KEY
+    overrides = set(cfg.get("settings", {}).get(OVERRIDES_KEY, []) or [])
+    changed = []
+    for where, value in _baked_items():
+        if _override_id(where) in overrides:
+            continue
+        if _baked_get(cfg, where) != value:
+            _baked_set(cfg, where, value)
+            changed.append(_override_id(where))
+    if changed:
+        print(f"[Config] baked fleet settings applied: {', '.join(changed)}")
+    return cfg
+
+
+def record_overrides(cfg):
+    """At save time: a baked key whose value differs from the baked one is a
+    deliberate UI change on this seat -- remember it so loads keep it."""
+    if not BAKED_ENABLED:
+        return cfg
+    from core.fleet_defaults import OVERRIDES_KEY
+    overrides = set(cfg.get("settings", {}).get(OVERRIDES_KEY, []) or [])
+    for where, value in _baked_items():
+        cur = _baked_get(cfg, where)
+        if cur is _MISSING or cur == value:
+            overrides.discard(_override_id(where))
+        else:
+            overrides.add(_override_id(where))
+    cfg.setdefault("settings", {})[OVERRIDES_KEY] = sorted(overrides)
+    return cfg
+
+
 def ensure_config_dir():
     os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
 
@@ -255,7 +326,7 @@ def load_config():
             cfg = _migrate(cfg)
             cfg = _merge_defaults(cfg, DEFAULT_CONFIG)
             cfg = _validate_types(cfg, DEFAULT_CONFIG)
-            return cfg
+            return apply_baked(cfg)
         except Exception as e:
             # NEVER let a failed read silently become "defaults", because the
             # app then saves those defaults over the file and the user's
@@ -278,13 +349,13 @@ def load_config():
                     cfg = _merge_defaults(cfg, DEFAULT_CONFIG)
                     cfg = _validate_types(cfg, DEFAULT_CONFIG)
                     print(f"[Config] RECOVERED settings from {backup}")
-                    return cfg
+                    return apply_baked(cfg)
                 except Exception as bak_exc:
                     print(f"[Config] backup unusable ({bak_exc}); falling back to defaults")
             else:
                 print("[Config] no backup available; falling back to DEFAULTS "
                       "-- previous settings are in the preserved file above")
-    return json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
+    return apply_baked(json.loads(json.dumps(DEFAULT_CONFIG)))  # deep copy
 
 
 def _create_config_tmp():
@@ -305,6 +376,7 @@ def _create_config_tmp():
 
 def save_config(cfg):
     """Persist config to disk via atomic write with restrictive permissions."""
+    record_overrides(cfg)
     ensure_config_dir()
     fd, tmp_path = _create_config_tmp()
     try:

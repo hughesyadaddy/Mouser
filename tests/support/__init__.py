@@ -26,3 +26,7 @@ from core import config as _config  # noqa: E402
 
 _config.CONFIG_DIR = _tempfile.mkdtemp(prefix="mouser-tests-config-")
 _config.CONFIG_FILE = _os.path.join(_config.CONFIG_DIR, "config.json")
+
+# The fleet-baked layer rewrites settings on load; tests that check plain
+# load/save semantics run without it. tests/test_fleet_defaults.py enables it.
+_config.BAKED_ENABLED = False
