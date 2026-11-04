@@ -208,6 +208,9 @@ def locked_versions(root: Path | None = None) -> dict[str, str]:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
+        # Drop an environment marker (``; sys_platform == "darwin"``) so the
+        # lock installs on Windows/Linux without the macOS-only pins.
+        line = line.partition(";")[0].strip()
         name, sep, version = line.partition("==")
         if sep:
             versions[_normalize_package_name(name)] = version.strip()

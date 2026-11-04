@@ -65,6 +65,16 @@ class PythonProvenanceTests(unittest.TestCase):
             {"pyobjc-core": "12.1", "pyside6": "6.11.0", "shiboken6": "6.11.0"},
         )
 
+    def test_environment_markers_are_stripped_from_lock_pins(self):
+        (self.root / "requirements.lock").write_text(
+            'pyobjc-core==12.1; sys_platform == "darwin"\nPySide6==6.11.0\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            installer.locked_versions(self.root),
+            {"pyobjc-core": "12.1", "pyside6": "6.11.0"},
+        )
+
     def test_matching_environment_passes_and_logs(self):
         probe, msgs = self._verify(_probe_output())
         self.assertIn(str(self.python), probe.call_args.args[0][0])
