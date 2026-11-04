@@ -48,3 +48,13 @@ class DebugLoggingIsRateLimitedTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MoveFastPathTests(unittest.TestCase):
+    def test_idle_moves_pass_through_before_any_work(self):
+        start = WINDOWS_HOOK.index("def _low_level_handler_inner")
+        body = WINDOWS_HOOK[start:start + 1200]
+        fast = body.index("wParam == WM_MOUSEMOVE and self._button_gesture_active_owner is None")
+        self.assertLess(fast, body.index("data = lParam.contents"))
+        self.assertIn("return CallNextHookEx(self._hook, nCode, wParam, lParam)",
+                      body[fast:fast + 200])

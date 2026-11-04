@@ -313,6 +313,13 @@ class MouseHook(BaseMouseHook):
 
     def _low_level_handler_inner(self, nCode, wParam, lParam):
         if nCode == HC_ACTION:
+            # WH_MOUSE_LL serializes ALL system mouse input through this
+            # Python callback, and moves are by far the busiest stream. Mouser
+            # only needs them while a button slide-gesture is held, so pass
+            # every other move straight through before any work (fork
+            # c1f2318: cursor lag when a KVM / remote desktop injects moves).
+            if wParam == WM_MOUSEMOVE and self._button_gesture_active_owner is None:
+                return CallNextHookEx(self._hook, nCode, wParam, lParam)
             data = lParam.contents
             mouse_data = data.mouseData
             flags = data.flags
