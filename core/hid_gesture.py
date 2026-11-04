@@ -11,6 +11,7 @@ Requires:  pip install hidapi
 Falls back gracefully if the package or device are unavailable.
 """
 
+
 import atexit
 import functools
 import os
@@ -22,6 +23,7 @@ import time
 import weakref
 from dataclasses import replace as _dataclass_replace
 
+from core import receiver_link
 from core.logi_devices import (
     DEFAULT_GESTURE_CIDS,
     _coerce_cid,
@@ -2293,6 +2295,7 @@ class HidGestureListener:
                 if ok_h and invert_h:
                     self._set_native_wheel_invert_horizontal(False)
         self._wheel_divert_state = bool(success)
+        receiver_link.on_native_invert_applied(self, invert_v, invert_h, success)
         with self._wheel_divert_lock:
             self._wheel_divert_result = success
             self._pending_wheel_divert = None
@@ -2750,6 +2753,8 @@ class HidGestureListener:
         """Inspect an incoming HID++ report for diverted button / raw XY events."""
         msg = _parse(raw)
         if msg is None:
+            return
+        if receiver_link.handle_report(self, raw, msg):  # receiver layer
             return
         _, feat, func, _sw, params = msg
 
@@ -3351,6 +3356,7 @@ class HidGestureListener:
             connect_backoff_s = _CONNECT_BACKOFF_BASE_S
 
             self._connected = True
+            receiver_link.enable_notifications(self)
             if self._on_connect:
                 try:
                     self._on_connect()
@@ -3420,6 +3426,7 @@ class HidGestureListener:
                         self._apply_pending_smart_shift()
                     if self._pending_wheel_divert is not None:
                         self._apply_pending_native_wheel_invert()
+                    receiver_link.drain(self)
                     if self._pending_battery is not None:
                         self._apply_pending_read_battery()
                     if self._pending_haptic is not None:
