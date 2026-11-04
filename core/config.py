@@ -355,10 +355,19 @@ def load_config():
             cfg = _migrate(cfg)
             cfg = _merge_defaults(cfg, DEFAULT_CONFIG)
             cfg = _validate_types(cfg, DEFAULT_CONFIG)
+            _apply_swipe_layer(cfg)
             return cfg
         except Exception as e:
             print(f"[Config] Error loading config: {e}")
     return json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
+
+
+def _apply_swipe_layer(cfg):
+    """Native swipe layer hook (core/swipe_actions.py): migrate gesture
+    slots to swipe actions in memory and read the enable flag."""
+    from core import swipe_actions
+    swipe_actions.migrate_to_swipes(cfg)
+    swipe_actions.configure(cfg)
 
 
 def _atomic_write_json(path, obj):

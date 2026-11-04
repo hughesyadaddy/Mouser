@@ -1880,3 +1880,12 @@ else:
             "category": "Other",
         },
     }
+
+
+# ------------------------------------------------------------------
+# Native swipe layer (core/swipe_actions.py): swipe_* action ids.
+# ------------------------------------------------------------------
+from core import swipe_actions as _swipe_actions  # noqa: E402
+
+ACTIONS.update(_swipe_actions.action_entries(ACTIONS))
+execute_action = _swipe_actions.wrap_execute_action(execute_action)
