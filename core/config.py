@@ -7,9 +7,9 @@ import json
 import os
 import stat
 import sys
-import tempfile
 from urllib.parse import quote
 from core import app_catalog
+from core import config_safety
 
 if sys.platform == "darwin":
     CONFIG_DIR = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "Mouser")
@@ -352,14 +352,25 @@ def load_config():
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             # Merge any missing keys from default
-            cfg = _migrate(cfg)
-            cfg = _merge_defaults(cfg, DEFAULT_CONFIG)
-            cfg = _validate_types(cfg, DEFAULT_CONFIG)
-            _apply_swipe_layer(cfg)
-            return cfg
+            return _finish_loaded(cfg)
         except Exception as e:
+            # Never let a failed read silently become "defaults" (which the
+            # app would then save over the file): keep the unreadable file
+            # and try the last known-good copy first.
             print(f"[Config] Error loading config: {e}")
+            config_safety.preserve_unreadable(CONFIG_FILE)
+            recovered = config_safety.load_backup(CONFIG_FILE, _finish_loaded)
+            if recovered is not None:
+                return recovered
     return json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
+
+
+def _finish_loaded(cfg):
+    cfg = _migrate(cfg)
+    cfg = _merge_defaults(cfg, DEFAULT_CONFIG)
+    cfg = _validate_types(cfg, DEFAULT_CONFIG)
+    _apply_swipe_layer(cfg)
+    return cfg
 
 
 def _apply_swipe_layer(cfg):
@@ -375,7 +386,7 @@ def _atomic_write_json(path, obj):
     ensure_config_dir()
     target_path = os.path.realpath(path)
     target_dir = os.path.dirname(target_path) or CONFIG_DIR
-    fd, tmp_path = tempfile.mkstemp(suffix=".tmp", dir=target_dir)
+    fd, tmp_path = config_safety.create_tmp(target_dir)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(obj, f, indent=2)
@@ -395,6 +406,7 @@ def _atomic_write_json(path, obj):
 def save_config(cfg):
     """Persist config to disk via atomic write with restrictive permissions."""
     _atomic_write_json(CONFIG_FILE, cfg)
+    config_safety.roll_backup(CONFIG_FILE)
 
 
 
@@ -609,6 +621,10 @@ def get_profile_for_app_identity(cfg, app_identity: tuple[str, ...] | None) -> s
 
 def _migrate(cfg):
     """Migrate config from older versions to current."""
+    from core import config_fork_compat  # fork-schema reader (layer)
+    config_fork_compat.migrate_fork_lineage(
+        cfg, _default_actions_ring_slots, WHEEL_DIVERT_DEFAULT
+    )
     version = cfg.get("version", 1)
     if version < 2:
         # v1 → v2:  add 'apps' list to each profile, new settings keys

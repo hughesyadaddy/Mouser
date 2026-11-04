@@ -101,8 +101,14 @@ def wrap_execute_action(execute_action):
     return execute
 
 
+_SWIPE_SLOT_PREFIXES = ("gesture_", "actions_ring_")
+_SWIPE_SLOT_DIRS = ("left", "right", "up", "down")
+
+
 def _is_gesture_slot(key):
-    return key.startswith("gesture_")
+    """Swipe-direction slots of the native gesture controls (thumb Gesture
+    button and the MX Master 4 Sense Panel); never their tap keys."""
+    return any(key == f"{p}{d}" for p in _SWIPE_SLOT_PREFIXES for d in _SWIPE_SLOT_DIRS)
 
 
 def migrate_to_swipes(cfg, platform_name=None):
