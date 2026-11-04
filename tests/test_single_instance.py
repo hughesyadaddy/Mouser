@@ -26,9 +26,14 @@ class SingleInstanceServerNameTests(unittest.TestCase):
         with patch.object(main_qml.getpass, "getuser", return_value="testuser"):
             a = main_qml._single_instance_server_name()
             b = main_qml._single_instance_server_name()
+            expected = main_qml.single_instance.server_address()
         self.assertEqual(a, b)
-        self.assertTrue(a.startswith("mouser_instance_"))
-        self.assertEqual(len(a), len("mouser_instance_") + 16)
+        # Shared with core.single_instance (``--ctl stop`` reaches it):
+        # an absolute socket path on Unix, the digest pipe name on Windows.
+        self.assertEqual(a, expected)
+        self.assertTrue(a.endswith(".sock") or a.startswith("mouser_instance_"))
+        if a.startswith("mouser_instance_"):
+            self.assertEqual(len(a), len("mouser_instance_") + 16)
 
 
 @unittest.skipIf(main_qml is None, "main_qml / PySide6 not available")

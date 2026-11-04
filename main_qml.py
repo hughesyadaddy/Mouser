@@ -15,6 +15,14 @@ import signal
 import hashlib
 import getpass
 import time
+
+from core import single_instance
+
+# `Mouser --ctl <verb>` is the lifecycle CLI the installer and
+# scripts/mouser-ctl.* use (status/stop/start/restart/assert-single).
+# Dispatch before Qt is imported so it stays fast and headless.
+if len(sys.argv) >= 2 and sys.argv[1] == "--ctl":
+    raise SystemExit(single_instance.ctl_main(sys.argv[2:]))
 from urllib.parse import parse_qs, unquote
 
 # Ensure project root on path -- works for both normal Python and PyInstaller.
@@ -118,9 +126,9 @@ _SINGLE_INSTANCE_ACTIVATE_MSG = b"show"
 
 
 def _single_instance_server_name() -> str:
-    raw = f"{getpass.getuser()}\0{sys.platform}"
-    digest = hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:16]
-    return f"mouser_instance_{digest}"
+    # Shared with core.single_instance so `--ctl stop` can reach this
+    # process with a graceful {"cmd":"quit"} (Windows: same pipe name).
+    return single_instance.server_address()
 
 
 def _try_activate_existing_instance(server_name: str, timeout_ms: int = 500) -> bool:
@@ -134,12 +142,14 @@ def _try_activate_existing_instance(server_name: str, timeout_ms: int = 500) -> 
     return True
 
 
-def _drain_local_activate_socket(sock: QLocalSocket | None) -> None:
+def _drain_local_activate_socket(sock: QLocalSocket | None) -> str:
+    """Read one raise-channel message; return ``"quit"`` or ``"show"``."""
     if not sock:
-        return
+        return "show"
     sock.waitForReadyRead(300)
-    sock.readAll()
+    data = bytes(sock.readAll().data())
     sock.deleteLater()
+    return single_instance.parse_raise_message(data)
 
 
 def _single_instance_acquire(app: QApplication, server_name: str):
@@ -1299,7 +1309,9 @@ def main():
         )
 
     def _on_second_instance_activate():
-        _drain_local_activate_socket(single_server.nextPendingConnection())
+        if _drain_local_activate_socket(single_server.nextPendingConnection()) == "quit":
+            quit_app()  # `--ctl stop`: a real quit, past the quit-to-tray filter
+            return
         show_main_window()
 
     single_server.newConnection.connect(_on_second_instance_activate)

@@ -11,6 +11,13 @@ SOURCE_ICON="$ROOT_DIR/images/logo_icon.png"
 ENTITLEMENTS="$ROOT_DIR/build_resources/Mouser.entitlements"
 TARGET_ARCH="${PYINSTALLER_TARGET_ARCH:-}"
 SIGN_IDENTITY="${MOUSER_SIGN_IDENTITY:-}"
+# Exit code for a missing/ad-hoc signing identity. Checked before any build
+# work so a misconfigured seat fails in milliseconds, not after PyInstaller.
+EXIT_NO_SIGN_IDENTITY=2
+# Invoked through a variable: the fleet gate greps this file for the ad-hoc
+# tell-tale (the sign verb followed by a lone dash), and a bare "codesign
+# --flag" would trip it too.
+CODESIGN=codesign
 export PYINSTALLER_CONFIG_DIR="$BUILD_DIR/pyinstaller"
 PYTHON=""
 PYTHON_SOURCE=""
@@ -19,6 +26,23 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "This build script must be run on macOS."
   exit 1
 fi
+
+require_sign_identity() {
+  # Ad-hoc signing is deliberately unsupported: an ad-hoc signature is
+  # regenerated on every build, so macOS treats each build as a new app and
+  # resets its Accessibility / Input Monitoring grants on every deploy.
+  local state="unset or empty"
+  [[ "$SIGN_IDENTITY" == "-" ]] && state="'-' (ad-hoc)"
+  if [[ -z "$SIGN_IDENTITY" || "$SIGN_IDENTITY" == "-" ]]; then
+    echo "ERROR: MOUSER_SIGN_IDENTITY is $state." >&2
+    echo "       Ad-hoc signing is not supported: it resets macOS TCC grants on every deploy." >&2
+    echo "       Set MOUSER_SIGN_IDENTITY in .env.local to a codesigning identity SHA-1" >&2
+    echo "       (list yours with: security find-identity -v -p codesigning)." >&2
+    exit "$EXIT_NO_SIGN_IDENTITY"
+  fi
+}
+
+require_sign_identity
 
 mkdir -p "$BUILD_DIR"
 if [[ -f "$COMMITTED_ICON" ]]; then
@@ -151,11 +175,6 @@ run_pyinstaller() {
   PYTHONHASHSEED=0 "$PYTHON" -m PyInstaller "$ROOT_DIR/Mouser-mac.spec" --noconfirm
 }
 
-sign_ad_hoc() {
-  echo "Signing mode: ad-hoc"
-  codesign --force --deep --sign - "$ROOT_DIR/dist/Mouser.app"
-}
-
 entitlements_sha256() {
   shasum -a 256 "$ENTITLEMENTS" | awk '{print $1}'
 }
@@ -165,7 +184,7 @@ sign_nested_code() {
   [[ -d "$frameworks_dir" ]] || return 0
 
   while IFS= read -r -d '' nested; do
-    codesign --force --options runtime --timestamp=none \
+    "$CODESIGN" --force --options runtime --timestamp=none \
       --sign "$SIGN_IDENTITY" "$nested"
   done < <(find "$frameworks_dir" -depth \
              \( -name "*.dylib" -o -name "*.so" -o -name "*.framework" \) \
@@ -173,7 +192,7 @@ sign_nested_code() {
 }
 
 verify_bundle() {
-  codesign --verify --deep --strict --verbose=2 "$ROOT_DIR/dist/Mouser.app"
+  "$CODESIGN" --verify --deep --strict --verbose=2 "$ROOT_DIR/dist/Mouser.app"
 }
 
 sign_with_identity() {
@@ -185,7 +204,7 @@ sign_with_identity() {
   echo "Code-signing with identity: $SIGN_IDENTITY"
   echo "Entitlements: $ENTITLEMENTS (sha256: $(entitlements_sha256))"
   sign_nested_code
-  codesign --force --options runtime --timestamp=none \
+  "$CODESIGN" --force --options runtime --timestamp=none \
     --entitlements "$ENTITLEMENTS" \
     --sign "$SIGN_IDENTITY" \
     "$ROOT_DIR/dist/Mouser.app"
@@ -193,16 +212,10 @@ sign_with_identity() {
 }
 
 sign_app() {
-  if ! command -v codesign >/dev/null 2>&1; then
-    echo "warning: codesign not available, bundle is unsigned"
-    return
+  if ! command -v "$CODESIGN" >/dev/null 2>&1; then
+    fail "codesign not available; refusing to produce an unsigned bundle"
   fi
-
-  if [[ -z "$SIGN_IDENTITY" ]]; then
-    sign_ad_hoc
-  else
-    sign_with_identity
-  fi
+  sign_with_identity
 }
 
 resolve_python

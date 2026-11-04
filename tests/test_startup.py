@@ -188,6 +188,44 @@ class ApplyLoginStartupMacTests(unittest.TestCase):
                 ["launchctl", "bootstrap", domain, plist]
             )
 
+    def test_macos_plist_has_supervision_keys(self):
+        with patch("core.startup.os.path.expanduser", side_effect=lambda p: p.replace("~", "/Users/test")):
+            payload = st.macos_launch_agent_payload(["/X/Mouser"])
+        self.assertEqual(payload["Label"], st.MACOS_LAUNCH_AGENT_LABEL)
+        self.assertEqual(payload["ProgramArguments"], ["/X/Mouser"])
+        self.assertTrue(payload["RunAtLoad"])
+        # Relaunch after crash/kill, but NOT after a clean quit (tray Quit,
+        # `--ctl stop`) so installers can stop it without a resurrection race.
+        self.assertEqual(payload["KeepAlive"], {"SuccessfulExit": False})
+        self.assertEqual(payload["ProcessType"], "Interactive")
+        self.assertEqual(
+            payload["AssociatedBundleIdentifiers"], ["io.github.hughesyadaddy.mouser"]
+        )
+        self.assertEqual(payload["StandardOutPath"], "/Users/test/Library/Logs/Mouser/launchd.out.log")
+        self.assertEqual(payload["StandardErrorPath"], "/Users/test/Library/Logs/Mouser/launchd.err.log")
+        self.assertEqual(payload["ThrottleInterval"], 5)
+        # Everything must be plist-serialisable.
+        plistlib.dumps(payload)
+
+    def test_macos_enable_persists_supervision_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plist = os.path.join(tmp, "LaunchAgents", "x.plist")
+            with (
+                patch.object(sys, "platform", "darwin"),
+                patch("core.startup.os.getuid", return_value=501, create=True),
+                patch.object(st, "_macos_plist_path", return_value=plist),
+                patch.object(st, "_macos_log_dir", return_value=os.path.join(tmp, "Logs")),
+                patch.object(st, "_program_arguments", return_value=["/X/Mouser"]),
+                patch.object(st, "_launchctl_run") as m_lc,
+            ):
+                m_lc.return_value = MagicMock(returncode=0)
+                st.apply_login_startup(True)
+            with open(plist, "rb") as f:
+                payload = plistlib.load(f)
+            self.assertEqual(payload["KeepAlive"], {"SuccessfulExit": False})
+            self.assertEqual(payload["ProcessType"], "Interactive")
+            self.assertTrue(os.path.isdir(os.path.join(tmp, "Logs")))
+
     def test_macos_enable_raises_and_removes_plist_when_bootstrap_fails(self):
         domain = "gui/501"
 
@@ -260,6 +298,7 @@ class ApplyLoginStartupMacTests(unittest.TestCase):
                 patch.object(st, "_launchctl_run") as m_lc,
             ):
                 m_lc.side_effect = [
+                    MagicMock(returncode=113, stdout="", stderr="Could not find service"),
                     MagicMock(returncode=0),
                     MagicMock(returncode=5, stderr="Bootstrap failed", stdout=""),
                     MagicMock(returncode=0),
@@ -273,6 +312,7 @@ class ApplyLoginStartupMacTests(unittest.TestCase):
             self.assertEqual(
                 [call.args[0] for call in m_lc.call_args_list],
                 [
+                    ["launchctl", "print", f"{domain}/{st.MACOS_LAUNCH_AGENT_LABEL}"],
                     ["launchctl", "bootout", domain, plist],
                     ["launchctl", "bootstrap", domain, plist],
                     ["launchctl", "bootstrap", domain, plist],
@@ -325,6 +365,7 @@ class ApplyLoginStartupMacTests(unittest.TestCase):
                 patch.object(st, "_atomic_write_file", side_effect=fake_atomic_write),
             ):
                 m_lc.side_effect = [
+                    MagicMock(returncode=113, stdout="", stderr="Could not find service"),
                     MagicMock(returncode=0),
                     MagicMock(returncode=0),
                 ]
@@ -338,10 +379,119 @@ class ApplyLoginStartupMacTests(unittest.TestCase):
             self.assertEqual(
                 [call.args[0] for call in m_lc.call_args_list],
                 [
+                    ["launchctl", "print", f"{domain}/{st.MACOS_LAUNCH_AGENT_LABEL}"],
                     ["launchctl", "bootout", domain, plist],
                     ["launchctl", "bootstrap", domain, plist],
                 ],
             )
+
+    def _desired_plist(self, program_arguments):
+        return plistlib.dumps(
+            st.macos_launch_agent_payload(program_arguments), fmt=plistlib.FMT_XML
+        )
+
+    def test_macos_enable_with_identical_plist_only_enables(self):
+        """Every Backend init runs this sync. Bootout + bootstrap of an
+        unchanged plist spawned a second Mouser that raised the window and
+        exited (the "self-sync" window pop)."""
+        domain = "gui/501"
+        with tempfile.TemporaryDirectory() as tmp:
+            plist = os.path.join(tmp, "x.plist")
+            with (
+                patch.object(sys, "platform", "darwin"),
+                patch("core.startup.os.getuid", return_value=501, create=True),
+                patch.object(st, "_macos_plist_path", return_value=plist),
+                patch.object(st, "_macos_log_dir", return_value=os.path.join(tmp, "Logs")),
+                patch.object(st, "_program_arguments", return_value=["/X/Mouser"]),
+                patch.object(st, "_launchctl_run") as m_lc,
+            ):
+                with open(plist, "wb") as f:
+                    f.write(self._desired_plist(["/X/Mouser"]))
+                m_lc.return_value = MagicMock(returncode=0, stdout="", stderr="")
+                st.apply_login_startup(True)
+            self.assertEqual(
+                [call.args[0] for call in m_lc.call_args_list],
+                [["launchctl", "enable", f"{domain}/{st.MACOS_LAUNCH_AGENT_LABEL}"]],
+            )
+
+    def test_macos_enable_never_boots_out_the_agent_that_owns_this_process(self):
+        domain = "gui/501"
+        with tempfile.TemporaryDirectory() as tmp:
+            plist = os.path.join(tmp, "x.plist")
+            with open(plist, "wb") as f:
+                f.write(self._desired_plist(["/Old/Mouser"]))
+
+            def launchctl(args):
+                if args[1] == "print":
+                    return MagicMock(
+                        returncode=0,
+                        stdout=f"{st.MACOS_LAUNCH_AGENT_LABEL} = {{\n\tpid = {os.getpid()}\n}}\n",
+                        stderr="",
+                    )
+                return MagicMock(returncode=0, stdout="", stderr="")
+
+            with (
+                patch.object(sys, "platform", "darwin"),
+                patch("core.startup.os.getuid", return_value=501, create=True),
+                patch.object(st, "_macos_plist_path", return_value=plist),
+                patch.object(st, "_macos_log_dir", return_value=os.path.join(tmp, "Logs")),
+                patch.object(st, "_program_arguments", return_value=["/New/Mouser"]),
+                patch.object(st, "_launchctl_run", side_effect=launchctl) as m_lc,
+            ):
+                st.apply_login_startup(True)
+            with open(plist, "rb") as f:
+                self.assertEqual(plistlib.load(f)["ProgramArguments"], ["/New/Mouser"])
+            self.assertEqual(
+                [call.args[0] for call in m_lc.call_args_list],
+                [
+                    ["launchctl", "print", f"{domain}/{st.MACOS_LAUNCH_AGENT_LABEL}"],
+                    ["launchctl", "enable", f"{domain}/{st.MACOS_LAUNCH_AGENT_LABEL}"],
+                ],
+            )
+
+    def test_macos_enable_rebootstraps_a_changed_plist_owned_by_another_pid(self):
+        domain = "gui/501"
+        with tempfile.TemporaryDirectory() as tmp:
+            plist = os.path.join(tmp, "x.plist")
+            with open(plist, "wb") as f:
+                f.write(self._desired_plist(["/Old/Mouser"]))
+
+            def launchctl(args):
+                if args[1] == "print":
+                    return MagicMock(
+                        returncode=0, stdout="\tpid = 4242\n", stderr=""
+                    )
+                return MagicMock(returncode=0, stdout="", stderr="")
+
+            with (
+                patch.object(sys, "platform", "darwin"),
+                patch("core.startup.os.getuid", return_value=501, create=True),
+                patch.object(st, "_macos_plist_path", return_value=plist),
+                patch.object(st, "_macos_log_dir", return_value=os.path.join(tmp, "Logs")),
+                patch.object(st, "_program_arguments", return_value=["/New/Mouser"]),
+                patch.object(st, "_launchctl_run", side_effect=launchctl) as m_lc,
+            ):
+                st.apply_login_startup(True)
+            self.assertEqual(
+                [call.args[0] for call in m_lc.call_args_list],
+                [
+                    ["launchctl", "print", f"{domain}/{st.MACOS_LAUNCH_AGENT_LABEL}"],
+                    ["launchctl", "bootout", domain, plist],
+                    ["launchctl", "bootstrap", domain, plist],
+                ],
+            )
+
+    def test_launchd_agent_pid_parses_print_output(self):
+        with patch.object(st, "_launchctl_run") as m_lc:
+            m_lc.return_value = MagicMock(
+                returncode=0,
+                stdout="io.github.hughesyadaddy.mouser = {\n\tactive count = 1\n\tpid = 1020\n\tstate = running\n}\n",
+            )
+            self.assertEqual(st._launchd_agent_pid("gui/501"), 1020)
+            m_lc.return_value = MagicMock(returncode=0, stdout="\tstate = not running\n")
+            self.assertEqual(st._launchd_agent_pid("gui/501"), 0)
+            m_lc.return_value = MagicMock(returncode=113, stdout="", stderr="Could not find service")
+            self.assertIsNone(st._launchd_agent_pid("gui/501"))
 
     def test_macos_disable_bootout_and_remove_when_plist_exists(self):
         plist = "/tmp/io.github.tombadash.mouser.plist"
@@ -356,14 +506,69 @@ class ApplyLoginStartupMacTests(unittest.TestCase):
             patch("os.path.isfile", return_value=True),
             patch("os.remove") as m_remove,
         ):
-            m_lc.return_value = MagicMock(returncode=0)
+            m_lc.return_value = MagicMock(returncode=0, stdout="\tpid = 4242\n")
             st.apply_login_startup(False)
 
-        self.assertEqual(m_lc.call_count, 1)
-        m_lc.assert_called_with(
-            ["launchctl", "bootout", domain, plist]
+        self.assertEqual(
+            [call.args[0] for call in m_lc.call_args_list],
+            [
+                ["launchctl", "print", f"{domain}/{st.MACOS_LAUNCH_AGENT_LABEL}"],
+                ["launchctl", "bootout", domain, plist],
+            ],
         )
         m_remove.assert_called_once_with(plist)
+
+    def test_macos_disable_while_launchd_owns_this_process_only_disables(self):
+        """bootout of our own agent would SIGTERM this very process."""
+        plist = "/tmp/io.github.tombadash.mouser.plist"
+        domain = "gui/501"
+
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch("core.startup.os.getuid", return_value=501, create=True),
+            patch.object(st, "supports_login_startup", return_value=True),
+            patch.object(st, "_macos_plist_path", return_value=plist),
+            patch.object(st, "_launchctl_run") as m_lc,
+            patch("os.path.isfile", return_value=True),
+            patch("os.remove") as m_remove,
+        ):
+            m_lc.return_value = MagicMock(returncode=0, stdout=f"\tpid = {os.getpid()}\n")
+            st.apply_login_startup(False)
+
+        self.assertEqual(
+            [call.args[0] for call in m_lc.call_args_list],
+            [
+                ["launchctl", "print", f"{domain}/{st.MACOS_LAUNCH_AGENT_LABEL}"],
+                ["launchctl", "disable", f"{domain}/{st.MACOS_LAUNCH_AGENT_LABEL}"],
+            ],
+        )
+        m_remove.assert_not_called()
+
+    def test_macos_launchd_owns_process_helper(self):
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch("core.startup.os.getuid", return_value=501, create=True),
+            patch.object(st, "_launchctl_run") as m_lc,
+        ):
+            m_lc.return_value = MagicMock(returncode=0, stdout=f"\tpid = {os.getpid()}\n")
+            self.assertTrue(st.macos_launchd_owns_process())
+            m_lc.return_value = MagicMock(returncode=0, stdout="\tpid = 1\n")
+            self.assertFalse(st.macos_launchd_owns_process())
+        with patch.object(sys, "platform", "linux"):
+            self.assertFalse(st.macos_launchd_owns_process())
+
+    def test_write_macos_launch_agent_renders_without_launchctl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plist = os.path.join(tmp, "LaunchAgents", "x.plist")
+            with (
+                patch.object(st, "_macos_plist_path", return_value=plist),
+                patch.object(st, "_macos_log_dir", return_value=os.path.join(tmp, "Logs")),
+                patch.object(st, "_launchctl_run") as m_lc,
+            ):
+                self.assertEqual(st.write_macos_launch_agent(["/X/Mouser"]), plist)
+            m_lc.assert_not_called()
+            with open(plist, "rb") as f:
+                self.assertEqual(plistlib.load(f)["ProgramArguments"], ["/X/Mouser"])
 
     def test_macos_disable_uses_label_bootout_when_no_plist(self):
         plist = "/tmp/io.github.tombadash.mouser.plist"
@@ -388,6 +593,25 @@ class ApplyLoginStartupMacTests(unittest.TestCase):
                 st.MACOS_LAUNCH_AGENT_LABEL,
             ]
         )
+
+
+class RemoveStaleScheduledTasksTests(unittest.TestCase):
+    def test_noop_off_windows(self):
+        with patch.object(sys, "platform", "darwin"), patch.object(st.subprocess, "run") as run:
+            self.assertEqual(st.remove_stale_scheduled_tasks(), [])
+        run.assert_not_called()
+
+    def test_unregisters_each_known_task_name(self):
+        with patch.object(sys, "platform", "win32"), patch.object(st.subprocess, "run") as run:
+            run.return_value = MagicMock(returncode=0, stdout="MouserStart\nMouserProbe\n")
+            removed = st.remove_stale_scheduled_tasks()
+        self.assertEqual(removed, ["MouserStart", "MouserProbe"])
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[0], "powershell")
+        script = argv[-1]
+        self.assertIn("Unregister-ScheduledTask", script)
+        for name in ("MouserStart", "MouserDist", "MouserExe", "MouserSrc", "MouserProbe"):
+            self.assertIn(f"'{name}'", script)
 
 
 class SyncFromConfigTests(unittest.TestCase):
